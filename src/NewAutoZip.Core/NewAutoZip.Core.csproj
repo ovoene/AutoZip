@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    核心逻辑层：不引用任何 UI 程序集，因此可以被单元测试直接驱动。
+    这正是旧版最缺的东西 —— 所有逻辑都长在 WinForms 的 MainForm/BackupWorker 里，无法测试。
+
+    TargetFramework 用 net8.0-windows（而不是 net8.0）：本程序天生只跑 Windows
+    （Cloud Files 属性、注册表、DPAPI），带 -windows 后缀可以让 CA1416 平台分析器
+    正确放行这些 API，而不需要在几十处撒 [SupportedOSPlatform]。
+    注意：这里没有 UseWPF / UseWindowsForms，所以不会引入任何 UI 依赖。
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RootNamespace>NewAutoZip.Core</RootNamespace>
+    <AssemblyName>NewAutoZip.Core</AssemblyName>
+    <IsPackable>false</IsPackable>
+
+    <!-- [LibraryImport] 源生成器产出的封送代码使用 unsafe -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="NewAutoZip.Tests" />
+  </ItemGroup>
+
+</Project>

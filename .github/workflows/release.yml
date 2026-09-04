@@ -1,0 +1,195 @@
+name: release
+
+# ====================================================================
+#  推一个 v* tag 上来就发版。
+#
+#  本机的 release.bat 负责：把版本号写进 Directory.Build.props、跑完整
+#  本地关卡、提交、打 tag vX.Y.Z、推上来。剩下的全在这里做完 ——
+#  在 GitHub 的 Windows 机器上重新编译、跑单元测试、打成 zip、建 Release。
+#
+#  所以本机不需要装 gh，也不需要手工往网页上拖那个 71 MB 的包。
+#
+#  手动触发（Actions 页面上的 Run workflow）只演练、不发版：一样编译
+#  打包，产物存成 workflow artifact，不建 Release、不碰 tag。改完这个
+#  文件先手动跑一次 —— 拿真 tag 试错要删 tag、删 Release，还会在
+#  Actions 页面上永久留一条失败记录。
+# ====================================================================
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# 只给建 Release 需要的写权限，别的一概不给。
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install the .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          # 钉死成开发机上的同一个 SDK。Directory.Build.props 里
+          # TreatWarningsAsErrors=true，换一个 feature band 的编译器可能
+          # 单凭新增分析器就让这里红掉，而本机是绿的 —— 那种失败最难查。
+          # 升级时本机和这一行一起改。
+          dotnet-version: '8.0.424'
+
+      - name: The tag and the version inside the exe must agree
+        id: ver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # 界面上那个版本号读的是程序集版本，也就是 <AssemblyVersion>，
+          # 不是 <Version>。所以这里以 AssemblyVersion 为准。
+          $raw = Get-Content -LiteralPath 'Directory.Build.props' -Raw
+          $m = [regex]::Match($raw, '<AssemblyVersion>(\d+\.\d+\.\d+)\.0</AssemblyVersion>')
+          if (-not $m.Success) {
+            throw 'Directory.Build.props: <AssemblyVersion> is missing, or is not X.Y.Z.0'
+          }
+          $inProps = $m.Groups[1].Value
+
+          # tag 说 6.6.7、props 说 6.6.6，发出去的 exe 标题栏和「关于」
+          # 里就都写着 6.6.6，而 Release 名字叫 6.6.7。这种版本号对不上
+          # 是最难查的一类问题：用户报的版本根本不存在。宁可在这里停住。
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+            $fromTag = $env:GITHUB_REF_NAME -replace '^v', ''
+            if ($fromTag -ne $inProps) {
+              throw "Tag $env:GITHUB_REF_NAME means $fromTag, but Directory.Build.props says $inProps. The exe would show $inProps in its title bar and About box while the release is named $fromTag. Use release.bat - it writes both."
+            }
+          }
+
+          "version=$inProps" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Version: $inProps"
+
+      - name: Unit tests and single-file publish
+        shell: cmd
+        # 和本机跑的是同一个脚本，不在这里另抄一份 dotnet publish 参数
+        # ——抄出来的两份迟早会各走各的。noselftest 的理由见 publish.cmd。
+        run: publish.cmd noselftest
+
+      - name: Pack the release zip
+        id: pack
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # 发出去的包里必须正好是这两样。多一个文件都不行：这个 zip
+          # 就是用户解压后的整个程序目录，构建机上的一条日志混进去，
+          # 等他日后去翻"第一次运行"的记录时只会被带偏。
+          $got = Get-ChildItem -LiteralPath 'publish' -Recurse -File |
+                 ForEach-Object { $_.FullName.Substring((Resolve-Path 'publish').Path.Length + 1) } |
+                 Sort-Object
+          $want = @('AutoZip.exe', 'tools\7za.exe')
+          if (($got -join '|') -ne ($want -join '|')) {
+            throw "publish\ should hold exactly AutoZip.exe and tools\7za.exe, found: $($got -join ', ')"
+          }
+
+          # 条目名写死成正斜杠。Compress-Archive 在 Windows 上写的是
+          # 反斜杠，zip 规范要的是正斜杠 —— Windows 自带的解压和 7-Zip
+          # 都认，但别的工具不一定。发出去的东西不留这种赌注。
+          $zipName = "AutoZip-$env:VERSION-win-x64.zip"
+
+          # .NET Core 上这两个程序集是转发壳，类型在 pwsh 里本来就能直接
+          # 用，Add-Type 未必需要也未必成功。Windows PowerShell 上则必须
+          # 加载。所以两边都试，失败就当没这回事，别让它拦路。
+          foreach ($a in 'System.IO.Compression', 'System.IO.Compression.FileSystem') {
+            try { Add-Type -AssemblyName $a } catch { }
+          }
+
+          # 一律走绝对路径。下面几个是 .NET API，它们认的是进程的当前
+          # 目录，不是 PowerShell 的 $PWD —— 在 runner 上两者恰好一致，
+          # 但这种"恰好"不值得押上一次发版。
+          $fs = [IO.File]::Open((Join-Path $PWD $zipName), 'Create')
+          try {
+            $zip = New-Object IO.Compression.ZipArchive($fs, 'Create')
+            try {
+              [IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $zip, (Join-Path $PWD 'publish\AutoZip.exe'), 'AutoZip.exe', 'Optimal') | Out-Null
+              [IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $zip, (Join-Path $PWD 'publish\tools\7za.exe'), 'tools/7za.exe', 'Optimal') | Out-Null
+            } finally { $zip.Dispose() }
+          } finally { $fs.Dispose() }
+
+          $sha = (Get-FileHash -LiteralPath $zipName -Algorithm SHA256).Hash
+          $mb = [math]::Round((Get-Item -LiteralPath $zipName).Length / 1MB, 1)
+          Write-Host "$zipName  $mb MB  SHA256 $sha"
+
+          "zip=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "sha256=$sha"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Create the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          ZIP: ${{ steps.pack.outputs.zip }}
+          SHA256: ${{ steps.pack.outputs.sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $notes = @(
+            '## 下载',
+            '',
+            "**$env:ZIP** —— Windows x64，解压即用。",
+            '',
+            '不需要装 .NET，不需要装 7-Zip。要求 Windows 10 1809 (x64) 或更新的系统。',
+            '',
+            '## 解压出来是两个文件，缺一不可',
+            '',
+            '```',
+            'AutoZip.exe      主程序（自包含单文件）',
+            'tools\7za.exe    压缩引擎，必须与 exe 同级',
+            '```',
+            '',
+            '`7za.exe` 是作为独立进程被启动的，所以它必须是磁盘上的真实文件，没法塞进单文件包里。',
+            '**只把 `AutoZip.exe` 单独拿出去放，程序照样能开，但每一次压缩都会失败**',
+            '（界面会提示「找不到压缩程序」）。整个文件夹一起拷。',
+            '',
+            '## 首次使用',
+            '',
+            '打开 → **设置**页 → 至少填「监控目录」「OneDrive 目录」「压缩密码」→ 点「保存」→ 回**总览**页点「开始」。',
+            '保存时会做一次完整校验，所有问题一次性列在设置页底部的「配置检查」卡片里。',
+            '',
+            '两件第一次运行时会遇到的事：',
+            '',
+            '- exe 没有代码签名，SmartScreen 可能拦一下：点「更多信息」→「仍要运行」。',
+            '- 关闭窗口只是**收进托盘继续工作**。真正退出请右键托盘图标选「退出」。',
+            '',
+            '## 校验',
+            '',
+            '```',
+            "SHA256  $env:SHA256",
+            '```',
+            '',
+            "由 GitHub Actions 从 tag ``$env:TAG`` 自动编译发布，单元测试全过。构建配置见 ``.github/workflows/release.yml``。"
+          )
+          $notes -join "`n" | Set-Content -LiteralPath 'notes.md' -Encoding utf8NoBOM
+
+          gh release create $env:TAG `
+            --title "AutoZip $env:VERSION" `
+            --notes-file 'notes.md' `
+            "$env:ZIP#AutoZip $env:VERSION for Windows x64 (AutoZip.exe + tools/7za.exe)"
+
+      - name: Upload the zip as a workflow artifact
+        # 只在手动演练时走这里：没有 tag 就不该建 Release，但产物还是
+        # 要能拿下来看一眼。
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoZip-${{ steps.ver.outputs.version }}-win-x64
+          path: ${{ steps.pack.outputs.zip }}
+          if-no-files-found: error

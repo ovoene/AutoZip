@@ -1,0 +1,511 @@
+<Application x:Class="NewAutoZip.App.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:sys="clr-namespace:System;assembly=System.Runtime"
+             xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+             xmlns:views="clr-namespace:NewAutoZip.App.Views"
+             ShutdownMode="OnExplicitShutdown">
+    <!--
+        ShutdownMode=OnExplicitShutdown：主窗口关闭时程序退到托盘继续工作，
+        只有用户在托盘里选"退出"才真正结束。这是备份工具应有的行为。
+    -->
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <!--
+                    Windows 11 Fluent 设计令牌（颜色 / 圆角 / 阴影 / 字体）。
+
+                    这里写 Dark 只是"编译期的初值"，好让设计器有东西可显示。
+                    运行时由 Services\ThemeService 按配置（深色 / 浅色 / 跟随系统）
+                    在启动时立刻换掉 —— 别在这里改默认主题，改了也会被覆盖。
+                -->
+                <ui:ThemesDictionary Theme="Dark" />
+                <ui:ControlsDictionary />
+            </ResourceDictionary.MergedDictionaries>
+
+            <!-- ==================== 转换器 ==================== -->
+            <views:IndexVisibilityConverter x:Key="IndexVisibility" />
+            <views:BoolVisibilityConverter x:Key="BoolVisibility" />
+            <views:HasContentVisibilityConverter x:Key="HasContent" />
+            <views:TimeOfDayConverter x:Key="TimeOfDay" />
+            <views:StampConverter x:Key="Stamp" />
+
+            <!--
+                ==================== 语义配色 ====================
+
+                ViewModel 只给资源键（"DotOk" 等），不自己造 Brush；界面只引用键名。
+
+                <b>为什么要分成 Color 和 Brush 两层</b>
+                WPF 从 BAML 加载资源字典时会把能 Freeze 的 Freezable 自动 Freeze 掉 ——
+                不用写 PresentationOptions:Freeze，它自己就冻了。冻过的画刷改不动，
+                切主题时这些颜色会全部停在深色值上（白底浅灰字＝整片文字看不见）。
+                颜色单独放进 *Color 键、画刷用 DynamicResource 引它，画刷就带着一个
+                未解析的引用，于是冻不了、保持可变。ThemeService.SyncPalette 切主题时
+                直接改画刷实例的 Color，所有拿着这个实例的地方一起更新。
+
+                <b>三条规矩，第三条最容易违反</b>
+                  1. 每个键只能有一个实例，别在别处重复定义；
+                  2. 新增语义色要同时加进 ThemeService 的 Palette.Dark 和 Palette.Light，
+                     只加一边等于另一个主题下漏配（自检会当场把它报出来）；
+                  3. 界面里引用下面这些画刷，一律用 DynamicResource，不要用 StaticResource。
+                     原因：Style / DataTrigger 的 Setter 在密封时会把值里的 Freezable 冻掉，
+                     一个 <Setter Value="{StaticResource MutedText}" /> 就能把这只画刷
+                     永久冻在深色值上 —— 而且是静默的，界面照常显示，只是颜色不再变。
+                     曾经就这么中过招：13 个键里有 6 个（凡是出现在某个 Setter 里的）
+                     在浅色主题下全部停在深色值上。DynamicResource 的 Setter 存的是表达式
+                     而不是画刷本身，冻不到画刷，顺带还能按元素重新求值。
+                     （自检的 CheckPalette 会检查 IsFrozen，CheckPaletteValues 会
+                     逐键核对实际渲染出来的颜色等不等于该主题的值 —— 这条规矩有人看着。）
+
+                下面填的是深色值，与 ui:ThemesDictionary 的初值对齐，仅作初值。
+            -->
+            <Color x:Key="DotOkColor">#4ADE80</Color>
+            <Color x:Key="DotWarnColor">#FFC83D</Color>
+            <Color x:Key="DotErrorColor">#FF6B6B</Color>
+            <Color x:Key="DotIdleColor">#8A93A0</Color>
+
+            <Color x:Key="MutedTextColor">#A6AEBB</Color>
+            <Color x:Key="WarnTextColor">#FFC83D</Color>
+            <Color x:Key="ErrorTextColor">#FF8A8A</Color>
+
+            <!--
+                「正在进行」徽章。
+
+                刻意用紫罗兰而不是主题强调色：强调色是用户能自己改的（设置页里就有
+                一排可选强调色），徽章要是跟着强调色走，用户挑一个相近的颜色就和
+                周围的选中态、主按钮糊在一起，"哪一步正在跑"这个唯一有用的信息就没了。
+                紫罗兰也避开了已被占用的语义：绿＝成功、琥珀＝警告、红＝失败。
+                深浅两套都是实心紫罗兰，文字对比度都按正文 4.5:1 挑过
+                （深色 #E7DEFF 压 #4C3A82＝7.3:1，浅色白字压 #5B3FA8＝7.7:1）。
+            -->
+            <Color x:Key="RunningBadgeBgColor">#4C3A82</Color>
+            <Color x:Key="RunningBadgeTextColor">#E7DEFF</Color>
+
+            <!--
+                ========== 列表行（左边功能区 + 日志区共用一套） ==========
+
+                这六个键是 SelectableListBoxItem 模板的全部配色，nav rail 和日志列表都走它。
+
+                <b>为什么不跟强调色</b>
+                强调色是用户在设置页里能随手改的，主按钮就是它。列表行跟着它走的话，
+                整条左边功能区会和右上角那排按钮变成同一个色块 —— 分不出哪个是"能点的按钮"、
+                哪个只是"一行"，用户挑个饱和度高的颜色更是刺眼。原先两处都在犯这个错：
+                模板里硬编码了一套青蓝（#26A0DA 一家）；<b>而没有选中的那一行压根没设底色</b>，
+                于是从 WPF-UI 的基样式继承到强调色。所以下面把三个状态的底色全部写明，
+                一个都不留给基样式，用固定的低饱和蓝灰：色相跟着 Fluent 的中性面板走，
+                只把明度抬/压一档，够看出"选了哪行"，又不会把注意力从内容上抢走。
+
+                <b>三档明度，一路拉开</b>
+                普通行 → 悬停 → 选中，离背景越来越远（自检 CheckListRowColors 钉住这个顺序）。
+                普通行只比背景挪一点点，是"淡雅"那一档；真正显眼的只有选中那一行。
+
+                <b>失焦不许变暗</b>
+                关键一手：焦点内和失焦<b>用同一个底色</b>，只有描边不一样
+                （焦点内亮描边、失焦沉描边）。这样"失去焦点后底色变暗看不清"这件事
+                在结构上就不可能发生 —— 底色压根没变。所以下面
+                SelectionInactive ≡ ListSelected、SelectionInactiveText ≡ ListSelectedText。
+
+                <b>色值怎么挑的</b>（数字都是自检算出来并写进 selftest-report.txt 的：
+                对比度按 WCAG 相对亮度，"离背景/离上一档"是 RGB 欧氏距离；
+                "背景"取 ApplicationBackgroundColor，实测深色 #202020、浅色 #FAFAFA）
+                  深 普通 #2A303A：离背景 32.1 —— 认得出是一行，又不抢眼；
+                  深 悬停 #39414D：离普通 29.6、离背景 61.1；
+                  深 选中 #4A5769：离悬停 39.5、离背景 100.6；
+                  深 描边 #88A0BC：压在选中底上 2.73:1；
+                  深 文字 #F2F5F9：压在选中底上 6.72:1；
+                  浅 普通 #E4EBF6：离背景 26.9；
+                  浅 悬停 #CFDDEF：离普通 26.2、离背景 53.0；
+                  浅 选中 #B4CCE9：离悬停 32.5、离背景 85.5；
+                  浅 描边 #4E7BB4：压在选中底上 2.65:1；
+                  浅 文字 #12233A：压在选中底上 9.61:1。
+                普通行那两个数（32.1 / 26.9）自检卡在 8～40 之间：下限保证"看得出是一行"，
+                <b>上限就是"淡雅"</b> —— 界面上行数最多的就是它，一重整个窗口都被带跑。
+                强调色离背景动辄两三百，所以普通行只要再继承到强调色，那条上限立刻就红。
+                浅色主题只能往<b>深</b>的方向走（白底上面没有余量了），"底色不要太暗"
+                这条靠的是可读性：9.61:1 的字，比原先 #5B9DD3 底上的 5.7:1 更清楚。
+                文字也刻意避开纯白纯黑 —— 自检的 CheckRenderedNotStale 会把纯白/纯黑
+                从指纹里剔除（两个主题都可能出现，认不出来），避开它就多一个键被看着。
+            -->
+            <Color x:Key="ListRowColor">#2A303A</Color>
+            <Color x:Key="ListHoverColor">#39414D</Color>
+            <Color x:Key="ListHoverBorderColor">#48515F</Color>
+            <Color x:Key="ListSelectedColor">#4A5769</Color>
+            <Color x:Key="ListSelectedBorderColor">#88A0BC</Color>
+            <Color x:Key="ListSelectedTextColor">#F2F5F9</Color>
+
+            <!--
+                选中行失焦后的底色与文字色。走 WPF 默认选中机制的控件（DataGridCell 的
+                MultiTrigger、以及任何没套我们模板的 ListBoxItem）从这两只画刷取色。
+                选这条线是因为 WPF 默认样式的 InactiveSelectionHighlightBrushKey 是 #FFF0F0F0，
+                浅色主题下几乎和白底一样 —— 选中的行根本看不出来。
+                值与上面的 ListSelected / ListSelectedText 逐主题保持一致，理由见上：
+                失焦只换描边，不换底色。
+            -->
+            <Color x:Key="SelectionInactiveColor">#4A5769</Color>
+            <Color x:Key="SelectionInactiveTextColor">#F2F5F9</Color>
+
+            <!-- 日志级别色。原先硬编码在转换器里，浅色主题下不可读。 -->
+            <Color x:Key="LogDebugColor">#868D96</Color>
+            <Color x:Key="LogInfoColor">#D6DBE0</Color>
+            <Color x:Key="LogWarnColor">#FFC83D</Color>
+            <Color x:Key="LogErrorColor">#FF8A8A</Color>
+
+            <SolidColorBrush x:Key="DotOk" Color="{DynamicResource DotOkColor}" />
+            <SolidColorBrush x:Key="DotWarn" Color="{DynamicResource DotWarnColor}" />
+            <SolidColorBrush x:Key="DotError" Color="{DynamicResource DotErrorColor}" />
+            <SolidColorBrush x:Key="DotIdle" Color="{DynamicResource DotIdleColor}" />
+
+            <SolidColorBrush x:Key="MutedText" Color="{DynamicResource MutedTextColor}" />
+            <SolidColorBrush x:Key="WarnText" Color="{DynamicResource WarnTextColor}" />
+            <SolidColorBrush x:Key="ErrorText" Color="{DynamicResource ErrorTextColor}" />
+
+            <SolidColorBrush x:Key="RunningBadgeBg" Color="{DynamicResource RunningBadgeBgColor}" />
+            <SolidColorBrush x:Key="RunningBadgeText" Color="{DynamicResource RunningBadgeTextColor}" />
+
+            <SolidColorBrush x:Key="ListRow" Color="{DynamicResource ListRowColor}" />
+            <SolidColorBrush x:Key="ListHover" Color="{DynamicResource ListHoverColor}" />
+            <SolidColorBrush x:Key="ListHoverBorder" Color="{DynamicResource ListHoverBorderColor}" />
+            <SolidColorBrush x:Key="ListSelected" Color="{DynamicResource ListSelectedColor}" />
+            <SolidColorBrush x:Key="ListSelectedBorder" Color="{DynamicResource ListSelectedBorderColor}" />
+            <SolidColorBrush x:Key="ListSelectedText" Color="{DynamicResource ListSelectedTextColor}" />
+
+            <SolidColorBrush x:Key="SelectionInactive" Color="{DynamicResource SelectionInactiveColor}" />
+            <SolidColorBrush x:Key="SelectionInactiveText" Color="{DynamicResource SelectionInactiveTextColor}" />
+
+            <!--
+                把失焦选中的底色与文字色钉到 SystemColors 键上。
+
+                DataGrid 的选中行、以及任何<b>没</b>套 SelectableListBoxItem 模板的
+                ListBoxItem，走的都是 WPF 默认模板 —— 那份模板的
+                IsSelected && !Selector.IsSelectionActive 触发器是从
+                SystemColors.InactiveSelectionHighlightBrushKey 取画刷的，
+                拿到的是 #FFF0F0F0，浅色下根本看不出。
+                在 App.Resources 把这两个 SystemColors 键覆盖掉，这些控件就一起
+                拿到上面那对语义色，失焦后一眼能看出哪行被选了。
+
+                初值取的是深色值（与 ui:ThemesDictionary Theme="Dark" 对齐），
+                ThemeService.SyncPalette 启动后会按实际主题重设：dark 时不变，
+                light 时整只换新实例（Free 化的画刷改 Color 静默失效——这一点
+                在 ThemeService 类注释里有详细说明）。
+            -->
+            <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightBrushKey}" Color="#FF4A5769" />
+            <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightTextBrushKey}" Color="#FFF2F5F9" />
+
+            <SolidColorBrush x:Key="LogDebug" Color="{DynamicResource LogDebugColor}" />
+            <SolidColorBrush x:Key="LogInfo" Color="{DynamicResource LogInfoColor}" />
+            <SolidColorBrush x:Key="LogWarn" Color="{DynamicResource LogWarnColor}" />
+            <SolidColorBrush x:Key="LogError" Color="{DynamicResource LogErrorColor}" />
+
+            <!-- 图标字体。Win11 用 Segoe Fluent Icons，Win10 回退到 Segoe MDL2 Assets。 -->
+            <FontFamily x:Key="IconFont">Segoe Fluent Icons, Segoe MDL2 Assets</FontFamily>
+
+            <sys:Double x:Key="LabelWidth">190</sys:Double>
+
+            <!--
+                数字输入框统一宽度。
+
+                原先是 140，而 ui:NumberBox 右侧还压着一对上下箭头（约 34 像素）、
+                左右各有内边距 —— 留给文字的其实只有 80 出头。"86400"这种五位数
+                一点进去光标一移就把开头顶出可视区，用户看不全自己填的数。
+                180 能容下本程序所有取值上限（最大的是 86400 与 4096.00）还有余量。
+            -->
+            <sys:Double x:Key="NumberBoxWidth">180</sys:Double>
+
+            <!-- 时间输入框（HH:mm）。5 个字符，但要按最宽的数字算，不能贴着边。 -->
+            <sys:Double x:Key="TimeBoxWidth">110</sys:Double>
+
+            <!-- ==================== 通用样式 ==================== -->
+
+            <!-- 分组标题 -->
+            <Style x:Key="GroupTitle" TargetType="TextBlock">
+                <Setter Property="FontSize" Value="14" />
+                <Setter Property="FontWeight" Value="SemiBold" />
+                <Setter Property="Margin" Value="0,0,0,8" />
+            </Style>
+
+            <!--
+                卡片内的小标题。一张卡片里塞了几个不同概念时（比如“外观”里的
+                主题模式 / 强调色 / 背景图片）必须显式分块 —— 挤在一起就会出现
+                “皮肤色到底是什么”这种歧义。
+            -->
+            <Style x:Key="SubTitle" TargetType="TextBlock">
+                <Setter Property="FontSize" Value="13" />
+                <Setter Property="FontWeight" Value="SemiBold" />
+                <Setter Property="Margin" Value="0,18,0,8" />
+            </Style>
+
+            <!-- 说明文字：解释"为什么"，这是旧版界面完全缺失的东西 -->
+            <Style x:Key="Hint" TargetType="TextBlock">
+                <Setter Property="FontSize" Value="12" />
+                <Setter Property="Foreground" Value="{DynamicResource MutedText}" />
+                <Setter Property="TextWrapping" Value="Wrap" />
+                <Setter Property="Margin" Value="0,4,0,0" />
+            </Style>
+
+            <!-- 设置项左侧标签，固定宽度让所有输入框对齐 -->
+            <Style x:Key="FieldLabel" TargetType="TextBlock">
+                <Setter Property="Width" Value="{StaticResource LabelWidth}" />
+                <Setter Property="VerticalAlignment" Value="Center" />
+                <Setter Property="TextWrapping" Value="Wrap" />
+                <Setter Property="Margin" Value="0,0,12,0" />
+            </Style>
+
+            <!-- 设置项一行 -->
+            <Style x:Key="FieldRow" TargetType="StackPanel">
+                <Setter Property="Orientation" Value="Horizontal" />
+                <Setter Property="Margin" Value="0,0,0,10" />
+            </Style>
+
+            <!-- 统计数字 -->
+            <Style x:Key="StatValue" TargetType="TextBlock">
+                <Setter Property="FontSize" Value="22" />
+                <Setter Property="FontWeight" Value="SemiBold" />
+            </Style>
+
+            <Style x:Key="StatCaption" TargetType="TextBlock">
+                <Setter Property="FontSize" Value="12" />
+                <Setter Property="Foreground" Value="{DynamicResource MutedText}" />
+                <Setter Property="Margin" Value="0,2,0,0" />
+            </Style>
+
+            <!--
+                需要"占满一格"的卡片。
+
+                ui:Card 的默认样式把卡片<b>和它的内容</b>都钉在顶部
+                （VerticalAlignment / VerticalContentAlignment 都是 Top）。
+                这对"一张张往下堆"的卡片是对的，但放进比例行里就只有内容那么高 ——
+                日志页那一行分到 629 像素，卡片却只用了 82，日志区缩成三四行。
+                （这是自检的布局体检抓出来的，不是猜的。）
+
+                所以：凡是"这一格有多高、卡片就该有多高"的地方都套这个样式。
+            -->
+            <Style x:Key="FillCard" BasedOn="{StaticResource {x:Type ui:Card}}" TargetType="ui:Card">
+                <Setter Property="VerticalAlignment" Value="Stretch" />
+                <Setter Property="VerticalContentAlignment" Value="Stretch" />
+            </Style>
+
+            <!-- 数据网格：只读、整行选择、去掉那些容易误触的编辑行为 -->
+            <Style x:Key="ReadOnlyGrid" BasedOn="{StaticResource {x:Type DataGrid}}" TargetType="DataGrid">
+                <Setter Property="AutoGenerateColumns" Value="False" />
+                <Setter Property="IsReadOnly" Value="True" />
+                <Setter Property="CanUserAddRows" Value="False" />
+                <Setter Property="CanUserDeleteRows" Value="False" />
+                <Setter Property="CanUserResizeRows" Value="False" />
+                <Setter Property="SelectionMode" Value="Single" />
+                <Setter Property="SelectionUnit" Value="FullRow" />
+                <Setter Property="HeadersVisibility" Value="Column" />
+                <Setter Property="GridLinesVisibility" Value="None" />
+                <Setter Property="BorderThickness" Value="0" />
+                <Setter Property="Background" Value="Transparent" />
+
+                <!--
+                    行高给足。默认行高按字体算出来只有 20 出头，中文在这个高度下
+                    上下几乎贴着行边线，多行连在一起看就像糊成一片。
+                -->
+                <Setter Property="MinRowHeight" Value="30" />
+                <Setter Property="ColumnHeaderHeight" Value="34" />
+
+                <!--
+                    虚拟化必须开着。监控目录里几千个文件时，没有虚拟化的 DataGrid
+                    会为每一行创建可视树，界面直接卡住。
+                -->
+                <Setter Property="EnableRowVirtualization" Value="True" />
+                <Setter Property="EnableColumnVirtualization" Value="True" />
+                <Setter Property="VirtualizingPanel.IsVirtualizing" Value="True" />
+                <Setter Property="VirtualizingPanel.VirtualizationMode" Value="Recycling" />
+                <Setter Property="ScrollViewer.CanContentScroll" Value="True" />
+            </Style>
+
+            <!--
+                ==================== 托盘右键菜单 ====================
+
+                只替换 Template，其余 Setter（配色、内边距、条目容器样式）全部沿用
+                WPF-UI 默认的 ContextMenu 样式 —— 那些是跟着主题走的，自己硬写迟早和主题脱节。
+
+                换模板的唯一目的是<b>拿掉入场动画</b>：WPF-UI 的模板给最外层 Border 挂了一条
+                (Border.RenderTransform).(TranslateTransform.Y) 位移动画，菜单是"滑"出来的。
+                托盘菜单本来就贴着任务栏在鼠标位置弹出，再滑一段看起来像卡了一下。
+                这里的模板没有 RenderTransform、没有 Storyboard，弹出交回给 Windows：
+                ContextMenu 由 WPF 内部的 Popup 承载，走的就是系统标准的菜单弹出效果。
+            -->
+            <Style x:Key="TrayMenu" BasedOn="{StaticResource {x:Type ContextMenu}}" TargetType="ContextMenu">
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="ContextMenu">
+                            <Border Padding="{TemplateBinding Padding}"
+                                    Background="{TemplateBinding Background}"
+                                    BorderBrush="{TemplateBinding BorderBrush}"
+                                    BorderThickness="{TemplateBinding BorderThickness}"
+                                    CornerRadius="8"
+                                    SnapsToDevicePixels="True">
+                                <ScrollViewer HorizontalScrollBarVisibility="Disabled"
+                                              VerticalScrollBarVisibility="Auto">
+                                    <ItemsPresenter />
+                                </ScrollViewer>
+                            </Border>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+
+            <!-- 空列表时的占位提示 -->
+            <Style x:Key="EmptyHint" TargetType="TextBlock">
+                <Setter Property="HorizontalAlignment" Value="Center" />
+                <Setter Property="VerticalAlignment" Value="Center" />
+                <Setter Property="Foreground" Value="{DynamicResource MutedText}" />
+                <Setter Property="Margin" Value="0,32,0,0" />
+            </Style>
+
+            <!--
+                DataGridCell 全局样式。
+
+                WPF 的默认 DataGridCell 模板在 IsSelected && Selector.IsSelectionActive=false
+                这条分支上把背景画成 SystemColors.InactiveSelectionHighlightBrushKey
+                —— 浅色主题下是 #FFF0F0F0，几乎和白底融在一起，看不出哪行被选了。
+                这套样式 BasedOn 默认样式保留模板和"焦点内"#FF0078D7 那条强蓝不动，
+                只把"失焦选中"的底色与文字换成上面那对 SelectionInactive / SelectionInactiveText。
+
+                触发条件与默认样式里的 MultiTrigger 完全一致：
+                WPF 合并 BasedOn 样式时，派生样式里条件相同的触发器会替换基样式的，
+                这条 case 在前面那套刷代码里已经走通过（dynamic→LimeGreen）。
+
+                Setter 一律走 DynamicResource 而不是 StaticResource：
+                这两条规矩（"界面里引用语义画刷要用 DynamicResource"、
+                "Style Setter 里的 StaticResource 会把画刷冻在初值上"）
+                在本文件顶上「语义配色」那一段都写过，
+                落到这里继续遵守 —— 否则切主题后这两条画刷会被冻在深色值上，
+                浅色下又是看不见的一行字。
+            -->
+            <Style TargetType="DataGridCell"
+                   BasedOn="{StaticResource {x:Type DataGridCell}}">
+                <Style.Triggers>
+                    <MultiTrigger>
+                        <MultiTrigger.Conditions>
+                            <Condition Property="DataGridCell.IsSelected" Value="True" />
+                            <Condition Property="Selector.IsSelectionActive" Value="False" />
+                        </MultiTrigger.Conditions>
+                        <Setter Property="Background" Value="{DynamicResource SelectionInactive}" />
+                        <Setter Property="BorderBrush" Value="{DynamicResource SelectionInactive}" />
+                        <Setter Property="Foreground" Value="{DynamicResource SelectionInactiveText}" />
+                    </MultiTrigger>
+                </Style.Triggers>
+            </Style>
+
+            <!--
+                SelectableListBoxItem：让 nav rail、日志列表那种带显式 ItemContainerStyle
+                的 ListBox，失焦选中也能一眼看出。
+
+                WPF 默认 ListBoxItem 模板的失焦选中触发器用的是<b>硬编码</b>的 #3DDADADA，
+                浅色主题下和白底几乎一样看不出 —— 跟 DataGridCell 不一样，
+                那份默认模板用的是 DynamicResource 到 SystemColors.InactiveSelectionHighlightBrushKey，
+                所以之前 SystemColors 覆盖对 DataGridCell 有效，对 ListBoxItem 无效。
+                而且 nav rail、日志列表都用了显式 ItemContainerStyle（没有 BasedOn），
+                显式 Style 会顶掉 WPF-UI 的隐式样式，整体回落到 WPF 默认模板，
+                那条硬编码的失焦选中触发器就登场了。
+
+                这套样式 BasedOn = {x:Type ListBoxItem}，但覆盖了完整的 ControlTemplate，
+                普通态由下面两个 Setter 钉住，四条触发器（悬停 / 焦点内选中 / 失焦选中 / 禁用）
+                的配色全部换成上面那六个固定的 List* 语义键，一个硬编码色都不留 ——
+                原先那套 #26A0DA 青蓝是 WPF 十几年前的默认色，压在 Fluent 的中性面板上过于跳，
+                而且不跟主题走。理由和色值挑法见上面 List* 那段注释。
+
+                <b>失焦选中和焦点内选中共用同一个底色</b>，只有描边不同：
+                焦点内 ListSelectedBorder（亮），失焦 ListSelected 自己（等于没描边）。
+                所以窗口失去焦点时，选中行的底色<b>一点都不会变</b>，只是描边淡下去。
+
+                ItemContainerStyle 里写 BasedOn="{StaticResource SelectableListBoxItem}"
+                即可应用这套模板（基于那条 dynamic 验证过的机制）。
+            -->
+            <Style x:Key="SelectableListBoxItem"
+                   TargetType="ListBoxItem"
+                   BasedOn="{StaticResource {x:Type ListBoxItem}}">
+                <!--
+                    描边宽度写死在这里，不从基样式继承：模板里的 Border 是
+                    TemplateBinding 上来的，基样式给多少就是多少，而 WPF-UI 的隐式
+                    ListBoxItem 样式和 WPF 默认样式给的值不一样（一个 0 一个 1）。
+                    不写这一条的话，选中态的描边会时有时无 —— 取决于哪份基样式赢了。
+                -->
+                <Setter Property="BorderThickness" Value="1" />
+                <!--
+                    <b>普通态（没选中、没悬停）的底色必须在这里给死。</b>
+                    模板里 Bd 的 Background 是 TemplateBinding 上来的，这一条不写，
+                    值就从 BasedOn 的基样式继承 —— 而 WPF-UI 的隐式 ListBoxItem 样式
+                    在那里给的是<b>强调色</b>。结果整条左边功能区和整片日志区都被刷成
+                    和右上角那排主按钮一个色：分不出哪个是"能点的按钮"、哪个只是"一行"，
+                    用户再挑个饱和度高的强调色就更刺眼。四条触发器只管悬停/选中/禁用，
+                    盖不住这个默认值，所以过去这个洞一直在（老的硬编码模板也一样）。
+
+                    BorderBrush 用<b>同一个键</b>：1px 描边始终在（BorderThickness 恒为 1，
+                    选中前后不会有 1px 的位移），普通态让它和底色同色 = 看不见。
+                -->
+                <Setter Property="Background" Value="{DynamicResource ListRow}" />
+                <Setter Property="BorderBrush" Value="{DynamicResource ListRow}" />
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="ListBoxItem">
+                            <Border BorderThickness="{TemplateBinding Border.BorderThickness}"
+                                    CornerRadius="4"
+                                    Padding="{TemplateBinding Control.Padding}"
+                                    BorderBrush="{TemplateBinding Border.BorderBrush}"
+                                    Background="{TemplateBinding Panel.Background}"
+                                    Name="Bd"
+                                    SnapsToDevicePixels="True">
+                                <ContentPresenter Content="{TemplateBinding ContentControl.Content}"
+                                                  ContentTemplate="{TemplateBinding ContentControl.ContentTemplate}"
+                                                  ContentStringFormat="{TemplateBinding ContentControl.ContentStringFormat}"
+                                                  HorizontalAlignment="{TemplateBinding Control.HorizontalContentAlignment}"
+                                                  VerticalAlignment="{TemplateBinding Control.VerticalContentAlignment}"
+                                                  SnapsToDevicePixels="{TemplateBinding UIElement.SnapsToDevicePixels}" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <!-- 鼠标悬停：只抬一档明度，不换色相 -->
+                            <MultiTrigger>
+                                <MultiTrigger.Conditions>
+                                    <Condition Property="UIElement.IsMouseOver" Value="True" />
+                                </MultiTrigger.Conditions>
+                                <Setter Property="Panel.Background" TargetName="Bd" Value="{DynamicResource ListHover}" />
+                                <Setter Property="Border.BorderBrush" TargetName="Bd" Value="{DynamicResource ListHoverBorder}" />
+                            </MultiTrigger>
+                            <!--
+                                焦点内选中：底色 ListSelected，描边用亮一档的 ListSelectedBorder。
+                                这条要写在失焦那条<b>前面</b>吗？不用 —— 两条的条件互斥
+                                （IsSelectionActive 一真一假），谁在前都一样。
+                            -->
+                            <MultiTrigger>
+                                <MultiTrigger.Conditions>
+                                    <Condition Property="Selector.IsSelectionActive" Value="True" />
+                                    <Condition Property="Selector.IsSelected" Value="True" />
+                                </MultiTrigger.Conditions>
+                                <Setter Property="Panel.Background" TargetName="Bd" Value="{DynamicResource ListSelected}" />
+                                <Setter Property="Border.BorderBrush" TargetName="Bd" Value="{DynamicResource ListSelectedBorder}" />
+                                <Setter Property="TextElement.Foreground" TargetName="Bd" Value="{DynamicResource ListSelectedText}" />
+                            </MultiTrigger>
+                            <!--
+                                失焦选中：底色和上面<b>一模一样</b>，描边退回底色本身。
+                                WPF 默认模板这里是硬编码的 #3DDADADA，浅色下和白底
+                                几乎一样看不出；而我们这里不但看得出，底色还压根没变暗 ——
+                                窗口失去焦点只让描边淡下去，"选了哪行"始终清清楚楚。
+                                （SelectionInactive / SelectionInactiveText 与
+                                ListSelected / ListSelectedText 逐主题同值，见上面注释。）
+                            -->
+                            <MultiTrigger>
+                                <MultiTrigger.Conditions>
+                                    <Condition Property="Selector.IsSelectionActive" Value="False" />
+                                    <Condition Property="Selector.IsSelected" Value="True" />
+                                </MultiTrigger.Conditions>
+                                <Setter Property="Panel.Background" TargetName="Bd" Value="{DynamicResource SelectionInactive}" />
+                                <Setter Property="Border.BorderBrush" TargetName="Bd" Value="{DynamicResource SelectionInactive}" />
+                                <Setter Property="TextElement.Foreground" TargetName="Bd" Value="{DynamicResource SelectionInactiveText}" />
+                            </MultiTrigger>
+                            <!-- 禁用：文字退到灰色 -->
+                            <Trigger Property="UIElement.IsEnabled" Value="False">
+                                <Setter Property="TextElement.Foreground" TargetName="Bd" Value="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

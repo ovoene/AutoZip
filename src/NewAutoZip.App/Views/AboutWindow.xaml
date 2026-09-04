@@ -1,0 +1,105 @@
+<ui:FluentWindow x:Class="NewAutoZip.App.Views.AboutWindow"
+                 xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                 xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                 xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+                 Title="{Binding AboutTitle}"
+                 Width="560"
+                 SizeToContent="Height"
+                 ExtendsContentIntoTitleBar="True"
+                 ResizeMode="NoResize"
+                 ShowInTaskbar="True"
+                 WindowBackdropType="Mica"
+                 WindowCornerPreference="Round"
+                 WindowStartupLocation="CenterScreen">
+
+    <!--
+        独立的关于窗口。
+
+        为什么不用 ui:MessageBox：它是模态的，而"关于"要能在程序收在托盘里时直接弹出来。
+        模态框需要一个 Owner，托盘状态下主窗口是隐藏的 —— 拿隐藏窗口当 Owner 的模态框
+        会没有视觉归属（跑到别的程序后面去），而为了弹个关于把主窗口叫回来又正是要避免的事。
+        所以这里是一个无主的普通窗口：ShowInTaskbar 让用户总能找回它，
+        NoResize + SizeToContent 让它永远刚好包住内容。
+    -->
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <ui:TitleBar Grid.Row="0"
+                     Title="{Binding AboutTitle}"
+                     ShowMaximize="False"
+                     ShowMinimize="False">
+            <ui:TitleBar.Icon>
+                <ui:ImageIcon Source="pack://application:,,,/Assets/app.ico" />
+            </ui:TitleBar.Icon>
+        </ui:TitleBar>
+
+        <StackPanel Grid.Row="1" Margin="24,8,24,20">
+
+            <!-- 程序名 + 版本号，一行大字 -->
+            <TextBlock FontSize="22"
+                       FontWeight="SemiBold"
+                       Text="{Binding AboutHeadline}" />
+
+            <TextBlock Margin="0,10,0,0"
+                       FontSize="13"
+                       Foreground="{DynamicResource MutedText}"
+                       TextWrapping="Wrap"
+                       Text="{Binding AboutSummary}" />
+
+            <TextBlock Margin="0,10,0,0"
+                       FontSize="12"
+                       Foreground="{DynamicResource WarnText}"
+                       TextWrapping="Wrap"
+                       Text="{Binding AboutTrayNote}" />
+
+            <!--
+                路径与环境。ItemsControl 而不是手写五行 StackPanel：
+                行数会变（便携模式多一行"运行模式"），条目也在 ViewModel 里统一拼。
+            -->
+            <ui:Card Margin="0,16,0,0" Padding="14,12">
+                <ItemsControl ItemsSource="{Binding AboutRows}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Grid Margin="0,3">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="74" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+
+                                <TextBlock Grid.Column="0"
+                                           FontSize="12"
+                                           Foreground="{DynamicResource MutedText}"
+                                           Text="{Binding Label}" />
+
+                                <!--
+                                    路径可能很长（含中文目录名），必须能换行；
+                                    IsReadOnly 的 TextBox 而不是 TextBlock —— 用户要能选中复制，
+                                    报问题时把真实路径贴出来比让他手抄快得多。
+                                -->
+                                <TextBox Grid.Column="1"
+                                         Padding="0"
+                                         Background="Transparent"
+                                         BorderThickness="0"
+                                         FontSize="12"
+                                         IsReadOnly="True"
+                                         TextWrapping="Wrap"
+                                         Text="{Binding Value, Mode=OneWay}" />
+                            </Grid>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </ui:Card>
+
+            <ui:Button Margin="0,18,0,0"
+                       MinWidth="96"
+                       HorizontalAlignment="Right"
+                       Appearance="Primary"
+                       Click="OnClose"
+                       Content="知道了"
+                       IsDefault="True" />
+        </StackPanel>
+    </Grid>
+</ui:FluentWindow>

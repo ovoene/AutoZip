@@ -1,0 +1,700 @@
+<UserControl x:Class="NewAutoZip.App.Views.SettingsPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml">
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto" Padding="0,0,8,0">
+            <StackPanel DataContext="{Binding Settings}">
+
+                <!-- ==================================================
+                     目录
+                ================================================== -->
+                <ui:Card Margin="0,0,0,12">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource GroupTitle}" Text="目录" />
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="监控目录" />
+                            <ui:TextBox Width="440"
+                                        PlaceholderText="新文件出现在这个目录里就会被备份"
+                                        Text="{Binding MonitorPath, UpdateSourceTrigger=PropertyChanged}" />
+                            <ui:Button Margin="8,0,0,0" Appearance="Primary" Click="OnBrowseMonitor" Content="浏览…" />
+                        </StackPanel>
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="" />
+                            <CheckBox Content="包含子目录" IsChecked="{Binding IncludeSubdirectories}" />
+                        </StackPanel>
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="云盘类型" />
+                            <ComboBox Width="440"
+                                      DisplayMemberPath="Text"
+                                      ItemsSource="{Binding CloudTargets}"
+                                      SelectedItem="{Binding CloudTargetChoice}" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}" Text="{Binding CloudPathHint}" />
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="{Binding CloudPathLabel}" />
+                            <ui:TextBox Width="440"
+                                        PlaceholderText="压缩包会被剪切到这里"
+                                        Text="{Binding CloudPath, UpdateSourceTrigger=PropertyChanged}" />
+                            <ui:Button Margin="8,0,0,0" Appearance="Primary" Click="OnBrowseCloud" Content="浏览…" />
+                        </StackPanel>
+
+                        <!-- 本机注册表里发现的账号，一键填入，免得手抄路径抄错。非 OneDrive 模式下这一行没有意义 -->
+                        <StackPanel Style="{StaticResource FieldRow}"
+                                    Visibility="{Binding OneDriveAccounts.Count, Converter={StaticResource HasContent}}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="本机发现的账号" />
+                            <ComboBox x:Name="AccountPicker"
+                                      Width="440"
+                                      DisplayMemberPath="Text"
+                                      ItemsSource="{Binding OneDriveAccounts}" />
+                            <ui:Button Margin="8,0,0,0" Appearance="Primary" Click="OnUseAccount" Content="填入" />
+                        </StackPanel>
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="临时目录" />
+                            <ui:TextBox Width="440"
+                                        PlaceholderText="留空则用默认位置（数据目录下的 ZipTemp）"
+                                        Text="{Binding ZipTempPath, UpdateSourceTrigger=PropertyChanged}" />
+                            <ui:Button Margin="8,0,0,0" Appearance="Primary" Click="OnBrowseZipTemp" Content="浏览…" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="三个目录不能互相嵌套。若目标目录或临时目录落在监控目录里，生成的压缩包会被当成新文件再打一次包，自我喂养式膨胀，几轮就能填满磁盘 —— 启动前校验会直接拦住这种配置。" />
+
+                        <StackPanel Style="{StaticResource FieldRow}" Margin="0,12,0,0">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="排除规则" />
+                            <TextBox Width="440"
+                                     Height="88"
+                                     AcceptsReturn="True"
+                                     VerticalScrollBarVisibility="Auto"
+                                     Text="{Binding ExcludePatterns, UpdateSourceTrigger=PropertyChanged}" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="一行一条通配符，例如 *.tmp、~$*、*.7z、*.part。默认已排除常见的临时文件与压缩包自身。" />
+                    </StackPanel>
+                </ui:Card>
+
+                <!-- ==================================================
+                     工作时间
+                ================================================== -->
+                <ui:Card Margin="0,0,0,12">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource GroupTitle}" Text="工作时间" />
+
+                        <CheckBox Margin="0,0,0,10"
+                                  Content="限定生效日期范围"
+                                  IsChecked="{Binding LimitDates}" />
+
+                        <StackPanel Style="{StaticResource FieldRow}"
+                                    Visibility="{Binding LimitDates, Converter={StaticResource BoolVisibility}}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="从" />
+                            <DatePicker Width="180" SelectedDate="{Binding EffectiveFrom}" />
+                            <TextBlock Margin="12,0" VerticalAlignment="Center" Text="到" />
+                            <DatePicker Width="180" SelectedDate="{Binding EffectiveTo}" />
+                        </StackPanel>
+
+                        <!-- 起始日期同时是文件准入下限：用户设了日期却不见它认那天之后已有的文件，就是在这里困惑的 -->
+                        <TextBlock Style="{StaticResource Hint}" Text="{Binding EffectiveFromHint}" />
+
+                        <CheckBox Margin="0,0,0,10" Content="全天工作" IsChecked="{Binding AllDay}" />
+
+                        <StackPanel Style="{StaticResource FieldRow}"
+                                    Visibility="{Binding AllDay, Converter={StaticResource BoolVisibility}, ConverterParameter=invert}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="每日时段" />
+                            <ui:TextBox Width="{StaticResource TimeBoxWidth}"
+                                        PlaceholderText="HH:mm"
+                                        Text="{Binding DailyStartText, UpdateSourceTrigger=PropertyChanged}" />
+                            <TextBlock Margin="10,0" VerticalAlignment="Center" Text="→" />
+                            <ui:TextBox Width="{StaticResource TimeBoxWidth}"
+                                        PlaceholderText="HH:mm"
+                                        Text="{Binding DailyEndText, UpdateSourceTrigger=PropertyChanged}" />
+                        </StackPanel>
+
+                        <!-- 把时段解释成人话，尤其是跨夜 —— 旧版跨夜判断恒为假，配了也永远不工作 -->
+                        <TextBlock Style="{StaticResource Hint}" Text="{Binding DailyRangeHint}" />
+
+                        <StackPanel Style="{StaticResource FieldRow}" Margin="0,12,0,0">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="批处理窗口（分钟）" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="1440"
+                                          Minimum="1"
+                                          SmallChange="1"
+                                          LargeChange="10"
+                                          MaxDecimalPlaces="0"
+                                          Value="{Binding BatchWindowMinutes, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="第一个文件就绪后开一个窗口，窗口内陆续就绪的文件会攒到一起打成一个压缩包。设长一点能减少压缩包数量，代价是备份延迟变大。" />
+                    </StackPanel>
+                </ui:Card>
+
+                <!-- ==================================================
+                     文件监控
+                ================================================== -->
+                <ui:Card Margin="0,0,0,12">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource GroupTitle}" Text="文件监控" />
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="静默期（秒）" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="3600"
+                                          Minimum="5"
+                                          SmallChange="5"
+                                          LargeChange="30"
+                                          MaxDecimalPlaces="0"
+                                          Value="{Binding QuietSeconds, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="确认轮数" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="20"
+                                          Minimum="1"
+                                          SmallChange="1"
+                                          MaxDecimalPlaces="0"
+                                          Value="{Binding StableConfirmRounds, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="检查间隔（秒）" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="300"
+                                          Minimum="1"
+                                          SmallChange="1"
+                                          LargeChange="5"
+                                          MaxDecimalPlaces="0"
+                                          Value="{Binding RefreshIntervalSeconds, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <!-- 三个参数合起来意味着什么，直接算给用户看 -->
+                        <TextBlock Style="{StaticResource Hint}" Text="{Binding ReadyDelayHint}" />
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="静默期太短会把写得慢、中间有停顿的大文件误判成已完成，从而压进一个不完整的副本。这三个数的最小值都不允许填 0 —— 旧版可以填 0，那会让后台线程 100% 忙等。" />
+
+                        <StackPanel Style="{StaticResource FieldRow}" Margin="0,12,0,0">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="对账扫描间隔（秒）" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="86400"
+                                          Minimum="30"
+                                          SmallChange="30"
+                                          LargeChange="300"
+                                          MaxDecimalPlaces="0"
+                                          Value="{Binding ReconcileIntervalSeconds, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="监控靠系统事件通知，效率远高于定时全目录扫描；但事件队列会溢出丢事件，所以按这个间隔做一次全量对账兜底。" />
+
+                        <CheckBox Margin="0,12,0,0"
+                                  Content="首次启动时把目录里已有的文件也备份一遍"
+                                  IsChecked="{Binding ProcessExistingFilesOnFirstRun}" />
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="默认关闭。目录里原本有大量历史文件时，打开它会在第一轮产生一个巨大的压缩包。若上面「工作时间」里设了生效起始日期，这个开关就不起作用了 —— 那个日期更精确：它之后的已有文件都会备份，之前的都不碰。" />
+                    </StackPanel>
+                </ui:Card>
+
+                <!-- ==================================================
+                     压缩与加密
+                ================================================== -->
+                <ui:Card Margin="0,0,0,12">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource GroupTitle}" Text="压缩与加密" />
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="压缩密码" />
+                            <ui:PasswordBox Width="280" Password="{Binding Password, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="用 AES-256 加密。密码只存在本机、用当前 Windows 账户的 DPAPI 加密后落盘，且永不写入日志。忘记密码等于永久丢失备份 —— 请自己另存一份。" />
+
+                        <StackPanel Style="{StaticResource FieldRow}" Margin="0,12,0,0">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="压缩级别（0–9）" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="9"
+                                          Minimum="0"
+                                          SmallChange="1"
+                                          MaxDecimalPlaces="0"
+                                          Value="{Binding CompressionLevel, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}" Text="{Binding CompressionHint}" />
+
+                        <CheckBox Margin="0,12,0,0"
+                                  Content="同时加密文件名"
+                                  IsChecked="{Binding EncryptFileNames}" />
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="强烈建议开启。不开的话，任何人不用密码就能看到压缩包里所有文件的名字和大小 —— 文件名往往本身就是敏感信息。" />
+
+                        <StackPanel Style="{StaticResource FieldRow}" Margin="0,12,0,0">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="压缩包名前缀" />
+                            <ui:TextBox Width="220" Text="{Binding ArchivePrefix, UpdateSourceTrigger=PropertyChanged}" />
+                        </StackPanel>
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="打包超时（分钟）" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="1440"
+                                          Minimum="1"
+                                          SmallChange="10"
+                                          LargeChange="60"
+                                          MaxDecimalPlaces="0"
+                                          Value="{Binding PackTimeoutMinutes, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="超时后压缩进程会被结束，半成品文件删掉，按失败走退避重试。旧版没有超时也不读子进程输出，管道写满就永久卡死。" />
+                    </StackPanel>
+                </ui:Card>
+
+                <!-- ==================================================
+                     磁盘与配额
+                ================================================== -->
+                <ui:Card Margin="0,0,0,12">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource GroupTitle}" Text="磁盘与配额" />
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Margin="0,0,0,10"
+                                   Text="这一组是“磁盘被填满”的防线。三条配额同时生效，任何一条超限就按最旧优先淘汰临时目录里的压缩包。" />
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="保留天数" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="365"
+                                          Minimum="1"
+                                          SmallChange="1"
+                                          MaxDecimalPlaces="0"
+                                          Value="{Binding ZipTempKeepDays, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="最多保留几个包" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="10000"
+                                          Minimum="1"
+                                          SmallChange="1"
+                                          LargeChange="10"
+                                          MaxDecimalPlaces="0"
+                                          Value="{Binding ZipTempMaxCount, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="临时目录上限（GB）" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="4096"
+                                          Minimum="0.0625"
+                                          SmallChange="1"
+                                          LargeChange="10"
+                                          MaxDecimalPlaces="2"
+                                          Value="{Binding ZipTempMaxTotalGb, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="最低保留空间（GB）" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="4096"
+                                          Minimum="0"
+                                          SmallChange="1"
+                                          LargeChange="10"
+                                          MaxDecimalPlaces="2"
+                                          Value="{Binding MinFreeDiskGb, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="打包前先预检：预计体积放不下、或卷剩余低于这个值，就直接拒绝打包并发告警，一个文件都不产生。填 0 等于关掉预检。" />
+
+                        <StackPanel Style="{StaticResource FieldRow}" Margin="0,12,0,0">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="失败几次后隔离" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="100"
+                                          Minimum="1"
+                                          SmallChange="1"
+                                          MaxDecimalPlaces="0"
+                                          Value="{Binding MaxAttemptsBeforeQuarantine, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="同一批文件连续失败达到这个次数后进入隔离，程序停止重试并发出醒目通知。这是最后一道闸门：任何情况下一个批次都不可能无限重试。" />
+                    </StackPanel>
+                </ui:Card>
+
+                <!-- ==================================================
+                     OneDrive —— 只有云盘类型选了 OneDrive 才有意义。
+                     选了普通目录时整张卡片隐藏：那时程序不等上传、不检测客户端、
+                     也不会释放本地空间，留着这三项只会让人以为它们仍在生效。
+                ================================================== -->
+                <ui:Card Margin="0,0,0,12"
+                         Visibility="{Binding IsOneDriveTarget, Converter={StaticResource BoolVisibility}}">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource GroupTitle}" Text="OneDrive 上传" />
+
+                        <CheckBox Content="上传完成后释放本地空间（变成“仅联机”）"
+                                  IsChecked="{Binding ReleaseLocalSpace}" />
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="OneDrive 不会脱水一个还没上传完的文件，所以“脱水成功”本身就是“云端已收到”的确证。这是判断上传完成最可靠的信号，而且顺带把本地空间腾出来了。" />
+
+                        <StackPanel Style="{StaticResource FieldRow}" Margin="0,12,0,0">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="上传超时（分钟）" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="1440"
+                                          Minimum="1"
+                                          SmallChange="10"
+                                          LargeChange="60"
+                                          MaxDecimalPlaces="0"
+                                          Value="{Binding UploadTimeoutMinutes, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="检查间隔（秒）" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="600"
+                                          Minimum="2"
+                                          SmallChange="1"
+                                          LargeChange="10"
+                                          MaxDecimalPlaces="0"
+                                          Value="{Binding UploadPollSeconds, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="超时后程序会如实记为“已移入 OneDrive 目录，但未能确认上传完成”，绝不谎报成功 —— 旧版在英文系统上必然走到这一步，却照样发“上传完成”的通知。等待中的归档会写进状态文件，重启后继续等，不会重新打包。" />
+                    </StackPanel>
+                </ui:Card>
+
+                <!-- ==================================================
+                     通知
+                ================================================== -->
+                <ui:Card Margin="0,0,0,12">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource GroupTitle}" Text="通知" />
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="渠道" />
+                            <ComboBox Width="280"
+                                      DisplayMemberPath="Text"
+                                      ItemsSource="{Binding NotifyChannels}"
+                                      SelectedItem="{Binding NotifyChannel, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="必须显式选择。旧版靠地址里是否含 weixin 之类的字样去猜，而各通道自己的启用判断用的又是另一套规则，两者不一致时界面显示“已启用”、消息却被静默丢弃。" />
+
+                        <StackPanel Style="{StaticResource FieldRow}"
+                                    Margin="0,12,0,0"
+                                    Visibility="{Binding NeedsWebhookUrl, Converter={StaticResource BoolVisibility}}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="Webhook 地址" />
+                            <ui:TextBox Width="440"
+                                        PlaceholderText="https://…"
+                                        Text="{Binding WebhookUrl, UpdateSourceTrigger=PropertyChanged}" />
+                        </StackPanel>
+
+                        <StackPanel Visibility="{Binding NeedsTelegram, Converter={StaticResource BoolVisibility}}">
+                            <StackPanel Style="{StaticResource FieldRow}" Margin="0,12,0,0">
+                                <TextBlock Style="{StaticResource FieldLabel}" Text="Bot Token" />
+                                <ui:TextBox Width="440" Text="{Binding TelegramBotToken, UpdateSourceTrigger=PropertyChanged}" />
+                            </StackPanel>
+
+                            <StackPanel Style="{StaticResource FieldRow}">
+                                <TextBlock Style="{StaticResource FieldLabel}" Text="Chat ID" />
+                                <ui:TextBox Width="220" Text="{Binding TelegramChatId, UpdateSourceTrigger=PropertyChanged}" />
+                            </StackPanel>
+                        </StackPanel>
+
+                        <StackPanel Margin="0,12,0,0"
+                                    Visibility="{Binding NotifyConfigured, Converter={StaticResource BoolVisibility}}">
+                            <TextBlock Margin="0,0,0,8" Text="要通知哪些事件" />
+
+                            <!--
+                                顺序 = 一次备份的时间线，不是枚举的定义顺序：
+                                启动 → 开工 → 发现新文件 → 就绪 → 打包 → 上传 → 结束 → 收工，
+                                后面才是三个异常事件和【停止】。照时间线排，用户一眼就能看出
+                                自己关掉的是哪一段，也能看出漏掉了哪一段。
+
+                                宽度 190 而不是 170：【第 N 次发现新文件】比原来的【开始】长了一截，
+                                170 会把最后那个方括号挤掉。整排一起加宽 —— 只改一个会错列。
+                            -->
+                            <WrapPanel>
+                                <CheckBox Width="190" Margin="0,0,0,6" Content="【启动】程序启动" IsChecked="{Binding NotifyEngineStarted}" />
+                                <CheckBox Width="190" Margin="0,0,0,6" Content="【开工】进入时段" IsChecked="{Binding NotifyScheduleOpened}" />
+                                <CheckBox Width="190" Margin="0,0,0,6" Content="【第 N 次发现新文件】" IsChecked="{Binding NotifyRoundStarted}" />
+                                <CheckBox Width="190" Margin="0,0,0,6" Content="【就绪】文件已稳定" IsChecked="{Binding NotifyFilesStable}" />
+                                <CheckBox Width="190" Margin="0,0,0,6" Content="【打包】打包完成" IsChecked="{Binding NotifyPackCompleted}" />
+                                <CheckBox Width="190" Margin="0,0,0,6" Content="【上传】开始上传" IsChecked="{Binding NotifyUploadCompleted}" />
+                                <CheckBox Width="190" Margin="0,0,0,6" Content="【结束】上传完成" IsChecked="{Binding NotifyRoundFinished}" />
+                                <CheckBox Width="190" Margin="0,0,0,6" Content="【收工】离开时段" IsChecked="{Binding NotifyScheduleClosed}" />
+                                <CheckBox Width="190" Margin="0,0,0,6" Content="【失败】处理失败" IsChecked="{Binding NotifyFailure}" />
+                                <CheckBox Width="190" Margin="0,0,0,6" Content="【隔离】进入隔离" IsChecked="{Binding NotifyQuarantined}" />
+                                <CheckBox Width="190" Margin="0,0,0,6" Content="【磁盘】磁盘告警" IsChecked="{Binding NotifyDiskWarning}" />
+                                <CheckBox Width="190" Margin="0,0,0,6" Content="【停止】程序停止" IsChecked="{Binding NotifyEngineStopped}" />
+                            </WrapPanel>
+
+                            <TextBlock Style="{StaticResource Hint}"
+                                       Text="方括号里就是通知正文里显示的标签。一次完整的备份会按这个顺序发消息：【第 N 次发现新文件】一发现新文件就发（还在观察，N 数的是本轮第几次通报、不是文件数：同一时刻进来 2 个文件也只发一条，编号只 +1；正文里的 1. 2. 3. 每条通知各自从 1 数，只列这一条带来的文件；同一个文件一轮只通报一次，大小变了不再重发）→【就绪】窗口内所有文件都不再变化，一个窗口只发一次 →【打包】压缩包已生成并校验 →【上传】压缩包刚进目标目录、正在上传 →【结束】云端确认收到，“共计耗时”按第 1 次发现新文件到【结束】计算，最后一行是下一次的工作开始时间。" />
+
+                            <TextBlock Style="{StaticResource Hint}"
+                                       Text="【启动】【停止】是程序进程的启停；【开工】【收工】是工作时段的进出（“全天”模式下没有进出，这两条不会发），【收工】正文里带下一次工作开始时间。另外，源文件在打包前全部消失时，本轮会以【取消】收尾并列出消失的文件 —— 它跟【结束】共用上面那一个开关。" />
+
+                            <TextBlock Style="{StaticResource Hint}"
+                                       Text="至少保留“失败”和“进入隔离” —— 这两个才是真正需要你介入的时刻。旧版恰恰在打包失败时不发任何通知。" />
+                        </StackPanel>
+                    </StackPanel>
+                </ui:Card>
+
+                <!-- ==================================================
+                     界面与运行
+                ================================================== -->
+                <ui:Card Margin="0,0,0,12">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource GroupTitle}" Text="界面与运行" />
+
+                        <CheckBox Margin="0,0,0,8" Content="随 Windows 登录自动启动，并最小化到托盘" IsChecked="{Binding StartMinimized}" />
+                        <CheckBox Margin="0,0,0,8" Content="程序启动后自动开始备份" IsChecked="{Binding AutoStartEngine}" />
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="第一项会往当前用户的“启动”项里登记这个程序（不需要管理员权限，任务管理器的“启动”页里能看到它）；开机后程序直接收在右下角托盘里，不弹窗口。取消勾选会同时撤销登记。想让它开机就自己干活，把两项都勾上。" />
+
+                        <StackPanel Style="{StaticResource FieldRow}" Margin="0,8,0,0">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="日志级别" />
+                            <ComboBox Width="280"
+                                      DisplayMemberPath="Text"
+                                      ItemsSource="{Binding LogLevels}"
+                                      SelectedItem="{Binding LogLevelChoice, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="只影响界面和日志文件的详细程度，不影响备份行为。排查问题时切到“调试”。" />
+                    </StackPanel>
+                </ui:Card>
+
+                <!-- ==================================================
+                     外观：主题模式 / 强调色 / 背景图片
+
+                     这一组是唯一<b>不用点“保存”</b>的设置：选完立刻生效并立刻落盘。
+                     挑颜色看不见效果的话这个功能等于没有，而看见了又要求用户记得去点保存
+                     同样说不通。其余设置仍然全部走“保存”。
+
+                     三个概念显式分块并各自带一句说明 —— 原来叫“皮肤色”的那一项
+                     其实只改强调色，用户会以为它能换整套皮肤/背景。
+                ================================================== -->
+                <ui:Card Margin="0,0,0,12">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource GroupTitle}" Text="外观" />
+
+                        <TextBlock Margin="0,0,0,8"
+                                   Style="{StaticResource SubTitle}"
+                                   Text="主题模式" />
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="深色 / 浅色" />
+                            <ComboBox Width="280"
+                                      DisplayMemberPath="Text"
+                                      ItemsSource="{Binding Themes}"
+                                      SelectedItem="{Binding ThemeChoice, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <!--
+                            “跟随系统”到底落成了深色还是浅色，得说出来 ——
+                            这个属性在 MainViewModel 上（它才拿着 ThemeService），
+                            所以要从 UserControl 的 DataContext 取，本卡片的上下文是 Settings。
+                        -->
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="{Binding DataContext.EffectiveThemeText, RelativeSource={RelativeSource AncestorType=UserControl}}" />
+
+                        <TextBlock Style="{StaticResource SubTitle}" Text="强调色" />
+
+                        <TextBlock Margin="0,0,0,8"
+                                   Style="{StaticResource Hint}"
+                                   Text="只改按钮、勾选框、进度条这类控件的高亮颜色，不是背景图。" />
+
+                        <ItemsControl Margin="0,0,0,4" ItemsSource="{Binding AccentSwatches}">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <WrapPanel />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Button Width="42"
+                                            Height="42"
+                                            Margin="0,0,6,6"
+                                            Padding="0"
+                                            Background="Transparent"
+                                            BorderThickness="0"
+                                            Command="{Binding DataContext.PickAccentCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                            CommandParameter="{Binding Hex}"
+                                            ToolTip="{Binding Name}">
+                                        <Grid Width="34" Height="34">
+                                            <!-- 选中环。用两个椭圆而不是绑 BorderThickness，省一个转换器。 -->
+                                            <Ellipse Stroke="{DynamicResource TextFillColorPrimaryBrush}"
+                                                     StrokeThickness="2"
+                                                     Visibility="{Binding IsSelected, Converter={StaticResource BoolVisibility}}" />
+                                            <Ellipse Margin="4" Fill="{Binding Fill}" />
+                                        </Grid>
+                                    </Button>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+
+                        <StackPanel Style="{StaticResource FieldRow}" Margin="0,8,0,0">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="自定义颜色" />
+                            <ui:TextBox Width="160"
+                                        MaxLength="7"
+                                        PlaceholderText="#0078D4"
+                                        Text="{Binding AccentColor, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            <ui:Button Margin="8,0,0,0"
+                                       Appearance="Primary"
+                                       Command="{Binding ResetAccentCommand}"
+                                       Content="跟随系统强调色" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}" Text="{Binding AccentColorHint}" />
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Foreground="{DynamicResource ErrorText}"
+                                   Text="这个颜色填得不对，先按上一个有效的颜色显示。"
+                                   Visibility="{Binding AccentColorValid, Converter={StaticResource BoolVisibility}, ConverterParameter=invert}" />
+
+                        <!-- ============ 背景图片 ============ -->
+                        <TextBlock Style="{StaticResource SubTitle}" Text="背景图片" />
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="图片文件" />
+                            <ui:TextBox Width="360"
+                                        PlaceholderText="留空则不使用背景图"
+                                        Text="{Binding BackgroundImagePath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            <ui:Button Margin="8,0,0,0"
+                                       Appearance="Primary"
+                                       Click="OnPickBackground"
+                                       Content="选择图片…" />
+                            <ui:Button Margin="8,0,0,0"
+                                       Appearance="Primary"
+                                       Command="{Binding ClearBackgroundCommand}"
+                                       Content="不用背景图" />
+                        </StackPanel>
+
+                        <!--
+                            模糊与不透明度用滑块而不是数字框：这两项是“边拖边看”的，
+                            填数字要先在脑子里换算成观感，滑一下就有结论。
+                            没选图时禁用 —— 摆着能拖但什么都不会变的控件是在骗人。
+
+                            Delay=120 是性能上必须的，别去掉：拖动滑块时 Value 按鼠标移动
+                            的频率变化，每一次都会一路走到 ThemeService.Apply 并且重烘背景图。
+                            不节流就是一秒几十次，界面直接拖死。120 毫秒相当于“手停下来才算数”，
+                            观感上仍是即时的。
+
+                            右边那个数字读的是滑块自己的 Value（ElementName），不是绑定源 ——
+                            这样数字跟着滑块手柄实时走，节流只作用在真正贵的那条路上。
+                        -->
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="模糊" />
+                            <Slider x:Name="BlurSlider"
+                                    Width="280"
+                                    VerticalAlignment="Center"
+                                    IsEnabled="{Binding HasBackground}"
+                                    Maximum="60"
+                                    Minimum="0"
+                                    TickFrequency="1"
+                                    IsSnapToTickEnabled="True"
+                                    Value="{Binding BackgroundBlur, Mode=TwoWay, Delay=120}" />
+                            <TextBlock Width="52"
+                                       Margin="12,0,0,0"
+                                       VerticalAlignment="Center"
+                                       Text="{Binding Value, ElementName=BlurSlider, StringFormat={}{0:0}}" />
+                        </StackPanel>
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="不透明度" />
+                            <Slider x:Name="OpacitySlider"
+                                    Width="280"
+                                    VerticalAlignment="Center"
+                                    IsEnabled="{Binding HasBackground}"
+                                    Maximum="100"
+                                    Minimum="5"
+                                    TickFrequency="1"
+                                    IsSnapToTickEnabled="True"
+                                    Value="{Binding BackgroundOpacity, Mode=TwoWay, Delay=120}" />
+                            <TextBlock Width="52"
+                                       Margin="12,0,0,0"
+                                       VerticalAlignment="Center"
+                                       Text="{Binding Value, ElementName=OpacitySlider, StringFormat={}{0:0}%}" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}" Text="{Binding BackgroundHint}" />
+
+                        <!-- 图载不进来必须说出原因。静默失败会让用户以为是自己选错了图。 -->
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Foreground="{DynamicResource ErrorText}"
+                                   Text="{Binding BackgroundProblem}"
+                                   Visibility="{Binding HasBackgroundProblem, Converter={StaticResource BoolVisibility}}" />
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="以上三项都是选完立刻生效、立刻记住，不用点下面的“保存配置”。" />
+                    </StackPanel>
+                </ui:Card>
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- ==================================================
+             校验结果：一次列出全部问题，不弹一串 MessageBox
+        ================================================== -->
+        <ui:Card Grid.Row="1"
+                 Margin="0,12,0,0"
+                 Visibility="{Binding ValidationText, Converter={StaticResource HasContent}}">
+            <StackPanel>
+                <TextBlock Style="{StaticResource GroupTitle}" Text="配置检查" />
+                <ScrollViewer MaxHeight="150" VerticalScrollBarVisibility="Auto">
+                    <TextBlock FontSize="12"
+                               LineHeight="19"
+                               Text="{Binding ValidationText}"
+                               TextWrapping="Wrap" />
+                </ScrollViewer>
+            </StackPanel>
+        </ui:Card>
+
+        <!-- ==================================================
+             操作条
+        ================================================== -->
+        <Grid Grid.Row="2" Margin="0,12,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <StackPanel Grid.Column="0" VerticalAlignment="Center" Orientation="Horizontal">
+                <ui:Button Margin="0,0,8,0" Appearance="Primary" Command="{Binding TestNotifyCommand}" Content="测试发送通知" />
+                <TextBlock VerticalAlignment="Center" FontSize="12" Text="{Binding NotifyTestResult}" />
+            </StackPanel>
+
+            <StackPanel Grid.Column="1" Orientation="Horizontal">
+                <TextBlock Margin="0,0,12,0"
+                           VerticalAlignment="Center"
+                           FontSize="12"
+                           Foreground="{DynamicResource WarnText}"
+                           Text="有未保存的改动"
+                           Visibility="{Binding Settings.IsDirty, Converter={StaticResource BoolVisibility}}" />
+
+                <!-- 放弃改动是"扔掉刚敲的东西"，给它 Caution 色：带颜色，但和"保存"区分得开。 -->
+                <ui:Button Margin="0,0,8,0" Appearance="Caution" Command="{Binding ReloadSettingsCommand}" Content="放弃改动" />
+                <ui:Button Appearance="Primary" Command="{Binding SaveSettingsCommand}" Content="保存" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</UserControl>

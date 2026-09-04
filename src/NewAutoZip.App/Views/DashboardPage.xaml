@@ -1,0 +1,421 @@
+<UserControl x:Class="NewAutoZip.App.Views.DashboardPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml">
+
+    <UserControl.Resources>
+        <!--
+            ==================== 步骤条的三种状态 ====================
+
+            已完成 / 正在进行 / 还没到，三种状态用<b>颜色 + 是否加粗</b>区分，
+            不靠动画 —— 这一格每 250 毫秒被刷新一次，任何动画都会一直重启。
+
+            "还没到"用 MultiDataTrigger（IsDone=False 且 IsActive=False）而不是
+            在 Setter 里写默认色：那样一来正常状态的文字颜色就被钉死了，
+            深浅主题切换时不会跟着走。不设 Foreground 就继承主题的正文色。
+        -->
+
+        <!-- 序号圆圈 -->
+        <Style x:Key="StepDot" TargetType="Border">
+            <Setter Property="Width" Value="26" />
+            <Setter Property="Height" Value="26" />
+            <Setter Property="CornerRadius" Value="13" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderBrush" Value="{DynamicResource MutedText}" />
+            <Setter Property="VerticalAlignment" Value="Top" />
+            <Setter Property="Margin" Value="0,1,10,0" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsDone}" Value="True">
+                    <Setter Property="BorderBrush" Value="{DynamicResource DotOk}" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding IsActive}" Value="True">
+                    <Setter Property="Background" Value="{DynamicResource RunningBadgeBg}" />
+                    <Setter Property="BorderBrush" Value="{DynamicResource RunningBadgeBg}" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <!-- 圈里的序号 -->
+        <Style x:Key="StepOrdinal" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="HorizontalAlignment" Value="Center" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Style.Triggers>
+                <MultiDataTrigger>
+                    <MultiDataTrigger.Conditions>
+                        <Condition Binding="{Binding IsDone}" Value="False" />
+                        <Condition Binding="{Binding IsActive}" Value="False" />
+                    </MultiDataTrigger.Conditions>
+                    <Setter Property="Foreground" Value="{DynamicResource MutedText}" />
+                </MultiDataTrigger>
+                <DataTrigger Binding="{Binding IsDone}" Value="True">
+                    <Setter Property="Visibility" Value="Collapsed" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding IsActive}" Value="True">
+                    <Setter Property="Foreground" Value="{DynamicResource RunningBadgeText}" />
+                    <Setter Property="FontWeight" Value="SemiBold" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <!-- 走过的那几步：序号换成对勾。用 U+2713 而不是图标字体，任何字体都有。 -->
+        <Style x:Key="StepCheck" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="HorizontalAlignment" Value="Center" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="Foreground" Value="{DynamicResource DotOk}" />
+            <Setter Property="Visibility" Value="Collapsed" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsDone}" Value="True">
+                    <Setter Property="Visibility" Value="Visible" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <!-- 步骤名 -->
+        <Style x:Key="StepTitle" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Style.Triggers>
+                <MultiDataTrigger>
+                    <MultiDataTrigger.Conditions>
+                        <Condition Binding="{Binding IsDone}" Value="False" />
+                        <Condition Binding="{Binding IsActive}" Value="False" />
+                    </MultiDataTrigger.Conditions>
+                    <Setter Property="Foreground" Value="{DynamicResource MutedText}" />
+                </MultiDataTrigger>
+                <DataTrigger Binding="{Binding IsActive}" Value="True">
+                    <Setter Property="FontWeight" Value="SemiBold" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <!--
+            「正在进行」徽章。
+
+            只在正在跑的那一步上出现，位置在这一行的最右边 —— 视线从步骤名扫过去
+            正好落在它上面，而且不会因为步骤名长短不同而上下错位。
+            配色用专门的 RunningBadgeBg/Text（紫罗兰），刻意不跟随强调色：
+            强调色用户能自己改，跟着走就可能和选中态糊成一片。
+        -->
+        <Style x:Key="RunningBadge" TargetType="Border">
+            <Setter Property="Background" Value="{DynamicResource RunningBadgeBg}" />
+            <Setter Property="CornerRadius" Value="9" />
+            <Setter Property="Padding" Value="8,2" />
+            <Setter Property="Margin" Value="8,1,0,0" />
+            <Setter Property="VerticalAlignment" Value="Top" />
+            <Setter Property="Visibility" Value="Collapsed" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsActive}" Value="True">
+                    <Setter Property="Visibility" Value="Visible" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+    </UserControl.Resources>
+
+    <!--
+        左边一列是"发生了什么"（统计 / 批次 / 队列 / 结果 / 位置），
+        右边一列是"现在走到哪了"。分成两列而不是继续往下堆：
+        流水线进度是需要<b>随时瞥一眼</b>的东西，滚到页面底部才能看到等于没有。
+    -->
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="312" />
+        </Grid.ColumnDefinitions>
+
+        <ScrollViewer Grid.Column="0" Margin="0,0,12,0" VerticalScrollBarVisibility="Auto">
+            <StackPanel>
+
+                <!-- ==================== 累计统计 ==================== -->
+                <UniformGrid Columns="4" Margin="0,0,0,12">
+                    <ui:Card Margin="0,0,6,0">
+                        <StackPanel>
+                            <TextBlock Style="{StaticResource StatValue}" Text="{Binding ArchivesCreatedText}" />
+                            <TextBlock Style="{StaticResource StatCaption}" Text="已生成压缩包" />
+                        </StackPanel>
+                    </ui:Card>
+
+                    <ui:Card Margin="6,0">
+                        <StackPanel>
+                            <TextBlock Style="{StaticResource StatValue}" Text="{Binding FilesArchivedText}" />
+                            <TextBlock Style="{StaticResource StatCaption}" Text="已备份文件数" />
+                        </StackPanel>
+                    </ui:Card>
+
+                    <ui:Card Margin="6,0">
+                        <StackPanel>
+                            <TextBlock Style="{StaticResource StatValue}" Text="{Binding BytesArchivedText}" />
+                            <TextBlock Style="{StaticResource StatCaption}" Text="已备份数据量" />
+                        </StackPanel>
+                    </ui:Card>
+
+                    <!-- 剩余空间低于阈值时变红。这是"磁盘被填满"这类故障最早能看到的信号。 -->
+                    <ui:Card Margin="6,0,0,0">
+                        <StackPanel>
+                            <TextBlock Text="{Binding FreeDiskText}">
+                                <TextBlock.Style>
+                                    <Style BasedOn="{StaticResource StatValue}" TargetType="TextBlock">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding DiskLow}" Value="True">
+                                                <Setter Property="Foreground" Value="{DynamicResource ErrorText}" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                            <TextBlock Style="{StaticResource StatCaption}" Text="临时目录所在卷剩余" />
+                        </StackPanel>
+                    </ui:Card>
+                </UniformGrid>
+
+                <!-- ==================== 当前批次 ==================== -->
+                <ui:Card Margin="0,0,0,12">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource GroupTitle}" Text="当前批次" />
+
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Foreground="{DynamicResource MutedText}" Text="正在观察的文件" />
+                                <TextBlock Margin="0,2,0,0" FontWeight="SemiBold" Text="{Binding TrackedCountText}" />
+                            </StackPanel>
+
+                            <StackPanel Grid.Column="1">
+                                <TextBlock Foreground="{DynamicResource MutedText}" Text="已就绪待打包" />
+                                <TextBlock Margin="0,2,0,0" FontWeight="SemiBold" Text="{Binding BatchText}" />
+                            </StackPanel>
+
+                            <StackPanel Grid.Column="2">
+                                <TextBlock Foreground="{DynamicResource MutedText}" Text="批处理窗口" />
+                                <TextBlock Margin="0,2,0,0" FontWeight="SemiBold" Text="{Binding WindowText}" />
+                            </StackPanel>
+                        </Grid>
+                    </StackPanel>
+                </ui:Card>
+
+                <!-- ==================== 送达与重试 ====================
+                     "等待确认"那一格只有 OneDrive 模式才有意义：其他云盘下程序
+                     移入目录就收工，不存在"等待上传"这件事，留着这一格会让人
+                     以为程序还在替云盘客户端盯着。
+                ==================== -->
+                <ui:Card Margin="0,0,0,12">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource GroupTitle}" Text="送达与重试" />
+
+                        <StackPanel Margin="0,0,0,8" Orientation="Horizontal">
+                            <StackPanel Width="240"
+                                        Visibility="{Binding IsOneDriveMode, Converter={StaticResource BoolVisibility}}">
+                                <TextBlock Foreground="{DynamicResource MutedText}" Text="等待 OneDrive 确认" />
+                                <TextBlock Margin="0,2,0,0" FontWeight="SemiBold" Text="{Binding PendingUploadText}" />
+                            </StackPanel>
+
+                            <StackPanel Width="240">
+                                <TextBlock Foreground="{DynamicResource MutedText}" Text="退避重试" />
+                                <TextBlock Margin="0,2,0,0" FontWeight="SemiBold" Text="{Binding RetryText}" />
+                            </StackPanel>
+                        </StackPanel>
+
+                        <!-- 待上传归档明细。重启后这些记录会从 state.json 恢复，不会重新打包。 -->
+                        <DataGrid MaxHeight="180"
+                                  ItemsSource="{Binding PendingUploads}"
+                                  Style="{StaticResource ReadOnlyGrid}"
+                                  Visibility="{Binding PendingUploads.Count, Converter={StaticResource HasContent}}">
+                            <DataGrid.Columns>
+                                <DataGridTextColumn Binding="{Binding FileName}" Header="归档" Width="*" />
+                                <DataGridTextColumn Binding="{Binding SizeText}" Header="大小" Width="90" />
+                                <DataGridTextColumn Binding="{Binding FileCount}" Header="含文件" Width="70" />
+                                <DataGridTextColumn Binding="{Binding DeliveredLocal, Converter={StaticResource Stamp}}" Header="移入时间" Width="175" />
+                                <DataGridTextColumn Binding="{Binding Polls}" Header="已检查" Width="70" />
+                            </DataGrid.Columns>
+                        </DataGrid>
+
+                        <!-- 重试队列。有内容就说明出过错，但程序还在自己想办法。 -->
+                        <DataGrid MaxHeight="140"
+                                  Margin="0,8,0,0"
+                                  ItemsSource="{Binding Retries}"
+                                  Style="{StaticResource ReadOnlyGrid}"
+                                  Visibility="{Binding Retries.Count, Converter={StaticResource HasContent}}">
+                            <DataGrid.Columns>
+                                <DataGridTextColumn Binding="{Binding FileCount}" Header="含文件" Width="70" />
+                                <DataGridTextColumn Binding="{Binding Attempts}" Header="已试" Width="60" />
+                                <DataGridTextColumn Binding="{Binding NextAttemptLocal, StringFormat=HH:mm:ss}" Header="下次" Width="90" />
+                                <DataGridTextColumn Binding="{Binding LastError}" Header="上次失败原因" Width="*" />
+                            </DataGrid.Columns>
+                        </DataGrid>
+                    </StackPanel>
+                </ui:Card>
+
+                <!-- ==================== 最近结果 ====================
+                     打包和送达<b>分开报</b>。"包打好了但没送上去"和"压根没打出包"
+                     要采取的行动完全不同，只报一个笼统的"最近失败"等于让用户
+                     自己去翻日志才知道该做什么。
+                     送达那两行的标题随云盘类型变：OneDrive 说"上传"，其他云盘说"移入"。
+                ==================== -->
+                <ui:Card Margin="0,0,0,12">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource GroupTitle}" Text="最近结果" />
+
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+
+                            <TextBlock Grid.Row="0" Grid.Column="0"
+                                       Width="104"
+                                       Margin="0,0,0,6"
+                                       Foreground="{DynamicResource MutedText}"
+                                       Text="最近打包成功" />
+                            <TextBlock Grid.Row="0" Grid.Column="1"
+                                       Margin="0,0,0,6"
+                                       Text="{Binding LastPackSuccessText}" />
+
+                            <TextBlock Grid.Row="1" Grid.Column="0"
+                                       Width="104"
+                                       Margin="0,0,0,6"
+                                       Foreground="{DynamicResource MutedText}"
+                                       Text="{Binding DeliverSuccessLabel}" />
+                            <TextBlock Grid.Row="1" Grid.Column="1"
+                                       Margin="0,0,0,6"
+                                       Text="{Binding LastDeliverSuccessText}" />
+
+                            <TextBlock Grid.Row="2" Grid.Column="0"
+                                       Width="104"
+                                       Margin="0,0,0,6"
+                                       Foreground="{DynamicResource MutedText}"
+                                       Text="最近打包失败" />
+                            <TextBlock Grid.Row="2" Grid.Column="1"
+                                       Margin="0,0,0,6"
+                                       TextWrapping="Wrap"
+                                       Text="{Binding LastPackFailureText}">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding HasPackFailure}" Value="True">
+                                                <Setter Property="Foreground" Value="{DynamicResource WarnText}" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+
+                            <TextBlock Grid.Row="3" Grid.Column="0"
+                                       Width="104"
+                                       Foreground="{DynamicResource MutedText}"
+                                       Text="{Binding DeliverFailureLabel}" />
+                            <TextBlock Grid.Row="3" Grid.Column="1"
+                                       TextWrapping="Wrap"
+                                       Text="{Binding LastDeliverFailureText}">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding HasDeliverFailure}" Value="True">
+                                                <Setter Property="Foreground" Value="{DynamicResource WarnText}" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                        </Grid>
+                    </StackPanel>
+                </ui:Card>
+
+                <!-- ==================== 位置 ==================== -->
+                <ui:Card>
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource GroupTitle}" Text="位置" />
+
+                        <StackPanel Margin="0,0,0,8" Orientation="Horizontal">
+                            <TextBlock Width="120" Foreground="{DynamicResource MutedText}" Text="临时文件目录" />
+                            <TextBlock VerticalAlignment="Center" Text="{Binding ZipTempText}" />
+                        </StackPanel>
+
+                        <WrapPanel>
+                            <ui:Button Margin="0,0,8,8" Appearance="Primary" Command="{Binding OpenZipTempCommand}" Content="打开临时文件目录" />
+                            <ui:Button Margin="0,0,8,8" Appearance="Primary" Command="{Binding OpenMonitorFolderCommand}" Content="打开监控文件目录" />
+                            <ui:Button x:Name="OpenCloudFolderButton" Margin="0,0,8,8" Appearance="Primary" Command="{Binding OpenCloudFolderCommand}" Content="{Binding OpenCloudFolderText}" />
+                            <ui:Button Margin="0,0,8,8" Appearance="Primary" Command="{Binding OpenDataFolderCommand}" Content="打开程序所在目录" />
+                        </WrapPanel>
+                    </StackPanel>
+                </ui:Card>
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- ==================== 执行到哪一步了 ====================
+             FillCard 让卡片撑满这一格的高度 —— ui:Card 的默认样式把内容钉在顶部，
+             不套这个样式的话卡片只有内容那么高，右边会空出一大块。
+        ==================== -->
+        <ui:Card Grid.Column="1" Style="{StaticResource FillCard}">
+            <StackPanel VerticalAlignment="Top">
+                <TextBlock Style="{StaticResource GroupTitle}" Text="执行到哪一步了" />
+
+                <!--
+                    保存后改了云盘类型、但引擎还在按旧模式跑完这一轮时的说明。
+
+                    这时整块步骤列表故意<b>不</b>切（6 步 ⇄ 4 步）：正在跑的这一轮
+                    用的是启动时那份配置，提前换掉等于报了个还没生效的未来。
+                    但不说一声的话，用户改完保存、看总览一点没变，只会以为保存没生效。
+                -->
+                <TextBlock x:Name="CloudTargetPendingHint"
+                           Margin="0,0,0,10"
+                           Foreground="{DynamicResource WarnText}"
+                           Style="{StaticResource Hint}"
+                           Text="{Binding CloudTargetPendingText}"
+                           Visibility="{Binding CloudTargetPending, Converter={StaticResource BoolVisibility}}" />
+
+                <!-- 没有任何一步在跑时说明为什么（已停止 / 等待重试 / 不在时段） -->
+                <TextBlock Margin="0,0,0,10"
+                           Style="{StaticResource Hint}"
+                           Text="{Binding StepNote}"
+                           Visibility="{Binding HasStepNote, Converter={StaticResource BoolVisibility}}" />
+
+                <ItemsControl ItemsSource="{Binding PipelineSteps}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Grid Margin="0,0,0,14">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+
+                                <Border Grid.Column="0" Style="{StaticResource StepDot}">
+                                    <Grid>
+                                        <TextBlock Style="{StaticResource StepOrdinal}" Text="{Binding Ordinal}" />
+                                        <TextBlock Style="{StaticResource StepCheck}" Text="&#x2713;" />
+                                    </Grid>
+                                </Border>
+
+                                <StackPanel Grid.Column="1">
+                                    <TextBlock Style="{StaticResource StepTitle}" Text="{Binding Title}" />
+                                    <TextBlock Margin="0,2,0,0" Style="{StaticResource Hint}" Text="{Binding Hint}" />
+                                </StackPanel>
+
+                                <Border Grid.Column="2" Style="{StaticResource RunningBadge}">
+                                    <TextBlock FontSize="11"
+                                               FontWeight="SemiBold"
+                                               Foreground="{DynamicResource RunningBadgeText}"
+                                               Text="正在进行" />
+                                </Border>
+                            </Grid>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </StackPanel>
+        </ui:Card>
+    </Grid>
+</UserControl>

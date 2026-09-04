@@ -1,0 +1,348 @@
+<ui:FluentWindow x:Class="NewAutoZip.App.Views.MainWindow"
+                 xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                 xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                 xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+                 xmlns:tray="clr-namespace:Wpf.Ui.Tray.Controls;assembly=Wpf.Ui.Tray"
+                 xmlns:views="clr-namespace:NewAutoZip.App.Views"
+                 Title="AutoZip"
+                 Width="1240"
+                 Height="880"
+                 MinWidth="1000"
+                 MinHeight="700"
+                 ExtendsContentIntoTitleBar="True"
+                 WindowBackdropType="Mica"
+                 WindowCornerPreference="Round"
+                 WindowStartupLocation="CenterScreen">
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- ==================== 自定义背景图 ====================
+             第一个子元素 = 压在所有内容下面。要点四个：
+
+             · Grid.RowSpan 铺满整窗，ClipToBounds 挡住下面那个负边距溢出的部分；
+             · IsHitTestVisible="False" —— 否则这层会把整个界面的点击全吃掉；
+             · 这里<b>不挂 BlurEffect</b>，模糊是 ThemeService.Bake 一次性烘进位图的。
+               挂在界面上等于让合成器每一帧把整窗底图重卷积一遍，落到软件渲染
+               （虚拟机、远程桌面、老驱动）就是整个程序卡到点导航都要等。
+               这层现在只画一张冻结好的位图，稳态开销为零。自检会断言这里的
+               Effect 必须为 null —— 谁手一抖加回来，自检命令立刻红；
+             · Margin="-80" 留着：UniformToFill 会把图裁着放大，负边距给缩放留余量，
+               免得窄图在边上露底。烘制时那圈渐隐边已经裁掉了，不靠它遮。
+
+             没设背景图时 Source 为 null，这层什么都不画，窗口保持 Mica 材质。
+        ==================== -->
+        <Grid Grid.Row="0"
+              Grid.RowSpan="4"
+              ClipToBounds="True"
+              IsHitTestVisible="False"
+              Panel.ZIndex="-1">
+            <Image x:Name="BackgroundLayer"
+                   Margin="-80"
+                   Opacity="{Binding BackgroundOpacity}"
+                   Source="{Binding BackgroundImage}"
+                   Stretch="UniformToFill" />
+        </Grid>
+
+        <!-- ==================== 标题栏 ==================== -->
+        <ui:TitleBar Grid.Row="0"
+                     Title="{Binding AppName}"
+                     ShowMaximize="True"
+                     ShowMinimize="True">
+            <ui:TitleBar.Icon>
+                <ui:ImageIcon Source="pack://application:,,,/Assets/app.ico" />
+            </ui:TitleBar.Icon>
+
+            <!--
+                左上角是「程序名 + 版本号」两段，都放在 TitleBar.Header 里。
+
+                为什么不用 TitleBar.Title 显示程序名：<b>WPF-UI 4.3.0 的 TitleBar 模板根本不画 Title。</b>
+                这不是猜的 —— 自检把顶部 60 像素内渲染出来的文字连坐标一起打出来，
+                Title 那一块一个字都没有。这正是"内容绑在模板属性上、模板里没有对应
+                ContentPresenter 就静默不画"的典型：不报错、不警告、绑定诊断也干净。
+                Title 仍然设着，那是给窗口标题/任务栏用的，不指望它出现在这里。
+
+                两个细节：
+                · 文字来自程序集元数据，不是手抄的常量 —— 手抄的迟早和真实版本对不上，
+                  而用户报问题时第一句要问的就是版本；
+                · IsHitTestVisible=False —— 标题栏靠鼠标按下来拖动窗口，
+                  这里放个能接收点击的控件，用户在程序名上按住就拖不动窗口了。
+            -->
+            <ui:TitleBar.Header>
+                <StackPanel Margin="8,0,0,0"
+                            VerticalAlignment="Center"
+                            IsHitTestVisible="False"
+                            Orientation="Horizontal">
+                    <TextBlock VerticalAlignment="Center"
+                               FontSize="13"
+                               FontWeight="SemiBold"
+                               Text="{Binding AppName}" />
+                    <TextBlock Margin="8,1,0,0"
+                               VerticalAlignment="Center"
+                               FontSize="12"
+                               Foreground="{DynamicResource MutedText}"
+                               Text="{Binding VersionText}" />
+                </StackPanel>
+            </ui:TitleBar.Header>
+
+            <!--
+                深浅一键切换。放在标题栏而不是只放设置页里：这是个"看一眼就想换"的开关，
+                为了换个配色要先翻到第 5 页太远了。设置页仍然是完整入口（含跟随系统、强调色与背景图），
+                两边改的是同一个属性，会互相同步。
+
+                图标是字形而不是 ui:SymbolIcon —— 要跟着主题换，绑一个字符串最省事。
+            -->
+            <ui:TitleBar.TrailingContent>
+                <Button Width="40"
+                        Height="32"
+                        Margin="0,0,4,0"
+                        Padding="0"
+                        VerticalAlignment="Center"
+                        Background="Transparent"
+                        BorderThickness="0"
+                        Command="{Binding ToggleThemeCommand}"
+                        ToolTip="{Binding ThemeToggleTip}">
+                    <TextBlock FontFamily="{StaticResource IconFont}"
+                               FontSize="15"
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Center"
+                               Text="{Binding ThemeToggleIcon}" />
+                </Button>
+            </ui:TitleBar.TrailingContent>
+        </ui:TitleBar>
+
+        <!-- ==================== 全局提示条 ==================== -->
+        <ui:InfoBar Grid.Row="1"
+                    Margin="16,0,16,8"
+                    IsClosable="True"
+                    IsOpen="{Binding InfoBarOpen, Mode=TwoWay}"
+                    Message="{Binding InfoBarMessage}"
+                    Severity="{Binding InfoBarSeverity}"
+                    Title="{Binding InfoBarTitle}" />
+
+        <!-- ==================== 状态条 ====================
+             最重要的一条设计：状态灯只反映引擎的真实状态。
+             旧版即便 7z.exe 根本不存在、Run() 已经直接返回，界面照样显示"● 运行中"。
+        -->
+        <ui:Card Grid.Row="2" Margin="16,0,16,12">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <!-- 状态灯 + 阶段文字 -->
+                <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+                    <!--
+                        状态灯的颜色走 DataTrigger + DynamicResource，不走"键名→画刷"转换器。
+
+                        转换器那条路是错的：它在绑定求值那一刻按键名取到一只画刷，
+                        之后主题变了、而 ViewModel 给的键名没变，绑定不会重新求值，
+                        这颗灯就一直停在上一个主题的颜色上（切到浅色后是一颗看不见的浅绿点）。
+                        DynamicResource 是资源换了就通知每个引用，这才是"跟着主题走"该用的机制。
+                    -->
+                    <Ellipse Width="12"
+                             Height="12"
+                             Margin="0,0,10,0"
+                             VerticalAlignment="Center">
+                        <Ellipse.Style>
+                            <Style TargetType="Ellipse">
+                                <Setter Property="Fill" Value="{DynamicResource DotIdle}" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding PhaseColorKey}" Value="DotOk">
+                                        <Setter Property="Fill" Value="{DynamicResource DotOk}" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding PhaseColorKey}" Value="DotWarn">
+                                        <Setter Property="Fill" Value="{DynamicResource DotWarn}" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding PhaseColorKey}" Value="DotError">
+                                        <Setter Property="Fill" Value="{DynamicResource DotError}" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Ellipse.Style>
+                    </Ellipse>
+
+                    <StackPanel>
+                        <TextBlock FontSize="15"
+                                   FontWeight="SemiBold"
+                                   Text="{Binding PhaseText}" />
+                        <TextBlock FontSize="12"
+                                   Foreground="{DynamicResource MutedText}"
+                                   Text="{Binding ScheduleText}" />
+                    </StackPanel>
+                </StackPanel>
+
+                <!-- 打包进度：真实百分比，来自 7za 的 -bsp1 输出 -->
+                <StackPanel Grid.Column="1"
+                            Margin="24,0"
+                            VerticalAlignment="Center"
+                            Visibility="{Binding PackInProgress, Converter={StaticResource BoolVisibility}}">
+                    <TextBlock FontSize="12"
+                               Foreground="{DynamicResource MutedText}"
+                               TextTrimming="CharacterEllipsis"
+                               Text="{Binding PackCurrentFile}" />
+                    <ProgressBar Height="6"
+                                 Margin="0,4,0,0"
+                                 Maximum="100"
+                                 Value="{Binding PackPercent, Mode=OneWay}" />
+                </StackPanel>
+
+                <!-- 操作按钮 -->
+                <StackPanel Grid.Column="2" Orientation="Horizontal">
+                    <ui:Button Margin="0,0,8,0"
+                               Appearance="Primary"
+                               Command="{Binding StartCommand}"
+                               Content="开始">
+                        <ui:Button.Icon>
+                            <ui:FontIcon FontFamily="{StaticResource IconFont}" Glyph="&#xE768;" />
+                        </ui:Button.Icon>
+                    </ui:Button>
+
+                    <ui:Button Margin="0,0,8,0"
+                               Appearance="Primary"
+                               Command="{Binding StopCommand}"
+                               Content="停止">
+                        <ui:Button.Icon>
+                            <ui:FontIcon FontFamily="{StaticResource IconFont}" Glyph="&#xE71A;" />
+                        </ui:Button.Icon>
+                    </ui:Button>
+
+                    <ui:Button Appearance="Primary"
+                               Command="{Binding NudgeCommand}"
+                               Content="立即检查"
+                               ToolTip="不等定时器，立刻扫一次监控目录">
+                        <ui:Button.Icon>
+                            <ui:FontIcon FontFamily="{StaticResource IconFont}" Glyph="&#xE72C;" />
+                        </ui:Button.Icon>
+                    </ui:Button>
+                </StackPanel>
+            </Grid>
+        </ui:Card>
+
+        <!-- ==================== 导航 + 内容 ==================== -->
+        <Grid Grid.Row="3" Margin="16,0,16,16">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="196" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <!--
+                用 ListBox 而不是 ui:NavigationView：后者需要页面提供器与依赖注入，
+                在这个只有 5 个页面的程序里是纯粹的复杂度。
+            -->
+            <ListBox x:Name="NavRail"
+                     Grid.Column="0"
+                     Margin="0,0,12,0"
+                     Background="Transparent"
+                     BorderThickness="0"
+                     SelectedIndex="{Binding SelectedPage, Mode=TwoWay}">
+                <ListBox.ItemContainerStyle>
+                    <Style TargetType="ListBoxItem"
+                           BasedOn="{StaticResource SelectableListBoxItem}">
+                        <Setter Property="Padding" Value="12,10" />
+                        <Setter Property="Margin" Value="0,0,0,4" />
+                        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                    </Style>
+                </ListBox.ItemContainerStyle>
+
+                <ListBoxItem>
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Width="24"
+                                   FontFamily="{StaticResource IconFont}"
+                                   Text="&#xE80F;" />
+                        <TextBlock Text="总览" />
+                    </StackPanel>
+                </ListBoxItem>
+
+                <ListBoxItem>
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Width="24"
+                                   FontFamily="{StaticResource IconFont}"
+                                   Text="&#xE8B7;" />
+                        <TextBlock Text="文件" />
+                        <TextBlock Margin="6,0,0,0"
+                                   Foreground="{DynamicResource MutedText}"
+                                   Text="{Binding TrackedCountText}" />
+                    </StackPanel>
+                </ListBoxItem>
+
+                <!-- 隔离区有内容时必须显眼：那意味着有文件没被备份，而且程序已停止重试 -->
+                <ListBoxItem>
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Width="24"
+                                   FontFamily="{StaticResource IconFont}"
+                                   Text="&#xE7BA;" />
+                        <TextBlock Text="隔离区" />
+                        <ui:Badge Margin="6,0,0,0"
+                                  Appearance="Danger"
+                                  Content="{Binding QuarantineBadge}"
+                                  Visibility="{Binding HasQuarantine, Converter={StaticResource BoolVisibility}}" />
+                    </StackPanel>
+                </ListBoxItem>
+
+                <ListBoxItem>
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Width="24"
+                                   FontFamily="{StaticResource IconFont}"
+                                   Text="&#xE7C3;" />
+                        <TextBlock Text="日志" />
+                    </StackPanel>
+                </ListBoxItem>
+
+                <ListBoxItem>
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Width="24"
+                                   FontFamily="{StaticResource IconFont}"
+                                   Text="&#xE713;" />
+                        <TextBlock Text="设置" />
+                        <TextBlock Margin="6,0,0,0"
+                                   Foreground="{DynamicResource WarnText}"
+                                   Text="●"
+                                   ToolTip="有未保存的改动"
+                                   Visibility="{Binding Settings.IsDirty, Converter={StaticResource BoolVisibility}}" />
+                    </StackPanel>
+                </ListBoxItem>
+            </ListBox>
+
+            <!--
+                5 个页面同时存在、靠 Visibility 切换。
+                好处是切页不重建控件、滚动位置与选中行都留着；代价是常驻 5 份可视树，
+                在这个规模下完全可以接受。
+            -->
+            <Grid Grid.Column="1">
+                <views:DashboardPage Visibility="{Binding SelectedPage, Converter={StaticResource IndexVisibility}, ConverterParameter=0}" />
+                <views:FilesPage Visibility="{Binding SelectedPage, Converter={StaticResource IndexVisibility}, ConverterParameter=1}" />
+                <views:QuarantinePage Visibility="{Binding SelectedPage, Converter={StaticResource IndexVisibility}, ConverterParameter=2}" />
+                <views:LogPage Visibility="{Binding SelectedPage, Converter={StaticResource IndexVisibility}, ConverterParameter=3}" />
+                <views:SettingsPage Visibility="{Binding SelectedPage, Converter={StaticResource IndexVisibility}, ConverterParameter=4}" />
+            </Grid>
+        </Grid>
+
+        <!-- ==================== 托盘 ==================== -->
+        <tray:NotifyIcon x:Name="Tray"
+                         FocusOnLeftClick="True"
+                         Icon="pack://application:,,,/Assets/app.ico"
+                         MenuOnRightClick="True"
+                         TooltipText="AutoZip"
+                         LeftDoubleClick="OnTrayDoubleClick">
+            <tray:NotifyIcon.Menu>
+                <ContextMenu Style="{StaticResource TrayMenu}">
+                    <MenuItem Click="OnTrayShow" Header="显示主窗口" />
+                    <Separator />
+                    <MenuItem Command="{Binding StartCommand}" Header="开始" />
+                    <MenuItem Command="{Binding StopCommand}" Header="停止" />
+                    <Separator />
+                    <MenuItem Click="OnTrayAbout" Header="关于" />
+                    <MenuItem Click="OnTrayExit" Header="退出" />
+                </ContextMenu>
+            </tray:NotifyIcon.Menu>
+        </tray:NotifyIcon>
+    </Grid>
+</ui:FluentWindow>

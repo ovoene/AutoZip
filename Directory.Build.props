@@ -1,0 +1,34 @@
+<Project>
+
+  <!--
+    全解决方案统一的编译约定。
+    旧项目的教训：部分源文件是 GB2312 编码，注释已经乱码成 "����ʧ��"；
+    Nullable 未启用导致空引用问题只能在运行期暴露。这里统一收紧。
+  -->
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Deterministic>true</Deterministic>
+    <NeutralLanguage>zh-Hans</NeutralLanguage>
+    <InvariantGlobalization>false</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!--
+    产品名与版本号只在这里写一次。
+
+    界面上的程序名（标题栏、托盘提示、关于、错误弹窗标题）全部读程序集元数据，
+    不在别处再抄一遍 —— 抄出来的迟早和真实版本对不上，而用户报问题时
+    第一句要问的就是"你用的哪个版本"。
+  -->
+  <PropertyGroup>
+    <Product>AutoZip</Product>
+    <Company>AutoZip</Company>
+    <Version>6.6.6</Version>
+    <AssemblyVersion>6.6.6.0</AssemblyVersion>
+    <FileVersion>6.6.6.0</FileVersion>
+    <Copyright>Copyright (c) 2026</Copyright>
+  </PropertyGroup>
+
+</Project>

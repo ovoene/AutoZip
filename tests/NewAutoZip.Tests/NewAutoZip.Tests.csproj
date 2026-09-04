@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    测试项目。跟 Core 一样用 net8.0-windows：被测代码会碰注册表、DPAPI、Cloud Files 属性。
+
+    时间一律通过 TimeProvider 注入，测试里用 FakeTimeProvider 手工推进 ——
+    绝不用 Thread.Sleep 等真实时间。这样"连续失败 6 次进隔离区"这类需要
+    30s+1m+2m+5m+10m 阶梯的场景可以在几毫秒内跑完，而且结果完全确定。
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RootNamespace>NewAutoZip.Tests</RootNamespace>
+    <AssemblyName>NewAutoZip.Tests</AssemblyName>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" Version="8.10.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\NewAutoZip.Core\NewAutoZip.Core.csproj" />
+  </ItemGroup>
+
+</Project>

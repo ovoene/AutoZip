@@ -1,0 +1,36 @@
+# 构建输出
+bin/
+obj/
+publish/
+TestResults/
+
+# NuGet（老式 packages 目录；用 PackageReference 时不会产生，留着以防万一）
+packages/
+
+# IDE / 编辑器个人文件
+.vs/
+.idea/
+*.user
+*.suo
+*.userprefs
+
+# 调试符号与缓存（纯构建产物，非源码）
+*.pdb
+*.cache
+
+# 日志
+*.log
+
+# Windows 资源管理器产生的杂物
+Thumbs.db
+Desktop.ini
+
+# 本地发布 / 自检产物
+AutoZip-*-win-x64.zip
+selftest-report.txt
+
+# 本机产生的临时说明（非源码，且含绝对路径，不应进版本库）
+执行打包命令.txt
+
+# WorkBuddy AI 的工作目录（含项目记忆 / 对话日志，切勿上传）
+.workbuddy-ai/

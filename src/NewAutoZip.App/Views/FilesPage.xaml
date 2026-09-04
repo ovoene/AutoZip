@@ -1,0 +1,85 @@
+<UserControl x:Class="NewAutoZip.App.Views.FilesPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml">
+
+    <!--
+        两个列表按 2:1 分成比例行，而不是"上面吃剩下的、下面固定 220"。
+
+        原先是 Row1="*" + Row3="Auto" 且里层 MaxHeight=220：下面那块无条件占满 220，
+        上面那块拿剩下的 —— 窗口一矮，"正在观察的文件"就被压到只剩表头，
+        再叠上覆盖在同一格里的空列表提示，两段文字直接糊在一起。
+
+        现在：两块都是比例行 + MinHeight 兜底，谁也压不死谁；
+        表格与空提示互斥显示（见下），任何窗口尺寸下都不可能重叠。
+    -->
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="2*" MinHeight="150" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" MinHeight="110" />
+        </Grid.RowDefinitions>
+
+        <!-- ==================== 观察中的文件 ==================== -->
+        <StackPanel Grid.Row="0" Margin="0,0,0,6">
+            <TextBlock Style="{StaticResource GroupTitle}" Margin="0,0,0,4" Text="正在观察的文件" />
+            <TextBlock Style="{StaticResource Hint}"
+                       Margin="0,0,0,0"
+                       Text="文件写入停止后要连续几轮大小与修改时间都不变、且能以共享方式打开，才算“已就绪”。观察期间不会被打包，避免压进一个只写了一半的文件。已经消失（被删除或改名）的文件会在下一轮自动剔除。" />
+        </StackPanel>
+
+        <ui:Card Grid.Row="1" Padding="2" Style="{StaticResource FillCard}">
+            <Grid>
+                <!--
+                    表格和"没有内容"提示互斥：表格空着的时候整个折叠掉。
+                    留着表头再把提示文字压在上面，就是用户看到的那处重叠。
+                -->
+                <DataGrid ItemsSource="{Binding TrackedFiles}"
+                          Style="{StaticResource ReadOnlyGrid}"
+                          Visibility="{Binding TrackedFiles.Count, Converter={StaticResource HasContent}}">
+                    <DataGrid.Columns>
+                        <DataGridTextColumn Binding="{Binding FileName}" Header="文件" Width="*" />
+                        <DataGridTextColumn Binding="{Binding SizeText}" Header="大小" Width="100" />
+                        <DataGridTextColumn Binding="{Binding StateText}" Header="状态" Width="90" />
+                        <DataGridTextColumn Binding="{Binding QuietProbes}" Header="稳定轮次" Width="90" />
+                        <DataGridTextColumn Binding="{Binding FirstSeenLocal, Converter={StaticResource Stamp}}" Header="首次发现" Width="165" />
+                        <DataGridTextColumn Binding="{Binding Path}" Header="完整路径" Width="2*" />
+                    </DataGrid.Columns>
+                </DataGrid>
+
+                <TextBlock Style="{StaticResource EmptyHint}"
+                           Margin="0"
+                           Text="监控目录里没有新文件。"
+                           Visibility="{Binding TrackedFiles.Count, Converter={StaticResource HasContent}, ConverterParameter=invert}" />
+            </Grid>
+        </ui:Card>
+
+        <!-- ==================== 本轮待打包 ==================== -->
+        <StackPanel Grid.Row="2" Margin="0,14,0,6">
+            <TextBlock Style="{StaticResource GroupTitle}" Margin="0,0,0,4" Text="本轮待打包" />
+            <TextBlock Style="{StaticResource Hint}"
+                       Margin="0,0,0,0"
+                       Text="窗口关闭时这些文件会被打进一个压缩包。窗口期内新就绪的文件会加进来。" />
+        </StackPanel>
+
+        <ui:Card Grid.Row="3" Padding="2" Style="{StaticResource FillCard}">
+            <Grid>
+                <DataGrid ItemsSource="{Binding BatchFiles}"
+                          Style="{StaticResource ReadOnlyGrid}"
+                          Visibility="{Binding BatchFiles.Count, Converter={StaticResource HasContent}}">
+                    <DataGrid.Columns>
+                        <DataGridTextColumn Binding="{Binding FileName}" Header="文件" Width="*" />
+                        <DataGridTextColumn Binding="{Binding SizeText}" Header="大小" Width="100" />
+                        <DataGridTextColumn Binding="{Binding Path}" Header="完整路径" Width="2*" />
+                    </DataGrid.Columns>
+                </DataGrid>
+
+                <TextBlock Style="{StaticResource EmptyHint}"
+                           Margin="0"
+                           Text="没有已就绪的文件。"
+                           Visibility="{Binding BatchFiles.Count, Converter={StaticResource HasContent}, ConverterParameter=invert}" />
+            </Grid>
+        </ui:Card>
+    </Grid>
+</UserControl>

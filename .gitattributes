@@ -1,0 +1,17 @@
+# cmd.exe is not reliable on LF-only batch files: goto and multi-line
+# parenthesised blocks can misparse, and both scripts here use both.
+# The release workflow runs publish.cmd on a GitHub runner, where the
+# checkout's autocrlf setting is not ours to control - so pin it here
+# instead of hoping.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# release.ps1 is UTF-8 with a BOM: Windows PowerShell 5.1 decodes a BOM-less
+# .ps1 using the local codepage, which turns every Chinese prompt into
+# mojibake. The text attribute only pins line endings, it never touches the
+# BOM - so this is safe. Pin CRLF to match how the file was written.
+*.ps1 text eol=crlf
+
+# The workflow is read by GitHub, not by cmd.exe. Keep it LF so the file
+# stops flip-flopping between checkouts on a machine with autocrlf on.
+*.yml text eol=lf
