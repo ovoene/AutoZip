@@ -6,7 +6,20 @@ rem  Output:  publish\AutoZip.exe      (target machine needs no .NET)
 rem           publish\tools\7za.exe    (must stay a real file on disk)
 rem
 rem  Usage:   publish.cmd              tests + publish + UI self-test
-rem           publish.cmd noselftest  tests + publish, no UI self-test
+rem           publish.cmd 6.6.8        same, but write 6.6.8 into
+rem                                    Directory.Build.props first
+rem           publish.cmd noselftest   tests + publish, no UI self-test
+rem
+rem  With no version argument Directory.Build.props is not touched at all:
+rem  the build carries whatever version is already in the file. The two
+rem  arguments may be given in either order.
+rem
+rem  The version is written BEFORE the gates run, so a run that dies at the
+rem  unit tests leaves the new version sitting in the file - release.ps1
+rem  behaves the same way. This is a convenience for local builds only: it
+rem  does not commit, tag or push anything. Real releases still go through
+rem  release.bat / release.ps1, which own the git side and write the same
+rem  three properties themselves.
 rem
 rem  "noselftest" exists for the release workflow, which runs on a GitHub
 rem  runner. The self-test measures rendered colours and layout on a real
@@ -22,8 +35,26 @@ rem  the next command onto the comment. Chinese docs live in README.md.
 rem ===================================================================
 setlocal
 
+rem  Arguments in any order: "noselftest" and/or a version like 6.6.8.
+rem  Anything that is not "noselftest" is taken as a version and validated
+rem  further down - an unrecognized argument must not be silently dropped,
+rem  or "publish.cmd 6.6.8" would quietly build the old version.
 set SELFTEST=1
-if /i "%~1"=="noselftest" set SELFTEST=0
+set "AZ_SET_VERSION="
+
+:parseargs
+if "%~1"=="" goto :parsed
+if /i "%~1"=="noselftest" goto :argnoselftest
+set "AZ_SET_VERSION=%~1"
+shift
+goto :parseargs
+
+:argnoselftest
+set SELFTEST=0
+shift
+goto :parseargs
+
+:parsed
 
 rem  NuGet goes through a local proxy on this machine. A CI runner has no
 rem  such proxy, and pointing restore at a dead 127.0.0.1 there fails in a
@@ -34,6 +65,37 @@ if "%CI%"=="" (
 )
 
 pushd "%~dp0"
+
+if not defined AZ_SET_VERSION goto :noversion
+
+echo.
+echo [version] Writing %AZ_SET_VERSION% into Directory.Build.props ...
+rem  Batch has no regex, so PowerShell does the edit (it is on every
+rem  supported Windows). The version travels in through the environment,
+rem  never through the command line, so nothing inside it can come back as
+rem  code. Same three properties, same patterns, same BOM handling as
+rem  release.ps1 around line 1110 - if you change one, change the other.
+rem  Quoted "set" is required: the patterns contain < and >, which cmd would
+rem  otherwise read as redirection.
+set "PSV=$ErrorActionPreference='Stop';"
+set "PSV=%PSV% $v=$env:AZ_SET_VERSION;"
+set "PSV=%PSV% if ($v -notmatch '^v?\d+\.\d+\.\d+$') { Write-Host ('  *** Not a version: ' + $v + ' - expected X.Y.Z, for example 6.6.8 ***'); exit 2 };"
+set "PSV=%PSV% $v=$v.TrimStart('v');"
+set "PSV=%PSV% $f=Join-Path (Get-Location) 'Directory.Build.props';"
+set "PSV=%PSV% $b=[System.IO.File]::ReadAllBytes($f);"
+set "PSV=%PSV% $bom=($b.Length -ge 3 -and $b[0] -eq 239 -and $b[1] -eq 187 -and $b[2] -eq 191);"
+set "PSV=%PSV% $t=[System.Text.Encoding]::UTF8.GetString($b); if ($bom) { $t=$t.Substring(1) };"
+set "PSV=%PSV% $t=[regex]::Replace($t,'<Version>[^<]*</Version>','<Version>'+$v+'</Version>');"
+set "PSV=%PSV% $t=[regex]::Replace($t,'<AssemblyVersion>[^<]*</AssemblyVersion>','<AssemblyVersion>'+$v+'.0</AssemblyVersion>');"
+set "PSV=%PSV% $t=[regex]::Replace($t,'<FileVersion>[^<]*</FileVersion>','<FileVersion>'+$v+'.0</FileVersion>');"
+set "PSV=%PSV% [System.IO.File]::WriteAllText($f,$t,(New-Object System.Text.UTF8Encoding $bom));"
+set "PSV=%PSV% $e=[regex]::Escape($v); $back=[System.IO.File]::ReadAllText($f);"
+set "PSV=%PSV% if (-not (($back -match ('<Version>'+$e+'</Version>')) -and ($back -match ('<AssemblyVersion>'+$e+'\.0</AssemblyVersion>')) -and ($back -match ('<FileVersion>'+$e+'\.0</FileVersion>')))) { Write-Host '  *** Directory.Build.props did not take the new version. ***'; exit 3 };"
+set "PSV=%PSV% Write-Host ('  Version / AssemblyVersion / FileVersion -> ' + $v)"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "%PSV%"
+if errorlevel 1 goto :failed
+
+:noversion
 
 echo.
 echo [1/4] Unit tests (no publish if they fail)...
