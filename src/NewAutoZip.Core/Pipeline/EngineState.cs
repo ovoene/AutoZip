@@ -59,6 +59,43 @@ public sealed class QuarantinedBatch
 }
 
 /// <summary>
+/// 必须重新纳入处理的单个文件 —— 水位线的<b>例外名单</b>。
+///
+/// 水位线 <see cref="EngineState.Checkpoint"/> 是一个标量，只能表达
+/// "这一刻之前的都处理过了"，无法表达"这一刻之前的都处理过了，<b>除了 F</b>"。
+/// 而这种处境是真实存在的：整批文件打包成功，其中一个恰好被别的进程独占，
+/// 7za 跳过它并以退出码 1（成功但有警告）收尾 —— 包是好的，那个文件却没进去。
+/// 只有水位线的话，它会被永久跨过去，不重试、不隔离、不告警，静默丢失。
+///
+/// 所以另开一份逐文件的例外名单：命中名单的文件无论水位线怎么走都放行。
+/// </summary>
+public sealed class ForcedFile
+{
+    public string Path { get; set; } = string.Empty;
+
+    /// <summary>为什么进名单（写进日志，也给人看）。</summary>
+    public string Reason { get; set; } = string.Empty;
+
+    public DateTimeOffset AddedUtc { get; set; }
+}
+
+/// <summary>
+/// 修改时间落在未来的文件 —— 与 <see cref="ForcedFile"/> 极性相反的例外名单。
+///
+/// 水位线的推进被截断到"当前时刻"，所以一个 2030 年时间戳的文件不会把水位线毒死；
+/// 但代价是它自己也不会被水位线覆盖，下一轮对账又会把它当成新文件重新打包，无限循环。
+/// 这份名单按 (路径, 修改时间) 记住"这个时间戳的这个文件已经处理过了"：
+/// 时间戳一旦变化（文件被真正重写），配不上就自动重新放行，不需要人工干预。
+/// </summary>
+public sealed class FutureStampedFile
+{
+    public string Path { get; set; } = string.Empty;
+
+    /// <summary>当时记下的修改时间。文件被重写后此值配不上，于是重新放行。</summary>
+    public DateTimeOffset LastWriteUtc { get; set; }
+}
+
+/// <summary>
 /// 需要持久化的运行时状态。与 <see cref="Configuration.AppSettings"/> 分开存放：
 /// 配置是人写的，状态是程序写的，混在一起会让"重置状态"变成危险操作。
 /// </summary>
@@ -77,6 +114,19 @@ public sealed class EngineState
     public List<PendingUpload> PendingUploads { get; set; } = [];
 
     public List<QuarantinedBatch> Quarantined { get; set; } = [];
+
+    /// <summary>
+    /// 水位线的例外名单：这些文件无论水位线怎么走都要重新纳入处理。
+    /// 见 <see cref="ForcedFile"/>。名单是自愈的 —— 文件真被打进包里就立刻移出，
+    /// 文件从磁盘上消失也会被清掉，不会无限增长。
+    /// </summary>
+    public List<ForcedFile> ForcedFiles { get; set; } = [];
+
+    /// <summary>
+    /// 修改时间在未来、已经处理过的文件。见 <see cref="FutureStampedFile"/>。
+    /// 这一份是为了不让"水位线截断到当前时刻"变成重复打包。
+    /// </summary>
+    public List<FutureStampedFile> FutureStamped { get; set; } = [];
 
     /// <summary>首次运行已完成（决定 ProcessExistingFilesOnFirstRun 是否还生效）。</summary>
     public bool FirstRunCompleted { get; set; }
@@ -142,6 +192,17 @@ public sealed class EngineState
                 Attempts = q.Attempts,
                 QuarantinedUtc = q.QuarantinedUtc,
                 TotalBytes = q.TotalBytes,
+            }).ToList(),
+            ForcedFiles = ForcedFiles.Select(f => new ForcedFile
+            {
+                Path = f.Path,
+                Reason = f.Reason,
+                AddedUtc = f.AddedUtc,
+            }).ToList(),
+            FutureStamped = FutureStamped.Select(f => new FutureStampedFile
+            {
+                Path = f.Path,
+                LastWriteUtc = f.LastWriteUtc,
             }).ToList(),
         };
     }

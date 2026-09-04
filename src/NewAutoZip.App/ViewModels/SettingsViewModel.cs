@@ -80,6 +80,7 @@ public sealed class SettingsViewModel : ObservableObject
     private double _quietSeconds = 60;
     private double _stableConfirmRounds = 2;
     private double _refreshIntervalSeconds = 5;
+    private double _unreadableGiveUpMinutes = 20;
     private double _reconcileIntervalSeconds = 300;
     private bool _processExistingFilesOnFirstRun;
 
@@ -370,10 +371,26 @@ public sealed class SettingsViewModel : ObservableObject
     public string ReadyDelayHint =>
         $"文件停止写入后，约 {QuietSeconds + ((StableConfirmRounds - 1) * RefreshIntervalSeconds):0} 秒被判定为就绪。";
 
+    public double UnreadableGiveUpMinutes
+    {
+        get => _unreadableGiveUpMinutes;
+        set { if (Set(ref _unreadableGiveUpMinutes, value)) { MarkDirty(); Raise(nameof(UnreadableGiveUpHint)); } }
+    }
+
+    /// <summary>
+    /// 把这个值换算成用户实际会看到的现象。
+    /// 光写"最多等 N 分钟"说不清两件要紧事：什么样的文件才会走进这个计时，以及到点之后会怎样。
+    /// 前者决定用户该不该动这个值（数据库备份多半根本不走这条路），
+    /// 后者决定用户看到告警时慌不慌（文件没丢，只是这一轮先放着）。
+    /// </summary>
+    public string UnreadableGiveUpHint =>
+        $"一个文件连续 {UnreadableGiveUpMinutes:0} 分钟读不到，就先放下它：记一条警告，" +
+        $"并把它挂进「待重新处理」名单，下次对账扫描（每 {ReconcileIntervalSeconds:0} 秒）重新纳入观察。";
+
     public double ReconcileIntervalSeconds
     {
         get => _reconcileIntervalSeconds;
-        set { if (Set(ref _reconcileIntervalSeconds, value)) { MarkDirty(); } }
+        set { if (Set(ref _reconcileIntervalSeconds, value)) { MarkDirty(); Raise(nameof(UnreadableGiveUpHint)); } }
     }
 
     public bool ProcessExistingFilesOnFirstRun
@@ -869,6 +886,7 @@ public sealed class SettingsViewModel : ObservableObject
         _quietSeconds = settings.QuietSeconds;
         _stableConfirmRounds = settings.StableConfirmRounds;
         _refreshIntervalSeconds = settings.RefreshIntervalSeconds;
+        _unreadableGiveUpMinutes = settings.UnreadableGiveUpMinutes;
         _reconcileIntervalSeconds = settings.ReconcileIntervalSeconds;
         _processExistingFilesOnFirstRun = settings.ProcessExistingFilesOnFirstRun;
 
@@ -946,6 +964,7 @@ public sealed class SettingsViewModel : ObservableObject
             QuietSeconds = (int)Math.Round(QuietSeconds),
             StableConfirmRounds = (int)Math.Round(StableConfirmRounds),
             RefreshIntervalSeconds = (int)Math.Round(RefreshIntervalSeconds),
+            UnreadableGiveUpMinutes = (int)Math.Round(UnreadableGiveUpMinutes),
             ReconcileIntervalSeconds = (int)Math.Round(ReconcileIntervalSeconds),
             ProcessExistingFilesOnFirstRun = ProcessExistingFilesOnFirstRun,
 

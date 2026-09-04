@@ -41,6 +41,8 @@ public sealed class StateStore
             {
                 state.PendingUploads ??= [];
                 state.Quarantined ??= [];
+                state.ForcedFiles ??= [];
+                state.FutureStamped ??= [];
                 return state;
             }
 

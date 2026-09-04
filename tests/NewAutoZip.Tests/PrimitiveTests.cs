@@ -367,6 +367,9 @@ public class SettingsLimitsTests
             UploadPollSeconds = 0,
             PackTimeoutMinutes = 0,
             MaxAttemptsBeforeQuarantine = 0,
+
+            // 0 会让文件第一次读不到就被放弃，等于关掉了"等它解锁"这件事。
+            UnreadableGiveUpMinutes = 0,
         };
 
         s.ClampToLimits();
@@ -380,6 +383,7 @@ public class SettingsLimitsTests
         Assert.True(s.UploadPollSeconds >= SettingsLimits.UploadPollSecondsMin);
         Assert.True(s.PackTimeoutMinutes >= SettingsLimits.PackTimeoutMinutesMin);
         Assert.True(s.MaxAttemptsBeforeQuarantine >= SettingsLimits.MaxAttemptsBeforeQuarantineMin);
+        Assert.True(s.UnreadableGiveUpMinutes >= SettingsLimits.UnreadableGiveUpMinutesMin);
     }
 
     [Fact]
@@ -390,6 +394,7 @@ public class SettingsLimitsTests
             RefreshIntervalSeconds = int.MaxValue,
             CompressionLevel = 99,
             ZipTempKeepDays = int.MaxValue,
+            UnreadableGiveUpMinutes = int.MaxValue,
         };
 
         s.ClampToLimits();
@@ -397,6 +402,7 @@ public class SettingsLimitsTests
         Assert.Equal(SettingsLimits.RefreshIntervalSecondsMax, s.RefreshIntervalSeconds);
         Assert.Equal(SettingsLimits.CompressionLevelMax, s.CompressionLevel);
         Assert.Equal(SettingsLimits.ZipTempKeepDaysMax, s.ZipTempKeepDays);
+        Assert.Equal(SettingsLimits.UnreadableGiveUpMinutesMax, s.UnreadableGiveUpMinutes);
     }
 
     [Fact]

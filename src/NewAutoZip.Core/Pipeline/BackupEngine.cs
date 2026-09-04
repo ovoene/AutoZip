@@ -325,6 +325,7 @@ public sealed class BackupEngine : IAsyncDisposable
         AppPaths.EnsureCreated();
 
         _state = _stateStore.Load();
+        SanitizeState();
         _zipTemp.Configure(_settings.ResolveZipTemp());
         _zipTemp.EnsureDirectory();
 
@@ -336,7 +337,11 @@ public sealed class BackupEngine : IAsyncDisposable
             _settings.ExcludePatterns,
             [_zipTemp.Root, _settings.CloudPath, AppPaths.DataRoot]);
 
-        _tracker.Configure(_settings.QuietSeconds, _settings.StableConfirmRounds);
+        _tracker.Configure(
+            _settings.QuietSeconds,
+            _settings.StableConfirmRounds,
+            _settings.RefreshIntervalSeconds,
+            _settings.UnreadableGiveUpMinutes);
 
         if (_runner is not null)
         {
@@ -654,6 +659,26 @@ public sealed class BackupEngine : IAsyncDisposable
             _log.Debug($"文件已消失，停止跟踪：{Path.GetFileName(path)}");
         }
 
+        // 等够了「读不到时最多等」还是一个字节都读不到的文件，必须留下一笔账。
+        //
+        // 跟踪器把它从表里删掉之后，就只剩水位线这一道关口了 ——
+        // 而水位线很可能已经越过了它的修改时间（同一轮里别的文件打包成功就会推动水位线），
+        // 于是对账扫描再也不会把它补回来：一个用户明明看得见的文件，就这样静默没了备份。
+        // 记进例外名单等于"这个文件还没处理，下一轮继续试"。
+        // 代价是长期被独占的文件会走上"放弃 → 重新观察 → 再放弃"的循环
+        // （每圈一条 Warn、不产生任何压缩包），这是有意的：
+        // 有界的重试外加日志里说得清楚，好过无声无息地永久丢一个文件。
+        foreach (string path in refresh.GaveUp)
+        {
+            if (AddForcedFile(path, "持续无法读取（被独占锁定或权限不足），尚未备份"))
+            {
+                _log.Warn(
+                    $"{Path.GetFileName(path)} 至今无法读取，本轮不再等它；" +
+                    "它已记入待重新处理名单，下一次对账扫描会重新纳入。");
+                _stateStore.Save(_state);
+            }
+        }
+
         if (refresh.Ready.Count == 0)
         {
             return;
@@ -841,9 +866,14 @@ public sealed class BackupEngine : IAsyncDisposable
     }
 
     /// <summary>
-    /// 准入判断：文件的修改时间必须同时越过两条线。
+    /// 准入判断：文件的修改时间必须同时越过两条线，另有两份逐文件的例外名单可以推翻它们。
     ///
     /// <list type="number">
+    /// <item><b>例外名单</b>（<c>_state.ForcedFiles</c>）—— 命中就放行，优先于下面全部判断。
+    ///       水位线是个标量，表达不了"这一刻之前都处理过了，<b>除了 F</b>"，
+    ///       而"整批打包成功、其中一个文件被独占跳过"恰恰就是这种处境。</item>
+    /// <item><b>未来时间戳名单</b>（<c>_state.FutureStamped</c>）—— 按 (路径, 修改时间) 命中就拦下。
+    ///       水位线截断在当前时刻，覆盖不到这些文件，只能逐个记账。</item>
     /// <item><b>水位线</b>（<c>_state.Checkpoint</c>）—— 严格晚于它，避免重复打包已处理过的文件。
     ///       为空表示不过滤。</item>
     /// <item><b>生效起始日期</b>（工作时间里的"从"）—— 不早于那天的本地零点。
@@ -854,10 +884,18 @@ public sealed class BackupEngine : IAsyncDisposable
     /// </summary>
     private bool PassesCheckpoint(string path)
     {
+        // 例外名单优先于一切 —— 它存在的全部意义就是推翻下面那两道闸门。
+        if (_state.ForcedFiles.Count > 0 && IsForced(path))
+        {
+            return true;
+        }
+
         DateTimeOffset? checkpoint = _state.Checkpoint;
         DateTimeOffset? floor = _fileFloorUtc;
+        bool checkStamps = _state.FutureStamped.Count > 0;
 
-        if (checkpoint is null && floor is null)
+        // 三样都没有就不必去 stat 文件 —— 正常路径上这是绝大多数情况。
+        if (checkpoint is null && floor is null && !checkStamps)
         {
             return true;
         }
@@ -865,6 +903,11 @@ public sealed class BackupEngine : IAsyncDisposable
         try
         {
             DateTime written = File.GetLastWriteTimeUtc(path);
+
+            if (checkStamps && IsFutureStampHandled(path, written))
+            {
+                return false;
+            }
 
             if (checkpoint is { } cp && written <= cp.UtcDateTime)
             {
@@ -878,6 +921,195 @@ public sealed class BackupEngine : IAsyncDisposable
         {
             return true;
         }
+    }
+
+    // ==================================================================
+    //  水位线的两份例外名单
+    //
+    //  为什么非要有名单：水位线是<b>一个标量</b>，只能表达"这一刻之前的都处理过了"。
+    //  但真实存在两种它表达不了的处境，而且两种都会静默丢文件：
+    //
+    //    * 整批打包成功，其中一个文件当时被别的进程独占，7za 跳过它、以退出码 1
+    //      （成功但有警告）收尾。包是好的，那个文件没进去，而水位线照样从它头上跨过 ——
+    //      不重试、不隔离、不告警。→ ForcedFiles（"必须重新处理"）
+    //    * 某个文件的修改时间是 2030 年（时钟错、网络盘、解压出来的旧包）。水位线一旦
+    //      被推到 2030，此后所有正常文件都会被挡住，而这个值躺在 state.json 里，
+    //      重启也不会自愈。所以水位线要截断到当前时刻 —— 代价是它盖不住这个文件，
+    //      下一轮对账又把它当新文件重打。→ FutureStamped（"这个时间戳已经处理过了"）
+    //
+    //  两份名单极性相反，所以分开存；都是自愈的，正常批次一条也不会写。
+    // ==================================================================
+
+    /// <summary>
+    /// 例外名单的长度上限。名单本身是自愈的（打进包里就移出、文件消失就清掉），
+    /// 正常情况下长度是 0，这个上限只防病态场景把 state.json 撑爆 ——
+    /// 比如某个目录里躺着上万个被独占锁定的文件。
+    /// 超限时淘汰最旧的，<b>但绝不把它折进水位线</b>：折进去就等于跨过了其它还没打包的文件，
+    /// 那是又一处静默丢失，比撑大一点状态文件严重得多。
+    /// </summary>
+    private const int LedgerCap = 500;
+
+    /// <summary>
+    /// 判断"文件的修改时间是不是落在未来"要用的参照时钟 —— <b>故意不走 <c>_time</c></b>。
+    ///
+    /// 文件的修改时间是操作系统按真实时钟写下来的，拿一个被测试注入、可以停在任意时刻的
+    /// 时钟去比，结论毫无意义（测试里那个时钟落在过去，于是每个测试文件都会被判成"未来"）。
+    /// 生产环境里 <c>TimeProvider.System</c> 与这里是同一个值，所以只有测试能看出差别。
+    /// 所有<b>调度</b>判断（时段、窗口、超时、退避）仍然一律读 <c>_time</c>。
+    /// </summary>
+    private static DateTimeOffset WallClockUtc() => DateTimeOffset.UtcNow;
+
+    /// <summary>
+    /// 启动时体检：把上一次运行留下的病态状态治好，而不是带着它继续跑。
+    /// 这一步必须在读完 state.json 之后、任何准入判断之前做。
+    /// </summary>
+    private void SanitizeState()
+    {
+        bool dirty = false;
+        DateTimeOffset now = WallClockUtc();
+
+        // 水位线落在未来 = 被一个坏时间戳毒死了：此后所有文件都过不了准入，
+        // 而现象是"引擎显示运行中，什么都不做"，日志里一句解释也没有。
+        if (_state.Checkpoint is { } cp && cp > now)
+        {
+            if (cp > now.AddMinutes(5))
+            {
+                // 治法是清空而不是改成"现在"：改成"现在"会把监控目录里已有的文件一并跨过去，
+                // 那只是把静默丢失搬了个地方。
+                _log.Warn(
+                    $"运行状态里的水位线落在未来（{cp:yyyy-MM-dd HH:mm:ss}），已判定为无效并清空。" +
+                    "这通常是某个文件带着错误的修改时间造成的；水位线不清掉的话，此后所有新文件都会被挡住。");
+                _state.Checkpoint = null;
+            }
+            else
+            {
+                // 只超前几分钟，更像系统时钟被回拨（NTP 校时）而不是坏时间戳。
+                // 整段清空会把监控目录里的老文件全部重打一遍，代价太大；原样留着也不行 ——
+                // 那等于静默挡掉今后这几分钟里产生的每一个文件。压回"现在"两头都顾上：
+                // 老文件仍然算处理过，新文件立刻就能进来（水位线只会往小改，不可能多挡住谁）。
+                _log.Warn(
+                    $"运行状态里的水位线超前于当前时间（{cp:yyyy-MM-dd HH:mm:ss}），已压回当前时刻。" +
+                    "这通常是系统时钟被回拨造成的；不压回的话，接下来这几分钟内产生的文件会被静默挡住。");
+                _state.Checkpoint = now;
+            }
+
+            dirty = true;
+        }
+
+        dirty |= PruneLedgers();
+
+        if (dirty)
+        {
+            _stateStore.Save(_state);
+        }
+    }
+
+    /// <summary>
+    /// 清理两份例外名单：文件已经不在磁盘上的条目一律删掉，再按上限淘汰最旧的。
+    /// 返回是否真的改动过（决定要不要落盘）。
+    /// </summary>
+    private bool PruneLedgers()
+    {
+        int removed = _state.ForcedFiles.RemoveAll(f => !SafeExists(f.Path))
+                    + _state.FutureStamped.RemoveAll(f => !SafeExists(f.Path));
+
+        // 列表按追加顺序排列，所以从头上砍就是淘汰最旧的。
+        if (_state.ForcedFiles.Count > LedgerCap)
+        {
+            int excess = _state.ForcedFiles.Count - LedgerCap;
+            _log.Warn($"待重新处理的文件名单超过 {LedgerCap} 条，已丢弃最早的 {excess} 条。");
+            _state.ForcedFiles.RemoveRange(0, excess);
+            removed += excess;
+        }
+
+        if (_state.FutureStamped.Count > LedgerCap)
+        {
+            int excess = _state.FutureStamped.Count - LedgerCap;
+            _state.FutureStamped.RemoveRange(0, excess);
+            removed += excess;
+        }
+
+        return removed > 0;
+    }
+
+    private static bool SafeExists(string path)
+    {
+        try
+        {
+            return File.Exists(path);
+        }
+        catch
+        {
+            // 探测不了就当它还在：宁可留一条多余的账，也不要把一个真实存在的文件从名单上抹掉。
+            return true;
+        }
+    }
+
+    private bool IsForced(string path) =>
+        _state.ForcedFiles.Any(f => string.Equals(f.Path, path, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>把文件记进"必须重新处理"名单。已在名单里则只刷新原因。返回是否是新加入的。</summary>
+    private bool AddForcedFile(string path, string reason)
+    {
+        foreach (ForcedFile existing in _state.ForcedFiles)
+        {
+            if (string.Equals(existing.Path, path, StringComparison.OrdinalIgnoreCase))
+            {
+                existing.Reason = reason;
+                return false;
+            }
+        }
+
+        _state.ForcedFiles.Add(new ForcedFile
+        {
+            Path = path,
+            Reason = reason,
+            AddedUtc = _time.GetUtcNow(),
+        });
+
+        return true;
+    }
+
+    /// <summary>把这些路径从"必须重新处理"名单上移除。返回移除的条数。</summary>
+    private int ClearForcedFiles(IEnumerable<string> paths)
+    {
+        HashSet<string> set = new(paths, StringComparer.OrdinalIgnoreCase);
+
+        return set.Count == 0 || _state.ForcedFiles.Count == 0
+            ? 0
+            : _state.ForcedFiles.RemoveAll(f => set.Contains(f.Path));
+    }
+
+    /// <summary>
+    /// 这个文件<b>带着这个修改时间</b>是不是已经处理过了。
+    /// 配的是 (路径, 修改时间) 两项：时间戳一变就配不上，于是自动重新放行 ——
+    /// 文件真被重写时不需要任何人工干预。
+    /// </summary>
+    private bool IsFutureStampHandled(string path, DateTime writtenUtc) =>
+        _state.FutureStamped.Any(f =>
+            string.Equals(f.Path, path, StringComparison.OrdinalIgnoreCase)
+            && f.LastWriteUtc.UtcDateTime == writtenUtc);
+
+    private void RememberFutureStamped(string path, DateTimeOffset writtenUtc)
+    {
+        foreach (FutureStampedFile existing in _state.FutureStamped)
+        {
+            if (string.Equals(existing.Path, path, StringComparison.OrdinalIgnoreCase))
+            {
+                existing.LastWriteUtc = writtenUtc;
+                return;
+            }
+        }
+
+        _state.FutureStamped.Add(new FutureStampedFile
+        {
+            Path = path,
+            LastWriteUtc = writtenUtc,
+        });
+
+        _log.Warn(
+            $"{Path.GetFileName(path)} 的修改时间是 {writtenUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}（在未来），" +
+            "已单独记账。水位线不会被推到那个时刻，否则此后所有新文件都会被挡住。");
     }
 
     private bool IsQuarantined(string path) =>
@@ -928,6 +1160,13 @@ public sealed class BackupEngine : IAsyncDisposable
                 if (retryId is not null)
                 {
                     _retries.Remove(retryId);
+                }
+
+                // 文件都没了，例外名单上那几笔账就永远也补不上了 —— 就地清掉。
+                // 不清的话，名单只会越攒越长，而每一条都指向一个不存在的路径。
+                if (ClearForcedFiles(requested) > 0)
+                {
+                    _stateStore.Save(_state);
                 }
 
                 // 这一支曾经是整条时间线上唯一的静默处：【就绪】已经发出去了，
@@ -1004,6 +1243,10 @@ public sealed class BackupEngine : IAsyncDisposable
                 ? $"，跳过 {skippedCount} 个（被占用或已消失）"
                 : string.Empty;
 
+            // 到底是哪几个文件被跳过了 —— 紧挨着打包做，此刻"谁占着这个文件"的现场还在。
+            // 等交付完再探测就可能扑空：锁一松开证据就没了，而那个文件仍然没进包。
+            List<string> skippedFiles = DetectSkippedFiles(files, result);
+
             _log.Info(
                 $"压缩完成：{Path.GetFileName(result.ArchivePath)}，" +
                 $"{archivedCount} 个文件{skipNote} {ByteSize.Format(totalBytes)} → {ByteSize.Format(result.ArchiveBytes)}" +
@@ -1052,7 +1295,11 @@ public sealed class BackupEngine : IAsyncDisposable
                 return;
             }
 
-            AdvanceCheckpoint(files);
+            // 水位线只推到"真正打进包里的最新文件"，然后结算例外名单。
+            // 顺序要紧：先推水位线（它会把被截断的文件记进未来时间戳名单），
+            // 再结算"必须重新处理"名单（清掉这一批已成功的、重新记上仍然没进去的）。
+            AdvanceCheckpoint(files, skippedFiles);
+            ReconcileForcedFiles(files, skippedFiles);
 
             if (_settings.CloudTarget == CloudTarget.OneDrive)
             {
@@ -1325,16 +1572,45 @@ public sealed class BackupEngine : IAsyncDisposable
         }
     }
 
-    private void AdvanceCheckpoint(IReadOnlyList<string> files)
+    /// <summary>
+    /// 推进水位线 —— 这是"文件已经处理过了"的唯一记录，所以它推到哪里必须一分不差。
+    ///
+    /// 三条约束，每一条都对应一处真实的静默丢失：
+    /// <list type="bullet">
+    /// <item><paramref name="skipped"/> 里的文件<b>不参与</b>取最大值。7za 跳过的那个文件
+    ///       如果恰好是这一批里最新的，水位线一推就从它头上跨过去了，从此再也不会被发现。</item>
+    /// <item>取最大值时<b>截断到当前时刻</b>。一个 2030 年的时间戳会把水位线顶到 2030，
+    ///       此后所有正常文件都进不来，而这个值躺在 state.json 里、重启也不自愈。</item>
+    /// <item>被截断挡在外面的文件要<b>逐个记账</b>。水位线盖不住它们，
+    ///       下一轮对账就会把已经打好包的文件当新文件再打一遍，无限循环。</item>
+    /// </list>
+    /// </summary>
+    private void AdvanceCheckpoint(IReadOnlyList<string> files, IReadOnlyCollection<string> skipped)
     {
-        DateTimeOffset newest = _state.Checkpoint ?? DateTimeOffset.MinValue;
+        DateTimeOffset current = _state.Checkpoint ?? DateTimeOffset.MinValue;
+        DateTimeOffset ceiling = WallClockUtc();
+        DateTimeOffset newest = current;
+
+        HashSet<string> excluded = skipped.Count == 0
+            ? []
+            : new HashSet<string>(skipped, StringComparer.OrdinalIgnoreCase);
+
+        // 先量一遍时间戳：真正打进包里的文件才有资格推水位线。
+        List<(string Path, DateTimeOffset Written)> stamps = [];
 
         foreach (string path in files)
         {
+            if (excluded.Contains(path))
+            {
+                continue;
+            }
+
             try
             {
                 DateTimeOffset written = new(File.GetLastWriteTimeUtc(path), TimeSpan.Zero);
-                if (written > newest)
+                stamps.Add((path, written));
+
+                if (written > newest && written <= ceiling)
                 {
                     newest = written;
                 }
@@ -1345,10 +1621,149 @@ public sealed class BackupEngine : IAsyncDisposable
             }
         }
 
-        if (newest > (_state.Checkpoint ?? DateTimeOffset.MinValue))
+        if (newest > current)
         {
             _state.Checkpoint = newest;
         }
+
+        // 再回头看有没有谁被截断挡在了水位线外面。正常批次这里一条也不会有。
+        DateTimeOffset watermark = _state.Checkpoint ?? DateTimeOffset.MinValue;
+
+        foreach ((string path, DateTimeOffset written) in stamps)
+        {
+            if (written > watermark)
+            {
+                RememberFutureStamped(path, written);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 从打包结果里认出"7za 其实没读进去"的源文件。
+    ///
+    /// 退出码 1 是<b>成功但有警告</b>：压缩包是好的、能解开、该提交，只是某个源文件
+    /// 在压缩的那一刻被别的进程独占，7za 报一句 <c>Cannot open file …</c> 就跳过它继续干。
+    /// 不把这些文件单独拎出来，它们就会被当成"已成功打包"跨过去 ——
+    /// 不重试、不隔离、不告警，用户永远不知道少了一个文件。这是三处静默丢失里最隐蔽的一处。
+    /// </summary>
+    private List<string> DetectSkippedFiles(IReadOnlyList<string> files, PackResult result)
+    {
+        List<string> skipped = [];
+
+        // 退出码 0 = 清单里每一个文件都读进去了。7za 只要有一个文件没读成，退出码就是 1，
+        // 所以这里可以直接收工 —— 再往下探测只会误判：文件很可能是<b>打包之后</b>
+        // 才被业务进程重新锁上的，那时它已经在包里了。把它记成"被跳过"会白打一个包。
+        if (result.ExitCode == SevenZipExitCode.Ok)
+        {
+            return skipped;
+        }
+
+        // 个数对得上、一条警告都没有 = 完全正常的批次，不必再去逐个 stat 文件。
+        if (result.FileCount >= files.Count && result.Warnings.Count == 0)
+        {
+            return skipped;
+        }
+
+        // 线索一：警告行里点了本批次某个文件的名字。
+        // 只在"个数确实少了"时才采信 —— 警告行的措辞不由我们决定，
+        // 拿一条无害的警告去推断"少打了文件"，会让这一批被反复重打。
+        if (result.FileCount < files.Count)
+        {
+            foreach (string path in files)
+            {
+                string name = Path.GetFileName(path);
+
+                if (result.Warnings.Any(w => MentionsFile(w, path, name)))
+                {
+                    skipped.Add(path);
+                }
+            }
+        }
+
+        // 线索二：这个文件现在还是打不开。7za 的个数解析失败时（换了措辞、输出被截断）
+        // 这是唯一还剩下的证据，所以它不受上面那个 if 的约束。
+        foreach (string path in files)
+        {
+            if (skipped.Contains(path, StringComparer.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            FileProbeResult probe = _probe.Probe(path);
+
+            // 已经不存在的文件不算"跳过"：它可能刚被业务进程删掉或改名，
+            // 记进名单只会留下一笔永远补不上的账。
+            if (probe.Exists && !probe.Readable)
+            {
+                skipped.Add(path);
+            }
+        }
+
+        return skipped;
+    }
+
+    /// <summary>
+    /// 警告行里是否点到了这个文件。整条路径命中最可靠；退到只比文件名时要求落在
+    /// 路径分隔符或空白这类边界上 —— 否则 <c>a.bak</c> 会在 <c>data.bak</c> 里配上，
+    /// 把一个其实打进去了的文件误判成跳过。
+    /// </summary>
+    private static bool MentionsFile(string warning, string path, string name)
+    {
+        if (warning.Contains(path, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (name.Length == 0)
+        {
+            return false;
+        }
+
+        int at = 0;
+
+        while ((at = warning.IndexOf(name, at, StringComparison.OrdinalIgnoreCase)) >= 0)
+        {
+            int end = at + name.Length;
+            bool leftOk = at == 0 || warning[at - 1] is '\\' or '/' or ' ' or '\t' or '\'' or '"';
+            bool rightOk = end == warning.Length || warning[end] is ' ' or '\t' or ':' or ',' or ')' or '\'' or '"';
+
+            if (leftOk && rightOk)
+            {
+                return true;
+            }
+
+            at = end;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 送达成功之后结算例外名单：这一批文件先全部清账，再把仍然没打进去的重新记上。
+    ///
+    /// 顺序不能反。先清后记才是"自愈"：文件这一轮真被打进包里了，上一轮留下的账
+    /// 必须消失，否则它会被无休止地重打。
+    /// </summary>
+    private void ReconcileForcedFiles(IReadOnlyList<string> files, IReadOnlyCollection<string> skipped)
+    {
+        int cleared = ClearForcedFiles(files);
+
+        if (cleared > 0)
+        {
+            _log.Debug($"已从待重新处理名单移除 {cleared} 个文件（本轮已打包成功）。");
+        }
+
+        foreach (string path in skipped)
+        {
+            if (AddForcedFile(path, "打包时被其他进程独占，7za 已跳过"))
+            {
+                _log.Warn(
+                    $"{Path.GetFileName(path)} 在打包时无法读取，已被 7za 跳过，" +
+                    "不计入本次备份。它会在下一轮重新纳入处理。");
+            }
+        }
+
+        PruneLedgers();
     }
 
     /// <summary>
@@ -1648,12 +2063,25 @@ public sealed class BackupEngine : IAsyncDisposable
 
     private void ApplyDiscard(string id)
     {
-        if (_state.Quarantined.RemoveAll(q => q.Id == id) == 0)
+        QuarantinedBatch? batch = _state.Quarantined.FirstOrDefault(q => q.Id == id);
+
+        if (batch is null)
         {
             return;
         }
 
-        _log.Info($"已忽略隔离批次 {id}。");
+        _state.Quarantined.Remove(batch);
+
+        // "忽略"得真的止得住。这一批里可能有文件挂在例外名单上（打包时被跳过、
+        // 或长期无法读取），名单不清的话它们会被一轮轮重新捡回来 ——
+        // 用户点的那个"忽略"就等于没生效。清掉之后它们回到和其它文件一样的处境：
+        // 水位线盖不住就还会被发现，盖住了就到此为止 —— 而这是用户自己按下的决定。
+        int cleared = ClearForcedFiles(batch.Files);
+
+        _log.Info(cleared > 0
+            ? $"已忽略隔离批次 {id}（同时从待重新处理名单移除 {cleared} 个文件）。"
+            : $"已忽略隔离批次 {id}。");
+
         _stateStore.Save(_state);
     }
 

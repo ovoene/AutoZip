@@ -62,7 +62,8 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
     /// 等价于回归场景 1 里"把 7za.exe 临时改名"。
     ///
     /// <paramref name="seedState"/> 在 Start 之前写一份 state.json，用来模拟"上次进程留下的状态"
-    /// —— 回归场景 7（重启恢复）就靠它。
+    /// —— 回归场景 7（重启恢复）就靠它。它在 <paramref name="seedMonitor"/> <b>之后</b>执行，
+    /// 因为水位线的例外名单是按路径记的，种状态时得先知道文件的真实路径。
     ///
     /// <paramref name="seedMonitor"/> 在 Start <b>之前</b>往监控目录里放文件。这个时机是关键：
     /// 那时 watcher 还没 <c>EnableRaisingEvents</c>，一个事件都不会产生，
@@ -74,7 +75,8 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
         int maxAttempts = 3,
         Action<AppSettings>? tweak = null,
         Action<EngineState>? seedState = null,
-        Action<TempDir>? seedMonitor = null)
+        Action<TempDir>? seedMonitor = null,
+        IFileProbe? probe = null)
     {
         TempDir monitor = NewDir("naz-watch");
         TempDir oneDrive = NewDir("naz-od");
@@ -112,6 +114,14 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
 
         StateStore store = new(Path.Combine(state.Path, "state.json"), log);
 
+        // 先放文件、再种状态、最后 Start。
+        //
+        // 文件必须在 Start 之前放好：那时 watcher 还没 EnableRaisingEvents，一个事件都不会产生，
+        // 这些文件只能由启动时的那一次 Reconcile 一起发现 —— 于是"同一时刻进来 N 个文件"是确定的。
+        // 状态排在文件之后，是因为水位线的两份例外名单是<b>按路径</b>记的，
+        // 种状态的闭包得先知道临时目录里那个文件的真实路径。
+        seedMonitor?.Invoke(monitor);
+
         if (seedState is not null)
         {
             EngineState seeded = store.Load();
@@ -119,10 +129,7 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
             store.Save(seeded);
         }
 
-        BackupEngine engine = new(log, time, Win32FileProbe.Instance, store);
-
-        // 先放文件、再 Start：这样它们必然是被同一次 Reconcile 一起发现的。
-        seedMonitor?.Invoke(monitor);
+        BackupEngine engine = new(log, time, probe ?? Win32FileProbe.Instance, store);
 
         Assert.True(engine.Start(settings, notify, uploads, sevenZipExePath));
 
@@ -1470,6 +1477,432 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
         }
         finally
         {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    // ==================================================================
+    //  静默丢文件的三个洞
+    //
+    //  根因是同一个：水位线 Checkpoint 是<b>一个标量</b>，只能表达"这一刻之前都处理过了"，
+    //  表达不了"这一刻之前都处理过了，除了 F"。三处后果各不相同：
+    //    1. 7za 跳过的文件（退出码 1 = 成功但有警告）被水位线一并跨过 → 永久没备份；
+    //    2. 连续 240 轮打不开被放弃跟踪的文件，之后再也没人捡它；
+    //    3. 一个未来时间戳把水位线顶到 2030，此后所有文件都被挡住。
+    //  三处都是静默的：不重试、不隔离、不通知，日志里也看不出所以然。
+    // ==================================================================
+
+    [Fact]
+    public async Task 洞3_水位线落在未来时启动即清空且已有文件照样被发现()
+    {
+        Harness h = BuildHarness(
+            tweak: NeverReady(),
+            seedMonitor: d => d.WriteFile("normal.dat", 4096),
+            seedState: s =>
+            {
+                s.FirstRunCompleted = true;
+                s.Checkpoint = new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero);
+            });
+
+        try
+        {
+            Assert.True(
+                await PumpUntilAsync(h, s => s.TrackedCount == 1, maxSteps: 10, engineSecondsPerStep: 6),
+                $"水位线清空之后这个文件应当被发现。状态：{h.Engine.Snapshot.StatusText}");
+
+            // 治法是清空，不是改成"现在"：改成"现在"会把监控目录里已有的文件一并跨过去，
+            // 那只是把静默丢失搬了个地方。
+            Assert.Null(h.Store.Load().Checkpoint);
+            Assert.Contains("水位线落在未来", h.Log.Dump());
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    /// <summary>
+    /// 水位线只超前几分钟（系统时钟被回拨）时压回当前时刻，而不是整段清空。
+    /// 清空会把监控目录里的老文件全部重打一遍；原样留着则会静默挡掉接下来那几分钟里的每个文件。
+    /// </summary>
+    [Fact]
+    public async Task 洞3_水位线只略微超前时压回当前时刻而不是清空()
+    {
+        DateTimeOffset before = DateTimeOffset.UtcNow;
+
+        Harness h = BuildHarness(
+            tweak: NeverReady(),
+            seedMonitor: d =>
+            {
+                // 修改时间正好落在"被超前的水位线挡住"的那几分钟里。
+                string full = d.WriteFile("inside-the-skew.dat", 4096);
+                File.SetLastWriteTimeUtc(full, DateTime.UtcNow.AddMinutes(1));
+            },
+            seedState: s =>
+            {
+                s.FirstRunCompleted = true;
+                s.Checkpoint = DateTimeOffset.UtcNow.AddMinutes(2);
+            });
+
+        try
+        {
+            Assert.True(
+                await PumpUntilAsync(h, s => s.TrackedCount == 1, maxSteps: 10, engineSecondsPerStep: 6),
+                $"压回水位线之后这个文件应当被发现。状态：{h.Engine.Snapshot.StatusText}");
+
+            DateTimeOffset? after = h.Store.Load().Checkpoint;
+
+            // 压回而不是清空：老文件仍然算处理过，不会被重打一遍。
+            Assert.NotNull(after);
+            Assert.InRange(after!.Value, before, DateTimeOffset.UtcNow);
+            Assert.Contains("已压回当前时刻", h.Log.Dump());
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    /// <summary>
+    /// 例外名单能推翻水位线。<paramref name="forced"/> = false 的那一档是对照组：
+    /// 没有名单，同一个文件就被水位线永久挡在门外 —— 这正是洞 1 与洞 2 的后果。
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task 洞12_例外名单里的文件即使被水位线盖住也会重新纳入处理(bool forced)
+    {
+        string? full = null;
+
+        Harness h = BuildHarness(
+            tweak: NeverReady(),
+            seedMonitor: d =>
+            {
+                full = d.WriteFile("skipped-by-7za.dat", 4096);
+
+                // 文件比水位线更老 —— 光看水位线，它已经"处理过了"。
+                File.SetLastWriteTimeUtc(full, DateTime.UtcNow.AddHours(-2));
+            },
+            seedState: s =>
+            {
+                s.FirstRunCompleted = true;
+                s.Checkpoint = DateTimeOffset.UtcNow.AddHours(-1);
+
+                if (forced)
+                {
+                    s.ForcedFiles.Add(new ForcedFile
+                    {
+                        Path = full!,
+                        Reason = "打包时被其他进程独占，7za 已跳过",
+                        AddedUtc = DateTimeOffset.UtcNow.AddHours(-1),
+                    });
+                }
+            });
+
+        try
+        {
+            bool discovered = await PumpUntilAsync(
+                h, s => s.TrackedCount == 1, maxSteps: 12, engineSecondsPerStep: 6);
+
+            Assert.Equal(forced, discovered);
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    /// <summary>
+    /// 未来时间戳的账是按 (路径, 修改时间) 记的，不是按路径记的。
+    ///
+    /// 只按路径记会走到另一个极端：文件被真正重写之后也再不受理，又是一次静默丢失。
+    /// <paramref name="sameStamp"/> = false 那一档就是在验这个自愈：时间戳一变即放行。
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task 洞3_未来时间戳按路径加修改时间记账时间戳变了就重新放行(bool sameStamp)
+    {
+        string? full = null;
+        DateTime written = default;
+
+        Harness h = BuildHarness(
+            tweak: NeverReady(),
+            seedMonitor: d =>
+            {
+                full = d.WriteFile("stamped-in-2030.dat", 4096);
+
+                // 修改时间在未来：水位线推不到这里（会被截断到当前时刻），
+                // 所以挡住它的只可能是这份名单，不会是水位线。
+                File.SetLastWriteTimeUtc(full, DateTime.UtcNow.AddDays(30));
+                written = File.GetLastWriteTimeUtc(full);
+            },
+            seedState: s =>
+            {
+                s.FirstRunCompleted = true;
+                s.FutureStamped.Add(new FutureStampedFile
+                {
+                    Path = full!,
+                    LastWriteUtc = new DateTimeOffset(
+                        sameStamp ? written : written.AddSeconds(-1), TimeSpan.Zero),
+                });
+            });
+
+        try
+        {
+            bool discovered = await PumpUntilAsync(
+                h, s => s.TrackedCount == 1, maxSteps: 12, engineSecondsPerStep: 6);
+
+            Assert.Equal(!sameStamp, discovered);
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    /// <summary>
+    /// 洞 2：连续 240 轮打不开而被放弃跟踪的文件，必须留下一笔账。
+    ///
+    /// 只用假探测器就能确定性复现"一直被独占"，不必真去抢一个 20 分钟的文件锁。
+    /// 240 是跟踪器里写死的次数，一轮一次探测，所以这里得实打实地转 240 圈。
+    /// </summary>
+    [Fact]
+    public async Task 洞2_持续读不到而被放弃跟踪的文件会记入待重新处理名单()
+    {
+        FakeFileProbe probe = new();
+        string? full = null;
+
+        Harness h = BuildHarness(
+            seedMonitor: d =>
+            {
+                // 真实文件也要有：PassesCheckpoint 与名单清理读的是真磁盘。
+                full = d.WriteFile("locked-forever.dat", 4096);
+                probe.Set(full, 4096, Origin, readable: false);
+            },
+            probe: probe);
+
+        try
+        {
+            EngineState state = h.Store.Load();
+
+            for (int i = 0; i < 300 && state.ForcedFiles.Count == 0; i++)
+            {
+                h.Time.Advance(TimeSpan.FromSeconds(5));
+
+                Assert.True(await WaitOneRoundAsync(h), "引擎在第 " + i + " 轮卡住了");
+
+                state = h.Store.Load();
+            }
+
+            Assert.Contains(
+                state.ForcedFiles,
+                f => string.Equals(f.Path, full, StringComparison.OrdinalIgnoreCase));
+
+            Assert.Contains("至今无法读取", h.Log.Dump());
+
+            // 放弃跟踪不等于放弃这个文件：它必须还能被对账扫描重新捡起来。
+            Assert.True(
+                await PumpUntilAsync(h, s => s.TrackedCount == 1, maxSteps: 12, engineSecondsPerStep: 6),
+                "记了账就该被重新纳入观察");
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    /// <summary>
+    /// "忽略"这个动作必须把该批次在待重新处理名单上的账一并销掉。
+    ///
+    /// 否则会造出一类怎么点都关不掉的文件：批次没了，名单还在，
+    /// 每轮对账都把它重新捞回来 —— 用户点了"忽略"，界面上却没完。
+    /// </summary>
+    [Fact]
+    public async Task 忽略隔离批次会同时销掉它在待重新处理名单上的账()
+    {
+        string? full = null;
+
+        Harness h = BuildHarness(
+            tweak: NeverReady(),
+            seedMonitor: d => { full = d.WriteFile("quarantined.dat", 4096); },
+            seedState: s =>
+            {
+                s.FirstRunCompleted = true;
+                s.Quarantined.Add(new QuarantinedBatch
+                {
+                    Id = "B-1",
+                    Files = [full!],
+                    Reason = "测试用：连续打包失败",
+                    Attempts = 3,
+                    QuarantinedUtc = Origin,
+                    TotalBytes = 4096,
+                });
+                s.ForcedFiles.Add(new ForcedFile
+                {
+                    Path = full!,
+                    Reason = "打包时被其他进程独占，7za 已跳过",
+                    AddedUtc = Origin,
+                });
+            });
+
+        try
+        {
+            // Enqueue 是按界面看到的那份快照校验批次是否存在的，得先让它发布出来。
+            Assert.True(
+                await PumpUntilAsync(h, s => s.Quarantines.Count == 1, maxSteps: 6, engineSecondsPerStep: 6),
+                "种进去的隔离批次没有出现在快照里");
+
+            Assert.True(h.Engine.DiscardQuarantined("B-1"));
+
+            Assert.True(
+                await PumpUntilAsync(h, s => s.Quarantines.Count == 0, maxSteps: 6, engineSecondsPerStep: 6),
+                "忽略命令没有被执行");
+
+            EngineState after = h.Store.Load();
+            Assert.Empty(after.Quarantined);
+            Assert.Empty(after.ForcedFiles);
+            Assert.Contains("已忽略隔离批次 B-1", h.Log.Dump());
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    /// <summary>
+    /// 洞 1 的完整现场，用真 7za 跑：三个文件，中间那个能读，两头的被独占锁住。
+    /// 7za 跳过锁住的两个、以退出码 1（成功但有警告）收尾，归档本身完好。
+    ///
+    /// 修复前这一下会丢两个文件，而且是两种不同的丢法，缺一不可：
+    ///   · newer 比进包的文件<b>新</b> —— 旧版把整批清单丢给水位线，水位线一步推到 -5 分，
+    ///     它从此再也过不了闸门；
+    ///   · older 比进包的文件<b>老</b> —— 水位线合法地盖住了它，光靠水位线怎么都救不回来，
+    ///     只能靠例外名单。
+    /// 所以两半都得钉住：水位线不许越过被跳过的文件，被跳过的文件必须留下账。
+    /// </summary>
+    [Fact]
+    public async Task 洞1_7za跳过的文件不会被水位线跨过且锁一松开就补打一包()
+    {
+        Harness h = BuildHarness(
+            TestBinaries.SevenZip(),
+            seedMonitor: d =>
+            {
+                // 修改时间必须显式拉开：水位线是按修改时间比的，
+                // 三个文件同一秒写出来就分不出"跨过去"和"没跨过去"。
+                DateTime now = DateTime.UtcNow;
+                File.SetLastWriteTimeUtc(d.WriteFile("older.bak", 64 * 1024), now.AddMinutes(-15));
+                File.SetLastWriteTimeUtc(d.WriteFile("middle.bak", 64 * 1024), now.AddMinutes(-10));
+                File.SetLastWriteTimeUtc(d.WriteFile("newer.bak", 64 * 1024), now.AddMinutes(-5));
+            });
+
+        string older = h.Monitor.File("older.bak");
+        string middle = h.Monitor.File("middle.bak");
+        string newer = h.Monitor.File("newer.bak");
+
+        FileStream? holdOlder = null;
+        FileStream? holdNewer = null;
+
+        try
+        {
+            Assert.True(
+                await PumpUntilAsync(h, s => s.BatchFileCount == 3, maxSteps: 12, engineSecondsPerStep: 6),
+                $"三个文件没能一起进批次。当前状态：{h.Engine.Snapshot.StatusText}");
+
+            // FileShare.None 连 7za 的 -ssw 都绕不过去，这是"文件被别的进程占着"的真实现场。
+            holdOlder = new FileStream(older, FileMode.Open, FileAccess.Read, FileShare.None);
+            holdNewer = new FileStream(newer, FileMode.Open, FileAccess.Read, FileShare.None);
+
+            Assert.True(
+                await PumpUntilAsync(h, s => s.ArchivesCreated > 0 && s.PendingUploadCount == 0),
+                $"没能跑完第一轮（打包 + 上传确认）。当前状态：{h.Engine.Snapshot.StatusText}");
+
+            EngineState mid = h.Store.Load();
+
+            // ---- 水位线只推到真正进包的 middle，没有跨过被跳过的 newer ----
+            Assert.Equal(
+                new DateTimeOffset(File.GetLastWriteTimeUtc(middle), TimeSpan.Zero),
+                mid.Checkpoint);
+
+            // ---- 被跳过的两个都留下了账：一个在水位线之前，一个在水位线之后 ----
+            Assert.Equal(2, mid.ForcedFiles.Count);
+            Assert.Contains(
+                mid.ForcedFiles,
+                f => string.Equals(f.Path, older, StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(
+                mid.ForcedFiles,
+                f => string.Equals(f.Path, newer, StringComparison.OrdinalIgnoreCase));
+
+            // 通知如实写了跳过几个，而不是拿清单条数虚报成 3 个。
+            Assert.Contains(
+                "本次共 1 个文件打包成功，跳过 2 个（被占用或已消失）。",
+                h.Notify.First(NotifyEvent.PackCompleted).ToPlainText());
+
+            Assert.Single(h.OneDrive.Files("*.7z"));
+
+            // ---- 锁一松开就得补上：这是"名单自愈"那一半 ----
+            holdOlder.Dispose();
+            holdNewer.Dispose();
+
+            Assert.True(
+                await PumpUntilAsync(h, s => s.ArchivesCreated > 1 && s.PendingUploadCount == 0),
+                $"锁松开之后没有补打第二个包。当前状态：{h.Engine.Snapshot.StatusText}");
+
+            EngineState done = h.Store.Load();
+
+            // 两笔账都销了 —— 名单不会一直攒着。
+            Assert.Empty(done.ForcedFiles);
+
+            // newer 这一轮真进包了，水位线这才允许推到它。
+            Assert.Equal(
+                new DateTimeOffset(File.GetLastWriteTimeUtc(newer), TimeSpan.Zero),
+                done.Checkpoint);
+
+            // 全程没有一个未来时间戳，那份名单就该一条都不长。
+            Assert.Empty(done.FutureStamped);
+
+            Assert.Equal(2, h.OneDrive.Files("*.7z").Length);
+            AssertZipTempClean(h);
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            holdOlder?.Dispose();
+            holdNewer?.Dispose();
             await h.Engine.StopAsync();
         }
     }

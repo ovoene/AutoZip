@@ -165,8 +165,8 @@ public class StabilityTrackerTests
         probe.Set(path, 1000, Origin, readable: false);
         t.Observe(path);
 
-        // 放弃阈值默认 240 次探测；这里把它调小以便快速验证收敛。
-        t.Configure(Quiet, Rounds, unreadableGiveUpProbes: 5);
+        // 放弃阈值默认 20 分钟；这里调到 1 分钟以便快速验证收敛。
+        t.Configure(Quiet, Rounds, refreshIntervalSeconds: 10, unreadableGiveUpMinutes: 1);
 
         List<string> gaveUp = [];
 
@@ -178,6 +178,96 @@ public class StabilityTrackerTests
 
         Assert.Contains(path, gaveUp);
         Assert.False(t.IsTracked(path));
+    }
+
+    [Fact]
+    public void 放弃时长按设置值生效_不再是写死的探测次数()
+    {
+        (StabilityTracker t, FakeTimeProvider time, FakeFileProbe probe) = Build();
+        const string path = "C:\\watch\\locked-timed.dat";
+
+        probe.Set(path, 1000, Origin, readable: false);
+        t.Observe(path);
+        t.Configure(Quiet, Rounds, refreshIntervalSeconds: 5, unreadableGiveUpMinutes: 3);
+
+        DateTimeOffset start = time.GetUtcNow();
+        DateTimeOffset? gaveUpAt = null;
+
+        // 按 5 秒一轮推进，直到被放弃。上限给足（3 分钟 = 36 轮，这里给 200 轮）。
+        for (int i = 0; i < 200 && gaveUpAt is null; i++)
+        {
+            time.Advance(TimeSpan.FromSeconds(5));
+
+            if (t.Refresh().GaveUp.Count > 0)
+            {
+                gaveUpAt = time.GetUtcNow();
+            }
+        }
+
+        Assert.NotNull(gaveUpAt);
+
+        // 首次探测记 0 增量，所以实际会比 3 分钟多一轮，允许一轮的误差。
+        TimeSpan waited = gaveUpAt!.Value - start;
+        Assert.InRange(waited, TimeSpan.FromMinutes(3), TimeSpan.FromMinutes(3) + TimeSpan.FromSeconds(10));
+    }
+
+    [Fact]
+    public void 停摆一整夜不会让读不到的文件在恢复后的第一次探测就被放弃()
+    {
+        (StabilityTracker t, FakeTimeProvider time, FakeFileProbe probe) = Build();
+        const string path = "C:\\watch\\locked-overnight.dat";
+
+        probe.Set(path, 1000, Origin, readable: false);
+        t.Observe(path);
+        t.Configure(Quiet, Rounds, refreshIntervalSeconds: 5, unreadableGiveUpMinutes: 20);
+
+        t.Refresh();
+
+        // 工作时段之外主循环不探测；恢复后的第一次探测不该把整段空白算成"已经等过了"。
+        time.Advance(TimeSpan.FromHours(9));
+        RefreshResult after = t.Refresh();
+
+        Assert.Empty(after.GaveUp);
+        Assert.True(t.IsTracked(path));
+        Assert.Single(after.Unreadable);
+
+        // 时间跳变也不能一步凑满：单次增量不超过阈值的一半，所以至少还得再来一次。
+        time.Advance(TimeSpan.FromHours(9));
+        Assert.Empty(t.Refresh().GaveUp);
+    }
+
+    [Fact]
+    public void 中途读到过一次就重新计时()
+    {
+        (StabilityTracker t, FakeTimeProvider time, FakeFileProbe probe) = Build();
+        const string path = "C:\\watch\\flaky-lock.dat";
+
+        probe.Set(path, 1000, Origin, readable: false);
+        t.Observe(path);
+        t.Configure(Quiet, Rounds, refreshIntervalSeconds: 10, unreadableGiveUpMinutes: 1);
+
+        // 先攒 50 秒（阈值 60 秒，还差一步）。
+        for (int i = 0; i < 5; i++)
+        {
+            time.Advance(TimeSpan.FromSeconds(10));
+            Assert.Empty(t.Refresh().GaveUp);
+        }
+
+        // 锁松开一次：累计清零。
+        probe.Set(path, 1000, Origin, readable: true);
+        time.Advance(TimeSpan.FromSeconds(10));
+        t.Refresh();
+
+        // 再锁上，只等 30 秒，不该被放弃。
+        probe.Set(path, 1000, Origin, readable: false);
+
+        for (int i = 0; i < 3; i++)
+        {
+            time.Advance(TimeSpan.FromSeconds(10));
+            Assert.Empty(t.Refresh().GaveUp);
+        }
+
+        Assert.True(t.IsTracked(path));
     }
 
     [Fact]

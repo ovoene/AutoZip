@@ -187,6 +187,29 @@
                                    Text="静默期太短会把写得慢、中间有停顿的大文件误判成已完成，从而压进一个不完整的副本。这三个数的最小值都不允许填 0 —— 旧版可以填 0，那会让后台线程 100% 忙等。" />
 
                         <StackPanel Style="{StaticResource FieldRow}" Margin="0,12,0,0">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="读不到时最多等（分钟）" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="1440"
+                                          Minimum="1"
+                                          SmallChange="5"
+                                          LargeChange="30"
+                                          MaxDecimalPlaces="0"
+                                          Value="{Binding UnreadableGiveUpMinutes, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}" Text="{Binding UnreadableGiveUpHint}" />
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="【什么样的文件才会进入这个计时】只有一个字节都读不到的文件才算。程序探测文件时用的是「共享读」方式，只有写入方把文件独占打开（连别人读都不允许）才会失败 —— 常见于 Access/Jet 的 .ldb、独占模式的 SQLite、部分不走卷影副本的备份工具。" />
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="【正在写、但能读的文件不受这个值影响】数据库备份、日志写入绝大多数允许共享读。这种文件由上面的「静默期」负责：只要体积或修改时间还在变，程序就一直等，等一小时、等一整天都可以，不会因为这个值到点而放弃，也绝不会在写入过程中被打进压缩包。" />
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="【到点之后会发生什么】不是放弃这个文件，只是不在本轮继续盯它：日志记一条警告，文件挂进「待重新处理」名单，下次对账扫描重新纳入观察，锁一松开就正常打包。名单会随程序状态存盘，重启也不会漏掉它。" />
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="【调大还是调小】调大 = 告警更少、日志更干净，代价是「有个文件一直备份不了」这件事被发现得更晚。调小 = 更早收到提醒，代价是长期被独占的文件会反复刷警告。数据库文件常年独占的场景，建议设成大于备份窗口的时长。" />
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="【怎么计时】只累计程序真正在探测的时间。工作时间之外，以及打包、上传占住主循环的那段都不计入 —— 否则夜里关机、早上开工，所有锁着的文件会在第一次探测时一起「到点」，白刷一屏告警。" />
+
+                        <StackPanel Style="{StaticResource FieldRow}" Margin="0,12,0,0">
                             <TextBlock Style="{StaticResource FieldLabel}" Text="对账扫描间隔（秒）" />
                             <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
                                           Maximum="86400"

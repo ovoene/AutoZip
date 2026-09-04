@@ -24,6 +24,13 @@ public static class SettingsLimits
     public const int RefreshIntervalSecondsMin = 1;
     public const int RefreshIntervalSecondsMax = 300;
 
+    /// <summary>
+    /// 最小 1 分钟：填 0 会让文件第一次读不到就被放弃，等于关掉了"等它解锁"这件事。
+    /// 上限 1440 分钟（一整天）—— 再长就该考虑把这个目录移出监控范围了。
+    /// </summary>
+    public const int UnreadableGiveUpMinutesMin = 1;
+    public const int UnreadableGiveUpMinutesMax = 1440;
+
     public const int ReconcileIntervalSecondsMin = 30;
     public const int ReconcileIntervalSecondsMax = 86400;
 
@@ -137,6 +144,22 @@ public sealed class AppSettings
     /// <summary>对已跟踪文件重新探测的间隔。</summary>
     public int RefreshIntervalSeconds { get; set; } = 5;
 
+    /// <summary>
+    /// 一个<b>连一个字节都读不到</b>的文件最多等多久（分钟），到点后本轮不再等它。
+    ///
+    /// 只有写入方用独占方式打开文件（连共享读都不给）才会进入这个计时。
+    /// 绝大多数数据库备份、日志写入允许共享读，那些文件走的是
+    /// <see cref="QuietSeconds"/> 那条"还在变就继续等"的路，与这个值无关，等多久都行。
+    ///
+    /// 到点之后文件<b>不会</b>被跳过：它会被记进状态里的待重新处理名单，
+    /// 下一次对账扫描重新纳入观察。所以这个值只影响"多久告警一次、多久重来一遍"，
+    /// 不影响"会不会丢"。
+    ///
+    /// 计时只累计程序<b>真正在探测</b>的时间：工作时段之外、以及打包/上传占住主循环的那段
+    /// 不计入，否则关一夜机再开工，所有锁着的文件会在第一次探测时集体"到点"。
+    /// </summary>
+    public int UnreadableGiveUpMinutes { get; set; } = 20;
+
     /// <summary>兜底全目录对账扫描间隔（FileSystemWatcher 丢事件时的补救）。</summary>
     public int ReconcileIntervalSeconds { get; set; } = 300;
 
@@ -247,6 +270,7 @@ public sealed class AppSettings
         QuietSeconds = Math.Clamp(QuietSeconds, SettingsLimits.QuietSecondsMin, SettingsLimits.QuietSecondsMax);
         StableConfirmRounds = Math.Clamp(StableConfirmRounds, SettingsLimits.StableConfirmRoundsMin, SettingsLimits.StableConfirmRoundsMax);
         RefreshIntervalSeconds = Math.Clamp(RefreshIntervalSeconds, SettingsLimits.RefreshIntervalSecondsMin, SettingsLimits.RefreshIntervalSecondsMax);
+        UnreadableGiveUpMinutes = Math.Clamp(UnreadableGiveUpMinutes, SettingsLimits.UnreadableGiveUpMinutesMin, SettingsLimits.UnreadableGiveUpMinutesMax);
         ReconcileIntervalSeconds = Math.Clamp(ReconcileIntervalSeconds, SettingsLimits.ReconcileIntervalSecondsMin, SettingsLimits.ReconcileIntervalSecondsMax);
         CompressionLevel = Math.Clamp(CompressionLevel, SettingsLimits.CompressionLevelMin, SettingsLimits.CompressionLevelMax);
         PackTimeoutMinutes = Math.Clamp(PackTimeoutMinutes, SettingsLimits.PackTimeoutMinutesMin, SettingsLimits.PackTimeoutMinutesMax);

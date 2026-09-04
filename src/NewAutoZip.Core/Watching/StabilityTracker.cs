@@ -39,6 +39,19 @@ public sealed class TrackedFile
 
     public int UnreadableProbes { get; internal set; }
 
+    /// <summary>
+    /// 连续读不到的<b>累计探测时长</b>，与设置里的"读不到时最多等"比较。
+    ///
+    /// 为什么不直接用"第一次读不到的时刻"到现在的墙上时间差：工作时段之外主循环根本不探测，
+    /// 打包和上传也会占住主循环好一阵。用墙上时间差的话，关一夜机再开工，
+    /// 所有锁着的文件会在恢复后的第一次探测里集体"到点"，白刷一屏告警。
+    /// 这里只累加"两次探测之间真正过去的时间"，且每次累加有上限（见 <c>_probeStepCap</c>）。
+    /// </summary>
+    public TimeSpan UnreadableFor { get; internal set; }
+
+    /// <summary>上一次探测这个文件的时刻，用来算 <see cref="UnreadableFor"/> 的增量。</summary>
+    internal DateTimeOffset LastProbeUtc { get; set; }
+
     public TrackedFileState State { get; internal set; } = TrackedFileState.Observing;
 
     /// <summary>是否已经完成过初始化探测（用来区分"首次见到"和"后续复查"）。</summary>
@@ -87,7 +100,19 @@ public sealed class StabilityTracker
 
     private int _quietSeconds = 60;
     private int _confirmRounds = 2;
-    private int _unreadableGiveUpProbes = 240;
+
+    /// <summary>读不到的文件最多等多久（累计探测时长）。对应设置项 UnreadableGiveUpMinutes。</summary>
+    private TimeSpan _unreadableGiveUp = TimeSpan.FromMinutes(20);
+
+    /// <summary>
+    /// 单次探测最多能给 <see cref="TrackedFile.UnreadableFor"/> 记多少时间。
+    ///
+    /// 两个作用：主循环被打包/上传占住、或者干脆停在工作时段外时，
+    /// 恢复后的第一次探测不会把整段空白都算成"等过了"；
+    /// 同时它不超过放弃阈值的一半，于是"放弃"永远需要至少两次真实探测，
+    /// 不可能被一次时间跳变（NTP 校时、休眠唤醒）一步凑满。
+    /// </summary>
+    private TimeSpan _probeStepCap = TimeSpan.FromSeconds(15);
 
     public StabilityTracker(TimeProvider time, IFileProbe probe, IAppLogger log)
     {
@@ -100,11 +125,20 @@ public sealed class StabilityTracker
 
     public IReadOnlyCollection<TrackedFile> Files => _files.Values;
 
-    public void Configure(int quietSeconds, int confirmRounds, int unreadableGiveUpProbes = 240)
+    public void Configure(
+        int quietSeconds,
+        int confirmRounds,
+        int refreshIntervalSeconds = 5,
+        int unreadableGiveUpMinutes = 20)
     {
         _quietSeconds = Math.Max(1, quietSeconds);
         _confirmRounds = Math.Max(1, confirmRounds);
-        _unreadableGiveUpProbes = Math.Max(1, unreadableGiveUpProbes);
+        _unreadableGiveUp = TimeSpan.FromMinutes(Math.Max(1, unreadableGiveUpMinutes));
+
+        // 正常一轮的间隔给三倍余量，再兜一个 30 秒的底（间隔设成 1 秒时，
+        // 一轮偶尔跑到十几秒是正常的，不该因此少记时间）；最后压到阈值的一半以内。
+        double capSeconds = Math.Max(Math.Max(1, refreshIntervalSeconds) * 3, 30);
+        _probeStepCap = TimeSpan.FromSeconds(Math.Min(capSeconds, _unreadableGiveUp.TotalSeconds / 2));
     }
 
     /// <summary>登记一个候选文件。已在跟踪中则忽略。返回 true 表示新加入。</summary>
@@ -154,16 +188,34 @@ public sealed class StabilityTracker
                 continue;
             }
 
+            // 距上次探测这个文件真正过去了多久。首次探测记 0；时钟被回拨记 0；
+            // 太长的空白（停在工作时段外、打包占住主循环）压到上限。
+            TimeSpan since = file.LastProbeUtc == default ? TimeSpan.Zero : now - file.LastProbeUtc;
+
+            if (since < TimeSpan.Zero)
+            {
+                since = TimeSpan.Zero;
+            }
+            else if (since > _probeStepCap)
+            {
+                since = _probeStepCap;
+            }
+
+            file.LastProbeUtc = now;
+
             if (!probe.Readable)
             {
                 file.State = TrackedFileState.Unreadable;
                 file.UnreadableProbes++;
+                file.UnreadableFor += since;
 
-                if (file.UnreadableProbes >= _unreadableGiveUpProbes)
+                if (file.UnreadableFor >= _unreadableGiveUp)
                 {
                     _files.Remove(path);
                     gaveUp.Add(path);
-                    _log.Warn($"文件持续无法读取，已放弃跟踪：{path}（被独占锁定或权限不足）");
+                    _log.Warn(
+                        $"文件已连续 {_unreadableGiveUp.TotalMinutes:0} 分钟无法读取（探测 {file.UnreadableProbes} 次），" +
+                        $"本轮放弃跟踪：{path}（被独占锁定或权限不足）");
                 }
                 else
                 {
@@ -174,6 +226,7 @@ public sealed class StabilityTracker
             }
 
             file.UnreadableProbes = 0;
+            file.UnreadableFor = TimeSpan.Zero;
 
             bool changed = !file.Initialized
                 || probe.Length != file.Length
