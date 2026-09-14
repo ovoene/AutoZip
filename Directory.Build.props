@@ -25,9 +25,9 @@
   <PropertyGroup>
     <Product>AutoZip</Product>
     <Company>AutoZip</Company>
-    <Version>6.6.9</Version>
-    <AssemblyVersion>6.6.9.0</AssemblyVersion>
-    <FileVersion>6.6.9.0</FileVersion>
+    <Version>6.7.0</Version>
+    <AssemblyVersion>6.7.0.0</AssemblyVersion>
+    <FileVersion>6.7.0.0</FileVersion>
     <Copyright>Copyright (c) 2026</Copyright>
   </PropertyGroup>
 

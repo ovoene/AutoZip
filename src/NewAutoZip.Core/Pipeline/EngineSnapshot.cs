@@ -117,7 +117,22 @@ public sealed record EngineSnapshot(
     IReadOnlyList<BatchFileView> BatchFiles,
     IReadOnlyList<PendingUploadView> PendingUploads,
     IReadOnlyList<RetryView> Retries,
-    IReadOnlyList<QuarantineView> Quarantines)
+    IReadOnlyList<QuarantineView> Quarantines,
+
+    /// <summary>
+    /// 上面那三个容量数字是按什么口径算的（见 <see cref="QuotaBasis"/>）。
+    ///
+    /// 本地硬盘用 <see cref="QuotaBasis.Volume"/>：三个数全是卷的真实值，
+    /// <c>CloudUsedBytes</c> 是<b>整个卷</b>的占用，不只是我们的包 ——
+    /// 界面文案必须据此改口，否则用户会以为那么多都是备份占的。
+    /// </summary>
+    QuotaBasis CloudQuotaBasis = QuotaBasis.Budget,
+
+    /// <summary>我们自己的包占了多少。两种口径下都填，供"本程序备份包占 X"那句用。</summary>
+    long CloudOurBytes = 0,
+
+    /// <summary>用户填的预算，0 = 没填。Volume 口径下它和 <c>CloudQuotaBytes</c> 是两回事。</summary>
+    long CloudBudgetBytes = 0)
 {
     public static EngineSnapshot Stopped { get; } = new(
         EnginePhase.Stopped,
@@ -168,7 +183,10 @@ public sealed record EngineSnapshot(
 
     // ---------- 云盘容量 ----------
 
-    /// <summary>用户填了总容量才有得算。没填时界面把整张容量卡片藏起来。</summary>
+    /// <summary>
+    /// 有得算吗。本地硬盘下卷的总容量恒大于 0，所以<b>用户没填预算也会显示卡片</b>——
+    /// 卷的容量不需要谁来填。云盘/远程目录才要人填，没填就藏起整张卡片。
+    /// </summary>
     public bool CloudQuotaConfigured => CloudQuotaBytes > 0;
 
     public string CloudQuotaText => ByteSize.Format(CloudQuotaBytes);
@@ -194,9 +212,31 @@ public sealed record EngineSnapshot(
     public string CloudQuotaWarnText =>
         CloudQuotaWarnBytes > 0 ? $"警戒线 {ByteSize.Format(CloudQuotaWarnBytes)}" : string.Empty;
 
-    /// <summary>「已用 712.4 GB / 1.00 TB · 剩余 311.6 GB」。</summary>
-    public string CloudQuotaUsageText =>
-        $"已用 {CloudUsedText} / {CloudQuotaText} · 剩余 {CloudFreeText}";
+    /// <summary>
+    /// 「已用 712.4 GB / 1.00 TB · 剩余 311.6 GB」。
+    ///
+    /// 三个数之间<b>恒有减法关系</b>（见 <see cref="CloudQuotaStatus.FreeBytes"/>）。
+    /// 本地硬盘口径下这是整个卷的账，所以再缀一句我们自己占了多少 ——
+    /// 否则用户看着 1.51 TB 会以为全是备份包。
+    /// </summary>
+    public string CloudQuotaUsageText
+    {
+        get
+        {
+            string head = $"已用 {CloudUsedText} / {CloudQuotaText} · 剩余 {CloudFreeText}";
+
+            if (CloudQuotaBasis != QuotaBasis.Volume)
+            {
+                return head;
+            }
+
+            string ours = $" · 其中本程序备份包 {ByteSize.Format(CloudOurBytes)}";
+
+            return CloudBudgetBytes > 0
+                ? $"{head}{ours} / 预算 {ByteSize.Format(CloudBudgetBytes)}"
+                : $"{head}{ours}";
+        }
+    }
 
     /// <summary>
     /// 容量卡片<b>应该</b>按哪份数字显示。
@@ -241,6 +281,9 @@ public sealed record EngineSnapshot(
                 CloudUsedBytes = 0,
                 CloudFreeBytes = 0,
                 CloudQuotaWarnBytes = 0,
+                CloudQuotaBasis = QuotaBasis.Budget,
+                CloudOurBytes = 0,
+                CloudBudgetBytes = 0,
             };
         }
 
@@ -250,6 +293,9 @@ public sealed record EngineSnapshot(
             CloudUsedBytes = saved.UsedBytes,
             CloudFreeBytes = saved.FreeBytes,
             CloudQuotaWarnBytes = savedWarnBytes,
+            CloudQuotaBasis = saved.Basis,
+            CloudOurBytes = saved.OurBytes,
+            CloudBudgetBytes = saved.BudgetBytes,
         };
     }
 }

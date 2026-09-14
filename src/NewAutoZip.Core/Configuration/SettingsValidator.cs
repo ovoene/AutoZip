@@ -506,8 +506,10 @@ public static class SettingsValidator
 
         if (space.Known && quota > space.TotalBytes)
         {
+            // 本地硬盘上这条预算尤其没用：卡片和通知报的本来就是卷的真实三个数，
+            // 一个比整块盘还大的预算连"提前拦一道"的作用都起不到。
             issues.Add(new ValidationIssue(IssueSeverity.Warning, nameof(settings.CloudQuotaBytes),
-                $"目标目录容量上限 {ByteSize.Format(quota)} " +
+                $"容量上限 {ByteSize.Format(quota)} " +
                 $"超过该卷的总容量 {ByteSize.Format(space.TotalBytes)}，这条预算起不到保护作用。" +
                 "实际能放多少仍以磁盘真实剩余空间为准。"));
         }

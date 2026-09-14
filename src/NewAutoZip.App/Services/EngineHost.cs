@@ -309,21 +309,20 @@ public sealed class EngineHost : IAsyncDisposable
     /// 调用点只有 <c>MainViewModel.SyncCloudDisplay</c> 那几个（保存 / 重新读取 /
     /// 引擎启停 / 构造），与云盘类型的同步点是同一批。
     ///
-    /// 没填总容量时直接返回 <see cref="CloudQuotaStatus.NotConfigured"/>，
-    /// 连目录都不扫 —— 那是一次白花的枚举，与引擎里那道早退是同一个理由。
+    /// 没填总容量时<b>不扫目录</b>（那是一次白花的枚举），但仍要走一遍
+    /// <see cref="CloudQuota.Evaluate"/>：本地硬盘的容量不需要谁来填，
+    /// 卷的三个数照样要显示出来。远程/云盘没填预算时它会返回
+    /// <see cref="CloudQuotaStatus.NotConfigured"/>，卡片自然还是藏着。
     /// </summary>
     public CloudQuotaStatus DescribeCloudQuota()
     {
-        if (Settings.CloudQuotaBytes <= 0)
-        {
-            return CloudQuotaStatus.NotConfigured;
-        }
-
         // 每次都重新 Configure：保存配置可能刚把 CloudPath 改到别处，
         // 只在构造时配一次的话，改完路径算的还是旧目录。
         _cloudScanner.Configure(Settings.CloudPath);
 
-        return CloudQuota.Evaluate(Settings, CloudQuota.MeasureUsed(_cloudScanner));
+        long used = Settings.CloudQuotaBytes > 0 ? CloudQuota.MeasureUsed(_cloudScanner) : 0;
+
+        return CloudQuota.Evaluate(Settings, used);
     }
 
     // ==================================================================

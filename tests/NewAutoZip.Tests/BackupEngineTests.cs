@@ -4,6 +4,7 @@ using NewAutoZip.Core.Notifications;
 using NewAutoZip.Core.OneDrive;
 using NewAutoZip.Core.Packing;
 using NewAutoZip.Core.Pipeline;
+using NewAutoZip.Core.Storage;
 using NewAutoZip.Core.Watching;
 using Xunit;
 using Xunit.Abstractions;
@@ -1408,6 +1409,144 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
     }
 
     // ==================================================================
+    //  通知：启动 / 开始 / 结束三条的末尾都要有一行容量
+    //
+    //  用户要求原文："是否可以在 启动，开始，结束 这三个节点，消息最后 换行
+    //  增加一个当前云盘的容量：格式类似：云盘总容量，已用容量，剩余容量。
+    //  非云盘也要在这三个节点。"
+    //
+    //  为什么要有：不打开界面就知道"还能放多少"。三条里漏掉任意一条，
+    //  用户就得为了一个数字去开程序 —— 那正是他要免掉的事。
+    // ==================================================================
+
+    [Fact]
+    public async Task 启动开始结束三条消息末尾都带容量行()
+    {
+        // 目标目录是临时目录，落在本机硬盘上，所以走的是本地磁盘口径：
+        // 三个数全取自卷，且必须对得上（这正是用户报的"总减已用有问题"那条）。
+        Harness h = BuildHarness(
+            TestBinaries.SevenZip(),
+            tweak: s => s.CloudTarget = CloudTarget.Folder);
+
+        try
+        {
+            h.Monitor.WriteFile("MT20210608_20260824_180100.bak", 64 * 1024);
+
+            Assert.True(
+                await PumpUntilAsync(h, s => s.ArchivesCreated > 0),
+                $"没能在时限内跑完一整轮。当前状态：{h.Engine.Snapshot.StatusText}");
+
+            foreach (NotifyEvent evt in new[]
+            {
+                NotifyEvent.EngineStarted,
+                NotifyEvent.RoundStarted,
+                NotifyEvent.RoundFinished,
+            })
+            {
+                string[] lines = h.Notify.First(evt).ToPlainText()
+                    .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(l => l.Trim())
+                    .ToArray();
+
+                // 在<b>最后一行</b>，不是夹在中间 —— 用户说的是"消息最后换行增加"。
+                string capacity = lines[^1];
+
+                Assert.StartsWith("本地磁盘 ", capacity);
+                Assert.Contains("总 ", capacity);
+                Assert.Contains("已用 ", capacity);
+                Assert.Contains("剩余 ", capacity);
+
+                // 没填预算，所以不该冒出"预算"那段尾巴。
+                Assert.DoesNotContain("预算", capacity);
+            }
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task 填了预算时容量行末尾补一句我们自己占了多少()
+    {
+        // 卷已用是整个盘的账，用户会以为那么多全是备份占的。
+        // 填了预算就把"我们自己占多少 / 预算多少"缀在后面说清楚。
+        Harness h = BuildHarness(
+            TestBinaries.SevenZip(),
+            tweak: s =>
+            {
+                s.CloudTarget = CloudTarget.Folder;
+                s.CloudQuotaBytes = 100L * 1024 * 1024 * 1024;
+            });
+
+        try
+        {
+            // 【启动】不是在 Start() 里同步发的，得等主循环真的转起来。
+            Assert.True(
+                await PumpUntilAsync(h, _ => h.Notify.CountOf(NotifyEvent.EngineStarted) > 0),
+                "没能在时限内等到【启动】通知");
+
+            string startText = h.Notify.First(NotifyEvent.EngineStarted).ToPlainText();
+
+            string capacity = startText
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries)[^1]
+                .Trim();
+
+            Assert.StartsWith("本地磁盘 ", capacity);
+            Assert.Contains("本程序备份包占 ", capacity);
+
+            // 消息里用的是 FormatShort（「100G」），卡片那边用 Format（「100 GB」）—— 两个格式器。
+            Assert.Contains($"预算 {ByteSize.FormatShort(100L * 1024 * 1024 * 1024)}", capacity);
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task OneDrive没填预算时整行容量都不出现()
+    {
+        // "本地磁盘显示，远程不显示"里的远程那一半。
+        // 云端配额读不到，没人填就是不知道 —— 此时印一个"0 B"是在撒谎，
+        // 整行消失才是诚实的（NotifyMessage.Create 会丢掉 null 行）。
+        Harness h = BuildHarness(TestBinaries.SevenZip());
+
+        try
+        {
+            Assert.Equal(0, h.Settings.CloudQuotaBytes);
+
+            Assert.True(
+                await PumpUntilAsync(h, _ => h.Notify.CountOf(NotifyEvent.EngineStarted) > 0),
+                "没能在时限内等到【启动】通知");
+
+            string startText = h.Notify.First(NotifyEvent.EngineStarted).ToPlainText();
+
+            Assert.DoesNotContain("本地磁盘 ", startText);
+            Assert.DoesNotContain("剩余 ", startText);
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    // ==================================================================
     //  通知：非 OneDrive 模式下，流程与消息里不出现"云盘"
     //
     //  用户要求原文：非 OneDrive 云盘的时候，流程和消息不要再出现"云盘"字样，
@@ -1459,13 +1598,24 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
                 Assert.DoesNotContain("OneDrive", text);
             }
 
-            // 最后一行仍然是"下一次的工作开始时间"—— 两条【结束】分支都要有。
-            string lastLine = endText
-                .Split('\n', StringSplitOptions.RemoveEmptyEntries)[^1]
-                .Trim();
+            // "下一次的工作开始时间"两条【结束】分支都要有。
+            // 它曾经是最后一行，现在最后一行是容量行（用户要求容量加在消息末尾），
+            // 所以这里改判"存在且自成一行"，末行另判。
+            string[] endLines = endText
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                .Select(l => l.Trim())
+                .ToArray();
 
-            Assert.StartsWith("下一次的工作开始时间：", lastLine);
-            Assert.Contains("全天监控", lastLine);
+            string nextRoundLine = Assert.Single(
+                endLines,
+                l => l.StartsWith("下一次的工作开始时间：", StringComparison.Ordinal));
+
+            Assert.Contains("全天监控", nextRoundLine);
+
+            // 末行是容量行。目标目录在本地硬盘上，所以走的是本地磁盘口径，
+            // 三个数必须对得上 —— 这正是"总减已用"那个缺陷的回归防线。
+            Assert.StartsWith("本地磁盘 ", endLines[^1]);
+            Assert.Contains("剩余 ", endLines[^1]);
 
             // 归档真的落在指定目录里了。
             Assert.Single(h.OneDrive.Files("*.7z"));

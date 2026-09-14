@@ -502,7 +502,8 @@ public sealed class BackupEngine : IAsyncDisposable
                     ? "当前已在工作时段内，发现新文件会立即开始处理。"
                     : NextStartLine(startupSchedule, startupLocal),
                 $"重试阶梯：{RetryPolicy.DescribeLadder()}，{_settings.MaxAttemptsBeforeQuarantine} 次后隔离",
-                ProgramDiskLine()),
+                ProgramDiskLine(),
+                CloudCapacityLine()),
             CancellationToken.None).ConfigureAwait(false);
 
         SetPhase(EnginePhase.Idle);
@@ -1006,6 +1007,7 @@ public sealed class BackupEngine : IAsyncDisposable
                     .. DiscoveryLines(files),
                     $"稳定判定：静默 {_settings.QuietSeconds} 秒且连续 {_settings.StableConfirmRounds} 次大小不变。",
                     $"全部稳定后，等批处理窗口（{_settings.BatchWindowMinutes} 分钟）到期即开始打包。",
+                    CloudCapacityLine(),
                 ]),
             ct).ConfigureAwait(false);
     }
@@ -1418,6 +1420,7 @@ public sealed class BackupEngine : IAsyncDisposable
                             retryId is not null ? $"批次编号：{retryId}（已从重试队列移除，不再重试）" : null,
                             $"共计耗时：{ByteSize.FormatClock(_time.GetUtcNow() - roundStartedUtc)}",
                             NextRoundStartLine(),
+                            CloudCapacityLine(),
                         ]),
                     ct).ConfigureAwait(false);
 
@@ -1755,12 +1758,17 @@ public sealed class BackupEngine : IAsyncDisposable
 
         if (!quota.CanFit(required))
         {
+            // "容量预算不足"这几个字是拦截路径的既有措辞，测试也按它断言 ——
+            // 本地磁盘口径下则该说磁盘，两种情形的解决办法本来就不同。
+            string headline = quota.Basis == QuotaBasis.Volume && quota.DiskLimited
+                ? $"{label}所在磁盘空间不足"
+                : $"{label}容量预算不足";
+
             string reason =
-                $"{label}容量预算不足：已用 {ByteSize.Format(quota.UsedBytes)} / " +
-                $"{ByteSize.Format(quota.QuotaBytes)}，剩余 {ByteSize.Format(quota.FreeBytes)}，" +
+                $"{headline}：{DescribeQuota(quota)}，" +
                 $"本次预计需要 {ByteSize.Format(required)}。已拒绝打包，未产生任何文件。" +
                 (quota.DiskLimited
-                    ? "（剩余量受限于该卷的真实可用空间，不是预算本身。）"
+                    ? "（受限于该卷的真实可用空间，不是预算本身。）"
                     : "请清理目标目录里的旧压缩包，或在设置里调高容量上限。");
 
             _log.Error(reason);
@@ -1781,9 +1789,9 @@ public sealed class BackupEngine : IAsyncDisposable
         if (quota.IsLow(_settings.CloudQuotaWarnBytes))
         {
             string warning =
-                $"{label}剩余容量 {ByteSize.Format(quota.FreeBytes)} " +
+                $"{label}剩余容量 {ByteSize.Format(quota.EffectiveFreeBytes)} " +
                 $"已低于警戒线 {ByteSize.Format(_settings.CloudQuotaWarnBytes)}" +
-                $"（已用 {ByteSize.Format(quota.UsedBytes)} / {ByteSize.Format(quota.QuotaBytes)}）。" +
+                $"（{DescribeQuota(quota)}）。" +
                 "本次照常打包，但请及时清理旧压缩包，否则很快会无法继续备份。";
 
             _log.Warn(warning);
@@ -1833,7 +1841,8 @@ public sealed class BackupEngine : IAsyncDisposable
                 $"所在目录：{_settings.CloudPath}",
                 $"共计耗时：{ByteSize.FormatClock(now - roundStartedUtc)}",
                 ProgramDiskLine(),
-                NextRoundStartLine()),
+                NextRoundStartLine(),
+                CloudCapacityLine()),
             ct).ConfigureAwait(false);
     }
 
@@ -2418,7 +2427,8 @@ public sealed class BackupEngine : IAsyncDisposable
                                   $"压缩包 {ByteSize.FormatShort(upload.Bytes)}"
                                 : null,
                             ProgramDiskLine(),
-                            NextRoundStartLine()),
+                            NextRoundStartLine(),
+                            CloudCapacityLine()),
                         ct).ConfigureAwait(false);
 
                     break;
@@ -2623,6 +2633,31 @@ public sealed class BackupEngine : IAsyncDisposable
         NotifyMessage.Create(evt, tag, _time.GetLocalNow(), lines);
 
     /// <summary>
+    /// 拒绝/告警文案里那段"现在是什么情况"。
+    ///
+    /// 必须分口径：<see cref="QuotaBasis.Volume"/> 下 <c>UsedBytes</c> 是<b>整个卷</b>的占用
+    /// （含别人的文件），照搬成"已用 X / Y"会让用户以为是我们的包占的。
+    /// 判断依据一律是 <see cref="CloudQuotaStatus.EffectiveFreeBytes"/> ——
+    /// 文案里报的数字要和真正做判断的那个数一致，否则用户按文案清理完了还是被拒。
+    /// </summary>
+    private static string DescribeQuota(CloudQuotaStatus quota)
+    {
+        if (quota.Basis != QuotaBasis.Volume)
+        {
+            return $"已用 {ByteSize.Format(quota.UsedBytes)} / {ByteSize.Format(quota.QuotaBytes)}，" +
+                   $"实际还能放 {ByteSize.Format(quota.EffectiveFreeBytes)}";
+        }
+
+        string disk =
+            $"磁盘总 {ByteSize.Format(quota.QuotaBytes)}、可用 {ByteSize.Format(quota.FreeBytes)}";
+
+        return quota.BudgetBytes > 0
+            ? $"{disk}；本程序备份包已占 {ByteSize.Format(quota.OurBytes)} / " +
+              $"预算 {ByteSize.Format(quota.BudgetBytes)}"
+            : disk;
+    }
+
+    /// <summary>
     /// 【结束】里那行"程序所在磁盘"。用户要求带上它 —— 一轮跑完顺手报一次余量，
     /// 比等磁盘告警触发再看要早得多。取不到磁盘信息就返回 null，让这一行整行消失，
     /// 而不是印一个 "0 B" 出去骗人。
@@ -2642,6 +2677,57 @@ public sealed class BackupEngine : IAsyncDisposable
         return $"程序所在磁盘 {label}：总 {ByteSize.FormatShort(disk.TotalBytes)}，" +
                $"可用 {ByteSize.FormatShort(disk.FreeBytes)}";
     }
+
+    /// <summary>
+    /// 【启动】/【发现新文件】/【结束】三个节点末尾那行容量。
+    ///
+    /// 两种口径（见 <see cref="QuotaBasis"/>），措辞不同：
+    /// <list type="bullet">
+    /// <item>本地硬盘 —— 报卷的真实三个数，<b>总 − 已用恒等于剩余</b>；
+    /// 填了预算的话再缀一句我们自己的包占了多少。用户没填预算也照样有这一行。</item>
+    /// <item>云盘 / 远程目录 —— 报用户填的预算。没填预算就<b>返回 null 让整行消失</b>，
+    /// 与 <see cref="ProgramDiskLine"/> 同一个原则：读不到就别印个 "0 B" 出去骗人。</item>
+    /// </list>
+    ///
+    /// 成本：一次 <see cref="DiskSpace.Query"/>（快系统调用），外加仅在填了预算时
+    /// 一次目录枚举。一轮最多四条消息，可以接受 —— 注意别挪到 4 Hz 的快照路径上去。
+    /// </summary>
+    private string? CloudCapacityLine()
+    {
+        CloudQuotaStatus quota = CloudQuota.Evaluate(_settings, MeasureCloudUsedIfBudgeted());
+
+        if (!quota.Configured)
+        {
+            return null;
+        }
+
+        string head =
+            $"总 {ByteSize.FormatShort(quota.QuotaBytes)} · " +
+            $"已用 {ByteSize.FormatShort(quota.UsedBytes)} · " +
+            $"剩余 {ByteSize.FormatShort(quota.FreeBytes)}";
+
+        if (quota.Basis != QuotaBasis.Volume)
+        {
+            return $"{CloudTargetText.PathLabel(_settings.CloudTarget)}容量：{head}";
+        }
+
+        string root = Path.GetPathRoot(_settings.CloudPath)?.TrimEnd(Path.DirectorySeparatorChar)
+            ?? _settings.CloudPath;
+
+        string tail = quota.BudgetBytes > 0
+            ? $"（本程序备份包占 {ByteSize.FormatShort(quota.OurBytes)}" +
+              $" / 预算 {ByteSize.FormatShort(quota.BudgetBytes)}）"
+            : string.Empty;
+
+        return $"本地磁盘 {root}：{head}{tail}";
+    }
+
+    /// <summary>
+    /// 只在填了预算时才去扫目标目录 —— 那是一次真实的目录枚举，
+    /// 而没填预算时扫出来的数字一处都用不上。
+    /// </summary>
+    private long MeasureCloudUsedIfBudgeted() =>
+        _settings.CloudQuotaBytes > 0 ? CloudQuota.MeasureUsed(_cloudScanner) : 0;
 
     /// <summary>
     /// 【打包】里的编号文件列表：<c>1. name（4.72G）</c>。
@@ -2834,11 +2920,11 @@ public sealed class BackupEngine : IAsyncDisposable
         IReadOnlyList<ArchiveInfo> archives = _zipTemp.ListArchives();
         DiskSpaceInfo disk = DiskSpace.Query(_zipTemp.Root);
 
-        // 没配总容量就别去扫云盘目录 —— 那是一次白花的目录枚举，
-        // 而这个方法每秒会被调用好几次（界面 4 Hz 轮询）。
-        CloudQuotaStatus quota = _settings.CloudQuotaBytes > 0
-            ? CloudQuota.Evaluate(_settings, CloudQuota.MeasureUsed(_cloudScanner))
-            : CloudQuotaStatus.NotConfigured;
+        // 目录枚举只在填了预算时才做（见 MeasureCloudUsedIfBudgeted）——
+        // 这个方法每秒会被调用好几次（界面 4 Hz 轮询）。Evaluate 本身只多一次
+        // GetDiskFreeSpaceEx，很便宜，而本地硬盘<b>没填预算也要有数</b>，
+        // 不能再按"预算为 0 就整个跳过"来早退。
+        CloudQuotaStatus quota = CloudQuota.Evaluate(_settings, MeasureCloudUsedIfBudgeted());
 
         DateTimeOffset? windowCloses = _windowOpenedUtc is { } opened
             ? (opened + TimeSpan.FromMinutes(_settings.BatchWindowMinutes)).ToLocalTime()
@@ -2899,7 +2985,10 @@ public sealed class BackupEngine : IAsyncDisposable
                 .Select(q => new QuarantineView(
                     q.Id, q.Files.Count, q.TotalBytes, q.Reason, q.Attempts,
                     q.QuarantinedUtc.ToLocalTime(), q.Files))
-                .ToList());
+                .ToList(),
+            CloudQuotaBasis: quota.Basis,
+            CloudOurBytes: quota.OurBytes,
+            CloudBudgetBytes: quota.BudgetBytes);
     }
 
     private static long SafeLength(string path)

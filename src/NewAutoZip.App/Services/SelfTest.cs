@@ -1952,17 +1952,18 @@ internal static class SelfTest
     }
 
     /// <summary>
-    /// 容量卡片：三种情形各摆一份快照，核对卡片该藏的时候藏、该红的时候红。
+    /// 容量卡片：几种情形各摆一份快照，核对卡片该藏的时候藏、该红的时候红。
     ///
     /// 必须自己喂快照 —— 卡片整张的可见性绑在 <c>CloudQuotaConfigured</c> 上，
     /// 而 <see cref="Core.Pipeline.EngineSnapshot.Stopped"/> 里那个值是 0。
     /// 不喂就永远折叠，而<b>折叠元素不参与布局</b>，里面那几条绑定一条都测不到。
     ///
-    /// 三格：
     /// <list type="number">
     ///   <item>没填总容量 → 整张卡片藏起来；</item>
     ///   <item>填了、剩余还宽裕 → 卡片出现、不红；</item>
-    ///   <item>填了、剩余已低于警戒线 → 卡片出现且变红。</item>
+    ///   <item>填了、剩余已低于警戒线 → 卡片出现且变红；</item>
+    ///   <item>已用超过预算 → 进度条夹在 100%；</item>
+    ///   <item>本地硬盘口径且<b>没填预算</b> → 卡片照样出现（卷的容量不需要谁来填）。</item>
     /// </list>
     ///
     /// 进度条那一格顺带核对"已用超过预算也不许超过 100"——
@@ -1986,18 +1987,28 @@ internal static class SelfTest
         List<string> bad = [];
 
         // 期望值全部写死，不拿被测的那套算式去算。
-        (string Label, long Quota, long Used, long Free, long Warn, bool Shown, bool Low, double Percent)[] cases =
+        (string Label, long Quota, long Used, long Free, long Warn, bool Shown, bool Low, double Percent,
+            Core.Storage.QuotaBasis Basis, long Ours, long Budget)[] cases =
         [
-            ("没填总容量",              0,        0,        0,       0,        false, false, 0),
-            ("填了 100 GB、剩余 60 GB", 100 * gb, 40 * gb,  60 * gb, 10 * gb,  true,  false, 40),
-            ("剩余 5 GB、警戒线 10 GB", 100 * gb, 95 * gb,  5 * gb,  10 * gb,  true,  true,  95),
-            ("已用超过预算",            10 * gb,  30 * gb,  0,       gb,       true,  true,  100),
+            ("没填总容量",              0,        0,        0,       0,        false, false, 0,
+                Core.Storage.QuotaBasis.Budget, 0, 0),
+            ("填了 100 GB、剩余 60 GB", 100 * gb, 40 * gb,  60 * gb, 10 * gb,  true,  false, 40,
+                Core.Storage.QuotaBasis.Budget, 0, 0),
+            ("剩余 5 GB、警戒线 10 GB", 100 * gb, 95 * gb,  5 * gb,  10 * gb,  true,  true,  95,
+                Core.Storage.QuotaBasis.Budget, 0, 0),
+            ("已用超过预算",            10 * gb,  30 * gb,  0,       gb,       true,  true,  100,
+                Core.Storage.QuotaBasis.Budget, 0, 0),
+
+            // 本地硬盘口径：三个数全是卷的真实值，用户一个字都没填也该有卡片。
+            ("本地硬盘未填预算",        200 * gb, 150 * gb, 50 * gb, 0,        true,  false, 75,
+                Core.Storage.QuotaBasis.Volume, 12 * gb, 0),
         ];
 
         try
         {
             foreach ((string label, long quota, long used, long free, long warn,
-                bool shown, bool low, double percent) in cases)
+                bool shown, bool low, double percent,
+                Core.Storage.QuotaBasis basis, long ours, long budget) in cases)
             {
                 model.ApplySnapshotForSelfTest(Core.Pipeline.EngineSnapshot.Stopped with
                 {
@@ -2005,6 +2016,9 @@ internal static class SelfTest
                     CloudUsedBytes = used,
                     CloudFreeBytes = free,
                     CloudQuotaWarnBytes = warn,
+                    CloudQuotaBasis = basis,
+                    CloudOurBytes = ours,
+                    CloudBudgetBytes = budget,
                 });
 
                 model.SelectedPage = 0;
@@ -2050,6 +2064,23 @@ internal static class SelfTest
                 {
                     bad.Add($"{label}：进度条显示 {dash.CloudQuotaBar.Value:0.##}，"
                         + $"属性值却是 {model.CloudUsedPercent:0.##}（XAML 没绑 CloudUsedPercent）");
+                }
+
+                if (basis != Core.Storage.QuotaBasis.Volume)
+                {
+                    continue;
+                }
+
+                // 卷已用是整个盘的账。不点明这一点，用户会以为那么多全是备份包占的。
+                if (!dash.CloudQuotaUsageLine.Text.Contains("本程序备份包", StringComparison.Ordinal))
+                {
+                    bad.Add($"{label}：本地硬盘口径下用量那行没说清哪些是我们占的"
+                        + $"（「{dash.CloudQuotaUsageLine.Text}」）");
+                }
+
+                if (!string.Equals(model.CloudQuotaTitle, "本地磁盘容量", StringComparison.Ordinal))
+                {
+                    bad.Add($"{label}：卡片标题是「{model.CloudQuotaTitle}」，应当是「本地磁盘容量」");
                 }
             }
         }

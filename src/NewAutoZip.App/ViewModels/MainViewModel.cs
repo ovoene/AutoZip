@@ -747,8 +747,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// <summary>剩余已低于警戒线。界面用它把数字变红。</summary>
     public bool CloudQuotaLow => _quotaSource.CloudQuotaLow;
 
-    /// <summary>卡片标题：OneDrive 说"云盘容量"，普通目录说"目标目录容量"。</summary>
-    public string CloudQuotaTitle => IsOneDriveMode ? "云盘容量" : "目标目录容量";
+    /// <summary>
+    /// 卡片标题。三支：本地硬盘说"本地磁盘容量"（那三个数是整个卷的），
+    /// OneDrive 说"云盘容量"，远程目录说"目标目录容量"。
+    /// </summary>
+    public string CloudQuotaTitle => _quotaSource.CloudQuotaBasis == QuotaBasis.Volume
+        ? "本地磁盘容量"
+        : IsOneDriveMode ? "云盘容量" : "目标目录容量";
 
     /// <summary>「已用 712.4 GB / 1.00 TB · 剩余 311.6 GB」。</summary>
     public string CloudQuotaUsageText => _quotaSource.CloudQuotaUsageText;
@@ -863,14 +868,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     ///
     /// 两个调用方：轮询里快照变了（<see cref="RaiseSnapshotProperties"/>）、
     /// 停止时按磁盘配置重算（<see cref="SyncCloudQuota"/>）。
-    /// <c>CloudQuotaTitle</c> 不在这里 —— 它跟的是云盘类型，不是这些数字。
+    ///
+    /// <c>CloudQuotaTitle</c> <b>也在这里</b>：它原先只跟云盘类型走，
+    /// 但现在"本地磁盘容量"这一支是按<see cref="QuotaBasis"/>判的，
+    /// 而口径会随路径改变（F:\ 改成 \\nas\ 就从 Volume 变 Budget）。
+    /// <see cref="SyncCloudTarget"/> 那边仍然也 Raise 它，两处都要。
     /// </summary>
     private void RaiseQuotaProperties(EngineSnapshot a, EngineSnapshot b)
     {
         if (a.CloudQuotaBytes == b.CloudQuotaBytes
             && a.CloudUsedBytes == b.CloudUsedBytes
             && a.CloudFreeBytes == b.CloudFreeBytes
-            && a.CloudQuotaWarnBytes == b.CloudQuotaWarnBytes)
+            && a.CloudQuotaWarnBytes == b.CloudQuotaWarnBytes
+            && a.CloudQuotaBasis == b.CloudQuotaBasis
+            && a.CloudOurBytes == b.CloudOurBytes
+            && a.CloudBudgetBytes == b.CloudBudgetBytes)
         {
             return;
         }
@@ -883,6 +895,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         Raise(nameof(CloudQuotaLow));
         Raise(nameof(CloudQuotaUsageText));
         Raise(nameof(CloudQuotaWarnText));
+        Raise(nameof(CloudQuotaTitle));
     }
 
     /// <summary>
