@@ -292,4 +292,232 @@ public class SettingsValidatorTests
 
         Assert.True(report.CanStart, report.ToText());
     }
+
+    // ==================================================================
+    //  恢复演练：全部只发提醒，一条都不许拦启动
+    // ==================================================================
+
+    [Fact]
+    public void 默认配置下演练规则一条都不触发()
+    {
+        // 默认是"打包后本地演练开着、写清单开着"，这套组合不该招来任何提醒 ——
+        // 开箱就冒警告会训练用户忽略警告，那样真正要紧的那条也会被一起忽略。
+        using TempDir root = new();
+        AppSettings s = Healthy(root, out string exe);
+
+        ValidationReport report = SettingsValidator.Validate(s, exe);
+
+        Assert.True(report.CanStart, report.ToText());
+
+        Assert.DoesNotContain(report.Warnings, i =>
+            i.Field == nameof(AppSettings.VerifyAfterPackByExtract)
+            || i.Field == nameof(AppSettings.WriteArchiveManifest)
+            || i.Field == nameof(AppSettings.CloudDrillIntervalHours));
+    }
+
+    [Fact]
+    public void 两种演练都关掉只给提醒_不拦启动()
+    {
+        // 拦下启动意味着连备份本身都不做了 —— 那是拿更大的风险去换更小的风险。
+        using TempDir root = new();
+        AppSettings s = Healthy(root, out string exe);
+        s.VerifyAfterPackByExtract = false;
+        s.CloudDrillEnabled = false;
+
+        ValidationReport report = SettingsValidator.Validate(s, exe);
+
+        Assert.True(report.CanStart, $"演练配置拦下了启动，这是不允许的：{report.ToText()}");
+        Assert.Contains(report.Warnings, i => i.Field == nameof(AppSettings.VerifyAfterPackByExtract));
+        Assert.DoesNotContain(report.Errors, i => i.Field == nameof(AppSettings.VerifyAfterPackByExtract));
+    }
+
+    [Fact]
+    public void 开了演练却关了清单只给提醒()
+    {
+        // 没有清单，演练仍能验出"密码打不开"和"包坏了"，只是验不出"内容变了"。
+        using TempDir root = new();
+        AppSettings s = Healthy(root, out string exe);
+        s.VerifyAfterPackByExtract = true;
+        s.WriteArchiveManifest = false;
+
+        ValidationReport report = SettingsValidator.Validate(s, exe);
+
+        Assert.True(report.CanStart, report.ToText());
+        Assert.Contains(report.Warnings, i => i.Field == nameof(AppSettings.WriteArchiveManifest));
+    }
+
+    [Fact]
+    public void 两种演练都关着时不再抱怨没写清单()
+    {
+        // 清单是给演练用的账本。演练都关了还催人开清单，就是在制造噪音。
+        using TempDir root = new();
+        AppSettings s = Healthy(root, out string exe);
+        s.VerifyAfterPackByExtract = false;
+        s.CloudDrillEnabled = false;
+        s.WriteArchiveManifest = false;
+
+        ValidationReport report = SettingsValidator.Validate(s, exe);
+
+        Assert.True(report.CanStart, report.ToText());
+        Assert.DoesNotContain(report.Warnings, i => i.Field == nameof(AppSettings.WriteArchiveManifest));
+    }
+
+    [Fact]
+    public void 云端演练间隔过密只给提醒()
+    {
+        // 云端的包多半已脱水，每次演练都要重新下载回本地 —— 按流量计费的线路上是持续开销。
+        using TempDir root = new();
+        AppSettings s = Healthy(root, out string exe);
+        s.CloudDrillEnabled = true;
+        s.CloudDrillIntervalHours = 1;
+
+        ValidationReport report = SettingsValidator.Validate(s, exe);
+
+        Assert.True(report.CanStart, report.ToText());
+        Assert.Contains(report.Warnings, i => i.Field == nameof(AppSettings.CloudDrillIntervalHours));
+        Assert.DoesNotContain(report.Errors, i => i.Field == nameof(AppSettings.CloudDrillIntervalHours));
+    }
+
+    [Fact]
+    public void 云端演练间隔够宽松时不提醒()
+    {
+        using TempDir root = new();
+        AppSettings s = Healthy(root, out string exe);
+        s.CloudDrillEnabled = true;
+        s.CloudDrillIntervalHours = 24;
+
+        ValidationReport report = SettingsValidator.Validate(s, exe);
+
+        Assert.True(report.CanStart, report.ToText());
+        Assert.DoesNotContain(report.Warnings, i => i.Field == nameof(AppSettings.CloudDrillIntervalHours));
+    }
+
+    [Fact]
+    public void 云端演练关着时不管间隔多小都不提醒()
+    {
+        // 功能都没开，间隔是多少根本不产生任何流量。
+        using TempDir root = new();
+        AppSettings s = Healthy(root, out string exe);
+        s.CloudDrillEnabled = false;
+        s.CloudDrillIntervalHours = 1;
+
+        ValidationReport report = SettingsValidator.Validate(s, exe);
+
+        Assert.DoesNotContain(report.Warnings, i => i.Field == nameof(AppSettings.CloudDrillIntervalHours));
+    }
+
+    [Fact]
+    public void 最糟的演练配置组合也依然能启动()
+    {
+        // 把演练相关的每一项都调成最差，CanStart 仍必须为 true。
+        // 这一条是对"演练规则一律 Warning"这个设计的兜底 ——
+        // 将来谁把某条改成 Error，会先在这里被挡下。
+        using TempDir root = new();
+        AppSettings s = Healthy(root, out string exe);
+        s.VerifyAfterPackByExtract = false;
+        s.CloudDrillEnabled = true;
+        s.CloudDrillIntervalHours = 1;
+        s.WriteArchiveManifest = false;
+        s.DrillTimeoutMinutes = 1;
+
+        ValidationReport report = SettingsValidator.Validate(s, exe);
+
+        Assert.True(report.CanStart, $"演练配置拦下了启动：{report.ToText()}");
+
+        Assert.DoesNotContain(report.Errors, i =>
+            i.Field == nameof(AppSettings.VerifyAfterPackByExtract)
+            || i.Field == nameof(AppSettings.CloudDrillEnabled)
+            || i.Field == nameof(AppSettings.CloudDrillIntervalHours)
+            || i.Field == nameof(AppSettings.WriteArchiveManifest)
+            || i.Field == nameof(AppSettings.DrillTimeoutMinutes));
+    }
+
+    // ==================================================================
+    //  云盘容量预算
+    //
+    //  三条规则全都以"用户填了非 0 值"为前提。默认 0 = 没启用，
+    //  一条都不该触发 —— 下面第一个测试钉的就是这件事。
+    // ==================================================================
+
+    [Fact]
+    public void 没填容量预算时一条提醒都不该出现()
+    {
+        // 新字段遇上老 settings.json 就是这个样子：反序列化拿到 0。
+        // 这里要是变黄变红，等于所有老用户升级后都平白多出一条提醒。
+        using TempDir root = new();
+        AppSettings s = Healthy(root, out string exe);
+        s.CloudQuotaBytes = 0;
+        s.CloudQuotaWarnBytes = 0;
+
+        ValidationReport report = SettingsValidator.Validate(s, exe);
+
+        Assert.True(report.CanStart, report.ToText());
+
+        Assert.DoesNotContain(report.Issues, i =>
+            i.Field == nameof(AppSettings.CloudQuotaBytes)
+            || i.Field == nameof(AppSettings.CloudQuotaWarnBytes));
+    }
+
+    [Fact]
+    public void 只填警戒线不填总容量要提醒()
+    {
+        using TempDir root = new();
+        AppSettings s = Healthy(root, out string exe);
+        s.CloudQuotaBytes = 0;
+        s.CloudQuotaWarnBytes = 10L * 1024 * 1024 * 1024;
+
+        ValidationReport report = SettingsValidator.Validate(s, exe);
+
+        // 只是提醒，不该拦下启动：没填总容量顶多是这条警戒线不起作用，
+        // 而拦下启动意味着连备份本身都不做了。
+        Assert.True(report.CanStart, report.ToText());
+        Assert.Contains(report.Warnings, i => i.Field == nameof(AppSettings.CloudQuotaWarnBytes));
+    }
+
+    [Fact]
+    public void 警戒线不低于总容量是错误()
+    {
+        // 这种配置下剩余量从第一轮起就在警戒线之下，每一轮都会告警 ——
+        // 等于把告警变成了噪音，必须在启动前拦下来。
+        using TempDir root = new();
+        AppSettings s = Healthy(root, out string exe);
+        s.CloudQuotaBytes = 100L * 1024 * 1024 * 1024;
+        s.CloudQuotaWarnBytes = s.CloudQuotaBytes;
+
+        ValidationReport report = SettingsValidator.Validate(s, exe);
+
+        Assert.False(report.CanStart);
+        Assert.Contains(report.Errors, i => i.Field == nameof(AppSettings.CloudQuotaWarnBytes));
+    }
+
+    [Fact]
+    public void 普通目录的预算超过磁盘总容量要提醒()
+    {
+        // 1 PB，任何真实磁盘都不可能有这么大。
+        using TempDir root = new();
+        AppSettings s = Healthy(root, out string exe);
+        s.CloudTarget = CloudTarget.Folder;
+        s.CloudQuotaBytes = 1024L * 1024 * 1024 * 1024 * 1024;
+
+        ValidationReport report = SettingsValidator.Validate(s, exe);
+
+        Assert.True(report.CanStart, report.ToText());
+        Assert.Contains(report.Warnings, i => i.Field == nameof(AppSettings.CloudQuotaBytes));
+    }
+
+    [Fact]
+    public void OneDrive模式不拿本地磁盘去质疑云盘容量()
+    {
+        // 同样填 1 PB，但这一次是 OneDrive 模式。
+        // 云端的包会脱水，本地卷的大小和云端配额没有任何关系 ——
+        // 这里要是也提醒，等于在说"你的 OneDrive 不可能有 1 PB，因为你的 C 盘没这么大"。
+        using TempDir root = new();
+        AppSettings s = Healthy(root, out string exe);
+        s.CloudTarget = CloudTarget.OneDrive;
+        s.CloudQuotaBytes = 1024L * 1024 * 1024 * 1024 * 1024;
+
+        ValidationReport report = SettingsValidator.Validate(s, exe);
+
+        Assert.DoesNotContain(report.Issues, i => i.Field == nameof(AppSettings.CloudQuotaBytes));
+    }
 }

@@ -158,6 +158,26 @@ public sealed class EngineState
 
     public string? LastDeliverFailureReason { get; set; }
 
+    // ==================== 恢复演练 ====================
+
+    /// <summary>
+    /// 最近一次<b>云端</b>演练的时刻。周期判断只看这一个字段。
+    ///
+    /// 只记云端那一次：本地演练是每次打包都跟着做的，没有"到期了吗"这个问题；
+    /// 而云端演练要按 <c>CloudDrillIntervalHours</c> 掐表，还得跨重启记住 ——
+    /// 否则每次开机都会立刻拉一个包下来验，把"一周一次"变成"开机一次"。
+    /// </summary>
+    public DateTimeOffset? LastCloudDrillUtc { get; set; }
+
+    /// <summary>最近一次演练（不分本地云端）的时刻，给界面显示用。</summary>
+    public DateTimeOffset? LastDrillUtc { get; set; }
+
+    /// <summary>最近一次演练是否通过。null = 还没演练过。</summary>
+    public bool? LastDrillOk { get; set; }
+
+    /// <summary>最近一次演练的结论原文。</summary>
+    public string? LastDrillMessage { get; set; }
+
     public EngineState Clone()
     {
         return new EngineState
@@ -173,6 +193,10 @@ public sealed class EngineState
             LastDeliverSuccessUtc = LastDeliverSuccessUtc,
             LastDeliverFailureUtc = LastDeliverFailureUtc,
             LastDeliverFailureReason = LastDeliverFailureReason,
+            LastCloudDrillUtc = LastCloudDrillUtc,
+            LastDrillUtc = LastDrillUtc,
+            LastDrillOk = LastDrillOk,
+            LastDrillMessage = LastDrillMessage,
             PendingUploads = PendingUploads.Select(u => new PendingUpload
             {
                 ArchivePath = u.ArchivePath,

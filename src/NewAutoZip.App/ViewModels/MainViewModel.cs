@@ -9,7 +9,9 @@ using NewAutoZip.Core.Configuration;
 using NewAutoZip.Core.Diagnostics;
 using NewAutoZip.Core.Notifications;
 using NewAutoZip.Core.OneDrive;
+using NewAutoZip.Core.Packing;
 using NewAutoZip.Core.Pipeline;
+using NewAutoZip.Core.Storage;
 
 namespace NewAutoZip.App.ViewModels;
 
@@ -19,6 +21,27 @@ namespace NewAutoZip.App.ViewModels;
 /// <param name="Label">左侧标签，固定宽度对齐。</param>
 /// <param name="Value">右侧内容，通常是一条真实路径。</param>
 public sealed record AboutRow(string Label, string Value);
+
+/// <summary>
+/// 「恢复」页列表里的一行 —— 一个可以拿来恢复的归档。
+///
+/// 不放进 <see cref="EngineSnapshot"/>：快照是引擎 4 Hz 推给界面的运行状态，
+/// 而这份列表是用户点「刷新」时才去扫目录得到的，两者的生命周期完全不同。
+/// 混进快照会让引擎每秒扫四次磁盘目录。
+/// </summary>
+public sealed record RestoreArchiveView(
+    string Path,
+    string FileName,
+    long Bytes,
+    DateTimeOffset CreatedLocal,
+    bool HasManifest,
+    string Location)
+{
+    public string SizeText => ByteSize.Format(Bytes);
+
+    /// <summary>旁边有没有那份清单。没有就只能验"解得开"，验不了"东西全不全"。</summary>
+    public string ManifestText => HasManifest ? "有" : "无";
+}
 
 /// <summary>
 /// 主界面的全部状态。
@@ -32,6 +55,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 {
     /// <summary>界面上保留的日志行数。超出丢最旧的。</summary>
     private const int MaxLogLines = 2000;
+
+    /// <summary>
+    /// 「恢复」页在导航里的位置。
+    ///
+    /// 导航没有注册表、没有 DI，页面与索引的对应是 <c>MainWindow.xaml</c> 里
+    /// 按顺序硬编码的。这个常量至少让"切到恢复页时刷新列表"这条逻辑
+    /// 不再是又一个裸露的魔数。改导航顺序时这里和 XAML 要一起改。
+    /// </summary>
+    public const int RestorePageIndex = 5;
 
     /// <summary>单轮最多取走多少条日志 —— 避免一次爆量把 UI 线程占满。</summary>
     private const int LogDrainPerTick = 200;
@@ -71,9 +103,24 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private CloudTarget _savedCloudTarget;
     private bool _cloudTargetPending;
 
+    /// <summary>
+    /// 容量卡片的数据来源，只由 <see cref="SyncCloudQuota()"/> 维护。
+    ///
+    /// <b>这是一份拼出来的快照，只有容量那四个字段可信</b>
+    /// （见 <see cref="EngineSnapshot.QuotaSourceFor"/>）。其余字段仍是"已停止"的值，
+    /// 拿它去读阶段、计数一定是错的 —— 那些属性照旧读 <c>_snapshot</c>。
+    ///
+    /// 为什么要缓存而不是让属性现算：算一次要枚举一遍云盘目录，
+    /// 而这些属性每次 <c>Raise</c> 之后都会被界面读一遍。
+    /// </summary>
+    private EngineSnapshot _quotaSource = EngineSnapshot.Stopped;
+
     private int _selectedPage;
     private bool _autoScrollLog = true;
     private bool _newestLogFirst = true;
+
+    /// <summary>「清空历史记录」时是否连磁盘上的日志文件一起删。默认不删。</summary>
+    private bool _clearHistoryDeletesLogs;
     private bool _disposed;
 
     private string _infoBarTitle = string.Empty;
@@ -83,6 +130,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private string _validationText = string.Empty;
     private string _notifyTestResult = string.Empty;
+
+    // ---------- 恢复页 ----------
+    private RestoreArchiveView? _selectedArchive;
+    private string _restorePassword = string.Empty;
+    private string _restoreTarget = string.Empty;
+    private string _restoreStatus = string.Empty;
+    private string _restoreStatusKind = "Informational";
+    private bool _restoreBusy;
+    private int _restorePercent;
 
     public MainViewModel(EngineHost host, UiLogSink sink, IAppLogger log, ThemeService theme)
     {
@@ -122,10 +178,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ClearLogCommand = new RelayCommand(() => LogLines.Clear());
         CopyLogCommand = new RelayCommand(CopyLog);
 
+        // 引擎在跑的时候不能清：引擎启动时把状态读进内存副本，之后十几处会把
+        // 那份副本写回去 —— 运行中清空，下一次保存就把旧状态原样写回来了。
+        ClearHistoryCommand = new RelayCommand(ClearHistory, () => !_snapshot.Running);
+
         RequeueQuarantineCommand = new RelayCommand<string>(RequeueQuarantine);
         DiscardQuarantineCommand = new RelayCommand<string>(DiscardQuarantine);
 
         DismissInfoBarCommand = new RelayCommand(() => InfoBarOpen = false);
+
+        RefreshRestoreCommand = new RelayCommand(RefreshRestoreArchives);
+        ListArchiveCommand = new AsyncRelayCommand(ListArchiveAsync, () => _selectedArchive is not null);
+        DrillArchiveCommand = new AsyncRelayCommand(DrillArchiveAsync, () => _selectedArchive is not null);
+        ExtractArchiveCommand = new AsyncRelayCommand(ExtractArchiveAsync, CanExtract);
+        OpenRestoreTargetCommand = new RelayCommand(() => Reveal(RestoreTarget));
 
         // 配置一改就重算校验清单，用户在填的过程中就能看到问题，而不是点了"开始"才被拦。
         Settings.Changed += (_, _) => RefreshValidation();
@@ -143,6 +209,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _shownCloudTarget = _host.Settings.CloudTarget;
         _savedCloudTarget = _shownCloudTarget;
         RebuildPipelineSteps(_shownCloudTarget);
+
+        // 容量卡片同样要在开窗之前就位：引擎此刻没在跑，快照里容量是 0，
+        // 不先算一次的话用户一打开程序看到的就是"卡片不见了"。
+        // 这里面的 Raise 此刻没人听（还没绑定），纯粹是把 _quotaSource 填上。
+        SyncCloudQuota();
 
         if (_host.LoadWarning is { } warning)
         {
@@ -184,6 +255,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public ObservableCollection<LogRecord> LogLines { get; } = [];
 
+    /// <summary>「恢复」页上可选的归档。点刷新或切到那一页时重扫。</summary>
+    public ObservableCollection<RestoreArchiveView> RestoreArchives { get; } = [];
+
+    /// <summary>选中归档里的条目（点「查看内容」之后才有）。</summary>
+    public ObservableCollection<ArchiveEntry> RestoreEntries { get; } = [];
+
     // ==================================================================
     //  命令
     // ==================================================================
@@ -216,11 +293,26 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public RelayCommand CopyLogCommand { get; }
 
+    /// <summary>清空历史记录。引擎停止时才可用，见构造函数里的 canExecute。</summary>
+    public RelayCommand ClearHistoryCommand { get; }
+
     public RelayCommand<string> RequeueQuarantineCommand { get; }
 
     public RelayCommand<string> DiscardQuarantineCommand { get; }
 
     public RelayCommand DismissInfoBarCommand { get; }
+
+    // ---------- 恢复 ----------
+
+    public RelayCommand RefreshRestoreCommand { get; }
+
+    public AsyncRelayCommand ListArchiveCommand { get; }
+
+    public AsyncRelayCommand DrillArchiveCommand { get; }
+
+    public AsyncRelayCommand ExtractArchiveCommand { get; }
+
+    public RelayCommand OpenRestoreTargetCommand { get; }
 
     // ==================================================================
     //  关于
@@ -398,7 +490,23 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public int SelectedPage
     {
         get => _selectedPage;
-        set => Set(ref _selectedPage, value);
+        set
+        {
+            if (!Set(ref _selectedPage, value))
+            {
+                return;
+            }
+
+            // 切到「恢复」页就重扫一遍归档列表。
+            //
+            // 列表不能跟着 4 Hz 的快照走 —— 那等于每秒扫四次磁盘目录，
+            // 而这份列表在用户不操作时根本不会变。切页是个天然的刷新时机：
+            // 用户此刻正要挑一个包，看到的必须是现在真实存在的那些。
+            if (value == RestorePageIndex)
+            {
+                RefreshRestoreArchives();
+            }
+        }
     }
 
     /// <summary>
@@ -426,6 +534,119 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         get => _autoScrollLog;
         set => Set(ref _autoScrollLog, value);
+    }
+
+    // ==================================================================
+    //  恢复页
+    // ==================================================================
+
+    public RestoreArchiveView? SelectedArchive
+    {
+        get => _selectedArchive;
+        set
+        {
+            if (!Set(ref _selectedArchive, value))
+            {
+                return;
+            }
+
+            // 换了包，上一个包的条目清单和结论就都不作数了。
+            // 留着它们会让人以为看到的是新选中那个包的内容。
+            RestoreEntries.Clear();
+            RestoreStatus = string.Empty;
+
+            Raise(nameof(HasSelectedArchive));
+            Raise(nameof(SelectedArchiveManifestWarning));
+
+            ListArchiveCommand.RaiseCanExecuteChanged();
+            DrillArchiveCommand.RaiseCanExecuteChanged();
+            ExtractArchiveCommand.RaiseCanExecuteChanged();
+        }
+    }
+
+    public bool HasSelectedArchive => _selectedArchive is not null;
+
+    /// <summary>选中的包没有旁挂清单时说一句 —— 那种包只能验"解得开"。</summary>
+    public string SelectedArchiveManifestWarning =>
+        _selectedArchive is { HasManifest: false }
+            ? "这个包旁边没有清单文件，演练只能确认它解得开，无法核对内容是否完整。"
+            : string.Empty;
+
+    /// <summary>
+    /// 解这个包要用的密码。默认填当前设置里的那个。
+    ///
+    /// 必须可改：用户换过密码之后，旧包只有旧密码解得开，
+    /// 而那种包恰恰是最需要能被恢复出来的。
+    /// </summary>
+    public string RestorePassword
+    {
+        get => _restorePassword;
+        set
+        {
+            if (Set(ref _restorePassword, value))
+            {
+                ExtractArchiveCommand.RaiseCanExecuteChanged();
+            }
+        }
+    }
+
+    /// <summary>解压到哪里。</summary>
+    public string RestoreTarget
+    {
+        get => _restoreTarget;
+        set
+        {
+            if (Set(ref _restoreTarget, value))
+            {
+                ExtractArchiveCommand.RaiseCanExecuteChanged();
+                Raise(nameof(HasRestoreTarget));
+            }
+        }
+    }
+
+    public bool HasRestoreTarget => _restoreTarget.Trim().Length > 0;
+
+    /// <summary>最近一次操作的结论。</summary>
+    public string RestoreStatus
+    {
+        get => _restoreStatus;
+        set
+        {
+            if (Set(ref _restoreStatus, value))
+            {
+                Raise(nameof(HasRestoreStatus));
+            }
+        }
+    }
+
+    public bool HasRestoreStatus => _restoreStatus.Length > 0;
+
+    /// <summary>结论的颜色键（Success / Warning / Error / Informational）。界面查资源。</summary>
+    public string RestoreStatusKind
+    {
+        get => _restoreStatusKind;
+        private set => Set(ref _restoreStatusKind, value);
+    }
+
+    /// <summary>正在解压/演练。界面据此显示进度条并锁住那几颗按钮。</summary>
+    public bool RestoreBusy
+    {
+        get => _restoreBusy;
+        private set
+        {
+            if (Set(ref _restoreBusy, value))
+            {
+                Raise(nameof(RestoreIdle));
+            }
+        }
+    }
+
+    public bool RestoreIdle => !_restoreBusy;
+
+    public int RestorePercent
+    {
+        get => _restorePercent;
+        private set => Set(ref _restorePercent, value);
     }
 
     // ==================================================================
@@ -496,6 +717,44 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// <summary>剩余空间已经低于设定阈值。界面用它把数字变红。</summary>
     public bool DiskLow =>
         _snapshot.FreeDiskBytes > 0 && _snapshot.FreeDiskBytes <= _host.Settings.MinFreeDiskBytes;
+
+    // ==================================================================
+    //  云盘容量预算
+    //
+    //  OneDrive 的真实配额读不到 —— 那个数字从不落盘，OneDrive.exe 拿自己的
+    //  令牌问服务端并只留在内存里。所以总容量是用户自己填的，
+    //  已用量由引擎扫目标目录里实际存在的包算出来。
+    //
+    //  没填总容量时整张卡片隐藏：显示一条"剩余 ? / ?"比不显示更糟。
+    //
+    //  这一组读的是 _quotaSource 而不是 _snapshot：引擎停着时快照里那四个值是 0，
+    //  照读会让"没填容量"和"引擎停了"变成同一种表现 —— 卡片整张消失。
+    //  见 EngineSnapshot.QuotaSourceFor 与 SyncCloudQuota()。
+    // ==================================================================
+
+    /// <summary>用户填了总容量。没填时总览上那张卡片整体隐藏。</summary>
+    public bool CloudQuotaConfigured => _quotaSource.CloudQuotaConfigured;
+
+    public string CloudQuotaText => _quotaSource.CloudQuotaText;
+
+    public string CloudUsedText => _quotaSource.CloudUsedText;
+
+    public string CloudFreeText => _quotaSource.CloudFreeText;
+
+    /// <summary>进度条用。已超预算时快照那边已经夹到 100，不会画出框。</summary>
+    public double CloudUsedPercent => _quotaSource.CloudUsedPercent;
+
+    /// <summary>剩余已低于警戒线。界面用它把数字变红。</summary>
+    public bool CloudQuotaLow => _quotaSource.CloudQuotaLow;
+
+    /// <summary>卡片标题：OneDrive 说"云盘容量"，普通目录说"目标目录容量"。</summary>
+    public string CloudQuotaTitle => IsOneDriveMode ? "云盘容量" : "目标目录容量";
+
+    /// <summary>「已用 712.4 GB / 1.00 TB · 剩余 311.6 GB」。</summary>
+    public string CloudQuotaUsageText => _quotaSource.CloudQuotaUsageText;
+
+    /// <summary>警戒线那一行。没设警戒线时是空串。</summary>
+    public string CloudQuotaWarnText => _quotaSource.CloudQuotaWarnText;
 
     // ==================================================================
     //  最近结果：打包与送达分开报
@@ -573,6 +832,88 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     internal void SyncCloudTarget() => SyncCloudTarget(_snapshot, _host.Settings.CloudTarget);
 
     /// <summary>
+    /// 把容量卡片切到该显示的那份数字。触发点与 <see cref="SyncCloudTarget()"/> 完全相同
+    /// （保存配置、重新读取配置、引擎启停），外加构造时一次。
+    ///
+    /// 引擎在跑的时候<b>不去扫目录</b>：快照里那份是引擎每轮刚算出来的，
+    /// 扫了也是白扫，而这个方法会真的枚举一遍云盘目录。
+    /// （<see cref="EngineSnapshot.QuotaSourceFor"/> 里也有一次 <c>Running</c> 判断，
+    /// 那是它自己的契约；这里这次是为了省掉那次枚举，两者都得留着。）
+    ///
+    /// 引擎停着时数字在这几个触发点上刷新，不是实时的 —— 用户在资源管理器里
+    /// 手动删了包，要等下次保存 / 重新读取 / 启动引擎才会回落。总览上
+    /// <c>ZipTempText</c>、<c>FreeDiskText</c> 在停止时本来就是这个行为。
+    /// </summary>
+    internal void SyncCloudQuota()
+    {
+        EngineSnapshot previous = _quotaSource;
+
+        _quotaSource = _snapshot.Running
+            ? _snapshot
+            : EngineSnapshot.QuotaSourceFor(
+                _snapshot,
+                _host.DescribeCloudQuota(),
+                _host.Settings.CloudQuotaWarnBytes);
+
+        RaiseQuotaProperties(previous, _quotaSource);
+    }
+
+    /// <summary>
+    /// 容量那几个属性的变更通知。数字没变就一条都不发。
+    ///
+    /// 两个调用方：轮询里快照变了（<see cref="RaiseSnapshotProperties"/>）、
+    /// 停止时按磁盘配置重算（<see cref="SyncCloudQuota"/>）。
+    /// <c>CloudQuotaTitle</c> 不在这里 —— 它跟的是云盘类型，不是这些数字。
+    /// </summary>
+    private void RaiseQuotaProperties(EngineSnapshot a, EngineSnapshot b)
+    {
+        if (a.CloudQuotaBytes == b.CloudQuotaBytes
+            && a.CloudUsedBytes == b.CloudUsedBytes
+            && a.CloudFreeBytes == b.CloudFreeBytes
+            && a.CloudQuotaWarnBytes == b.CloudQuotaWarnBytes)
+        {
+            return;
+        }
+
+        Raise(nameof(CloudQuotaConfigured));
+        Raise(nameof(CloudQuotaText));
+        Raise(nameof(CloudUsedText));
+        Raise(nameof(CloudFreeText));
+        Raise(nameof(CloudUsedPercent));
+        Raise(nameof(CloudQuotaLow));
+        Raise(nameof(CloudQuotaUsageText));
+        Raise(nameof(CloudQuotaWarnText));
+    }
+
+    /// <summary>
+    /// 自检专用：直接摆一份快照进来，把那些"只有引擎跑起来才会出现"的界面状态
+    /// 摆到离屏窗口上让 walker 走一遍。
+    ///
+    /// 容量卡片是个典型：它整张的可见性绑在 <c>CloudQuotaConfigured</c> 上，
+    /// 而 <see cref="EngineSnapshot.Stopped"/> 里那个值是 0 ——
+    /// 不喂一份带容量的快照进来，卡片永远折叠，里面的绑定一条都测不到，
+    /// 而折叠元素不参与布局，等于没测。
+    ///
+    /// <b>调用前必须先 <see cref="Dispose"/> 停掉定时器</b>，
+    /// 否则下一个 Tick 就按真实快照把这里摆的东西同步掉了。
+    /// </summary>
+    internal void ApplySnapshotForSelfTest(EngineSnapshot snapshot)
+    {
+        EngineSnapshot previous = _snapshot;
+        EngineSnapshot previousQuota = _quotaSource;
+
+        _snapshot = snapshot;
+
+        // 容量卡片读的是 _quotaSource，不跟着摆的话自检喂进来的容量到不了界面上，
+        // 卡片永远折叠 —— 而折叠元素不参与布局，等于这一项没测。
+        // 这里直接取喂进来的那份，不走 SyncCloudQuota()：自检不该去扫用户的云盘目录。
+        _quotaSource = snapshot;
+
+        RaiseSnapshotProperties(previous, snapshot);
+        RaiseQuotaProperties(previousQuota, _quotaSource);
+    }
+
+    /// <summary>
     /// 同上，但两个输入由调用方给出 —— 自检用这个重演"引擎在跑 / 已停止"两种情形，
     /// 不必真的启动引擎、也不必往用户的 settings.json 里写东西。
     /// 它<b>不</b>改 <c>_snapshot</c>：自检跑完调一次无参版就能回到真实状态。
@@ -593,6 +934,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             Raise(nameof(DeliverFailureLabel));
             Raise(nameof(IsOneDriveMode));
             Raise(nameof(OpenCloudFolderText));
+            Raise(nameof(CloudQuotaTitle));
 
             // 步数本身变了（6 步 ⇄ 4 步），只 Raise 不重建的话列表还是旧的。
             RebuildPipelineSteps(wanted);
@@ -737,6 +1079,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             StartCommand.RaiseCanExecuteChanged();
             StopCommand.RaiseCanExecuteChanged();
             NudgeCommand.RaiseCanExecuteChanged();
+            ClearHistoryCommand.RaiseCanExecuteChanged();
         }
     }
 
@@ -763,6 +1106,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             // 引擎停下来了：总览该从"引擎在用的"换成"下次会用的"。
             // 这正是"引擎停止后自动切换"那句承诺的落点。
             SyncCloudTarget();
+
+            // 容量卡片同理 —— 而且不切的话它会直接消失（快照停止值里容量是 0）。
+            SyncCloudQuota();
         }
 
         if (a.ScheduleActive != b.ScheduleActive || a.NextActivationLocal != b.NextActivationLocal)
@@ -837,6 +1183,17 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             Raise(nameof(FreeDiskText));
             Raise(nameof(DiskLow));
+        }
+
+        // 引擎在跑：容量卡片跟着快照走，引擎每轮都重扫了，这里直接用。
+        // 停着的时候不能碰 _quotaSource —— 那份是 SyncCloudQuota 按磁盘配置算出来的，
+        // 覆盖回快照里的 0 就又变回"卡片整张消失"了。
+        if (b.Running)
+        {
+            EngineSnapshot previousQuota = _quotaSource;
+            _quotaSource = b;
+
+            RaiseQuotaProperties(previousQuota, _quotaSource);
         }
 
         if (a.CloudTarget != b.CloudTarget)
@@ -1082,6 +1439,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             // 云盘类型不用等"点开始"了 —— 引擎停着就当场切，在跑就先记下、停了再切。
             SyncCloudTarget();
 
+            // 刚改的容量预算也要当场反映到卡片上：改完保存却看见旧数字，
+            // 和"保存没生效"在用户眼里是一回事。
+            SyncCloudQuota();
+
             RefreshValidation();
 
             if (startupProblem is null)
@@ -1137,6 +1498,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         // 丢弃界面改动同样可能改变云盘类型（界面上改过但没保存），
         // 所以这里也要把总览拉回磁盘上那份。
         SyncCloudTarget();
+        SyncCloudQuota();
 
         // 主题也要跟着退回磁盘上的值 —— 设置页上的主题是即时预览的，
         // "重新读取"说的是"丢弃界面改动"，那就得把预览一起丢掉，否则界面
@@ -1248,6 +1610,258 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
+    // ==================================================================
+    //  恢复
+    //
+    //  「没试过恢复的备份不算备份」—— 这一组是那句话在界面上的落点。
+    //  所有真正干活的东西都在 EngineHost 后面，这里只负责：
+    //  把结论翻译成人话、把异常挡在 Dispatcher 之外、把按钮在执行期间锁上。
+    // ==================================================================
+
+    /// <summary>重扫临时目录与云盘目录，刷新可恢复的归档列表。</summary>
+    private void RefreshRestoreArchives()
+    {
+        // 记住当前选中的那个包，刷新之后尽量选回去 ——
+        // 否则用户点一下「刷新」，刚填好的密码和选择就全没了。
+        string? keep = _selectedArchive?.Path;
+
+        RestoreArchives.Clear();
+
+        try
+        {
+            foreach (ArchiveInfo archive in _host.ListRestorableArchives())
+            {
+                RestoreArchives.Add(new RestoreArchiveView(
+                    archive.Path,
+                    archive.FileName,
+                    archive.Bytes,
+                    archive.CreatedUtc.ToLocalTime(),
+                    archive.SidecarBytes > 0,
+                    DescribeLocation(archive.Path)));
+            }
+        }
+        catch (Exception ex)
+        {
+            // 目录不存在、没权限、路径非法都会走到这里。列表空着就空着，
+            // 但不能静默 —— 用户会以为"一个备份都没有"。
+            _log.Warn($"扫描可恢复的归档时出错：{ex.Message}");
+            SetRestoreStatus($"扫描归档目录时出错：{ex.Message}", "Error");
+        }
+
+        SelectedArchive = keep is not null
+            ? RestoreArchives.FirstOrDefault(a => string.Equals(a.Path, keep, StringComparison.OrdinalIgnoreCase))
+            : null;
+
+        // 密码框默认填当前设置里的那个，省得每次手敲；用户随时可以改成旧密码。
+        if (_restorePassword.Length == 0)
+        {
+            RestorePassword = _host.CurrentPassword;
+        }
+    }
+
+    /// <summary>这个包是在临时目录还是已经投递到云盘目录了。</summary>
+    private string DescribeLocation(string archivePath)
+    {
+        string? directory = Path.GetDirectoryName(archivePath);
+
+        if (string.IsNullOrEmpty(directory))
+        {
+            return string.Empty;
+        }
+
+        return Same(directory, _host.ZipTempDirectory) || Same(directory, _host.Settings.ResolveZipTemp())
+            ? "临时目录"
+            : Same(directory, _host.Settings.CloudPath)
+                ? "云盘目录"
+                : directory;
+
+        static bool Same(string a, string b)
+        {
+            if (string.IsNullOrWhiteSpace(a) || string.IsNullOrWhiteSpace(b))
+            {
+                return false;
+            }
+
+            try
+            {
+                return string.Equals(
+                    Path.TrimEndingDirectorySeparator(Path.GetFullPath(a)),
+                    Path.TrimEndingDirectorySeparator(Path.GetFullPath(b)),
+                    StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
+
+    /// <summary>看看包里有什么。不落盘。</summary>
+    private async Task ListArchiveAsync()
+    {
+        if (_selectedArchive is not { } archive)
+        {
+            return;
+        }
+
+        RestoreBusy = true;
+        RestoreEntries.Clear();
+        SetRestoreStatus($"正在读取 {archive.FileName} 的内容…", "Informational");
+
+        try
+        {
+            using CancellationTokenSource cts = new(TimeSpan.FromMinutes(10));
+
+            ArchiveListing listing = await _host
+                .ListArchiveContentsAsync(archive.Path, RestorePassword, cts.Token)
+                .ConfigureAwait(true);
+
+            if (!listing.Ok)
+            {
+                SetRestoreStatus(
+                    listing.WrongPassword
+                        ? "密码不对，打不开这个包。如果它是换密码之前打的，请在上面填回当时那个密码。"
+                        : $"读取失败：{listing.Error}",
+                    "Error");
+                return;
+            }
+
+            foreach (ArchiveEntry entry in listing.Entries)
+            {
+                RestoreEntries.Add(entry);
+            }
+
+            // 截断必须说出来：显示"共 20 个"而实际有 20 万个，比什么都不显示更糟。
+            SetRestoreStatus(
+                listing.Truncated
+                    ? $"包里至少有 {listing.FileCount} 个文件（共 {ByteSize.Format(listing.TotalBytes)}），" +
+                      "条目太多，只列出了前面一部分。完整清单以包内清单为准。"
+                    : $"包里有 {listing.FileCount} 个文件，共 {ByteSize.Format(listing.TotalBytes)}。",
+                "Success");
+        }
+        catch (Exception ex)
+        {
+            SetRestoreStatus($"读取失败：{ex.Message}", "Error");
+        }
+        finally
+        {
+            RestoreBusy = false;
+        }
+    }
+
+    /// <summary>
+    /// 演练一个包：真解出来、逐条核对、立刻删干净。
+    ///
+    /// 这颗按钮是整个功能里最该被按的那一颗 —— 它回答的是
+    /// "真出事那天，我这个包到底还能不能还原出来"。
+    /// </summary>
+    private async Task DrillArchiveAsync()
+    {
+        if (_selectedArchive is not { } archive)
+        {
+            return;
+        }
+
+        RestoreBusy = true;
+        SetRestoreStatus($"正在演练 {archive.FileName}，解出来核对后会立即删除…", "Informational");
+
+        try
+        {
+            using CancellationTokenSource cts = new(
+                TimeSpan.FromMinutes(Math.Max(1, _host.Settings.DrillTimeoutMinutes)));
+
+            DrillResult result = await _host.RunDrillAsync(archive.Path, cts.Token).ConfigureAwait(true);
+
+            SetRestoreStatus(result.Message, result.Outcome switch
+            {
+                DrillOutcome.Passed => "Success",
+                DrillOutcome.PassedWithWarnings => "Warning",
+                DrillOutcome.Skipped => "Warning",
+                DrillOutcome.Cancelled => "Warning",
+                _ => "Error",
+            });
+        }
+        catch (Exception ex)
+        {
+            SetRestoreStatus($"演练出错：{ex.Message}", "Error");
+        }
+        finally
+        {
+            RestoreBusy = false;
+        }
+    }
+
+    private bool CanExtract() =>
+        _selectedArchive is not null && _restoreTarget.Trim().Length > 0;
+
+    /// <summary>把整个包解到用户指定的目录。</summary>
+    private async Task ExtractArchiveAsync()
+    {
+        if (_selectedArchive is not { } archive)
+        {
+            return;
+        }
+
+        string target = _restoreTarget.Trim();
+
+        if (target.Length == 0)
+        {
+            SetRestoreStatus("请先选择解压到哪个目录。", "Warning");
+            return;
+        }
+
+        RestoreBusy = true;
+        RestorePercent = 0;
+        SetRestoreStatus($"正在把 {archive.FileName} 解压到 {target} …", "Informational");
+
+        try
+        {
+            using CancellationTokenSource cts = new(
+                TimeSpan.FromMinutes(Math.Max(1, _host.Settings.DrillTimeoutMinutes)));
+
+            // Progress<T> 在构造它的线程（这里是 UI 线程）上回调，
+            // 所以回调里直接改属性是安全的，不需要 Dispatcher。
+            Progress<PackProgress> progress = new(p => RestorePercent = p.Percent);
+
+            ExtractResult result = await _host
+                .ExtractAsync(archive.Path, target, RestorePassword, progress, cts.Token)
+                .ConfigureAwait(true);
+
+            if (!result.Ok)
+            {
+                SetRestoreStatus(
+                    result.WrongPassword
+                        ? "密码不对，解不开这个包。如果它是换密码之前打的，请填回当时那个密码。"
+                        : $"解压失败：{result.Error}",
+                    "Error");
+                return;
+            }
+
+            string warnings = result.Warnings.Count > 0
+                ? $" 有 {result.Warnings.Count} 条警告：{string.Join("；", result.Warnings.Take(3))}"
+                : string.Empty;
+
+            SetRestoreStatus(
+                $"已解压到 {target}，耗时 {result.Elapsed.TotalSeconds:0.#} 秒。" + warnings,
+                result.Warnings.Count > 0 ? "Warning" : "Success");
+        }
+        catch (Exception ex)
+        {
+            SetRestoreStatus($"解压失败：{ex.Message}", "Error");
+        }
+        finally
+        {
+            RestoreBusy = false;
+            RestorePercent = 0;
+        }
+    }
+
+    private void SetRestoreStatus(string message, string kind)
+    {
+        RestoreStatus = message;
+        RestoreStatusKind = kind;
+    }
+
     private void RequeueQuarantine(string id)
     {
         if (_host.RequeueQuarantined(id))
@@ -1309,6 +1923,50 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             // 剪贴板被别的进程占用时 SetText 会抛 COMException，这不该让程序崩。
             _log.Warn($"复制到剪贴板失败：{ex.Message}");
             ShowInfo("复制失败", "剪贴板被其他程序占用，请稍后再试。", "Warning");
+        }
+    }
+
+    // ==================================================================
+    //  清空历史记录
+    //
+    //  清的是"账本"，不是"备份"。压缩包一个都不删 —— 这一点必须在确认框里
+    //  说清楚，用户最怕的就是"点下去备份就没了"。
+    // ==================================================================
+
+    /// <summary>确认框里"同时删除日志文件"那个勾。默认不勾：日志是排查问题的唯一线索。</summary>
+    public bool ClearHistoryDeletesLogs
+    {
+        get => _clearHistoryDeletesLogs;
+        set => Set(ref _clearHistoryDeletesLogs, value);
+    }
+
+    private void ClearHistory()
+    {
+        // 正文由 Core 拼 —— 里面有真正的判断（清空后到底会不会把一大堆旧文件
+        // 重新备份一遍，取决于用户当前的配置组合），那种判断放在界面里没法写测试。
+        ClearHistoryAdvice advice = _host.DescribeClearHistory();
+
+        MessageBoxResult answer = MessageBox.Show(
+            advice.ToConfirmationText(ClearHistoryDeletesLogs),
+            "清空历史记录",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Warning,
+            MessageBoxResult.No);
+
+        if (answer != MessageBoxResult.Yes)
+        {
+            return;
+        }
+
+        if (_host.ClearHistory(ClearHistoryDeletesLogs, out string message))
+        {
+            // 引擎那边已经把快照复位成 Stopped 了，下一个 Tick（250ms 内）
+            // 就会把总览上那几个累计数字拨回零，这里不用自己动手。
+            ShowInfo("已清空", message, "Success");
+        }
+        else
+        {
+            ShowInfo("清空失败", message, "Error");
         }
     }
 

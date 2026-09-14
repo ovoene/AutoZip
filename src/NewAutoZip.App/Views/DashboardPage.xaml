@@ -171,6 +171,71 @@
                     </ui:Card>
                 </UniformGrid>
 
+                <!-- ==================== 云盘容量 ====================
+                     OneDrive 的真实配额读不到（那个数字从不落盘），所以总容量是
+                     用户在设置里自己填的，已用量由引擎扫目标目录里实际存在的包算出来。
+
+                     没填总容量时整张卡片隐藏 —— 显示一条"剩余 ? / ?"比不显示更糟。
+                -->
+                <ui:Card x:Name="CloudQuotaCard"
+                         Margin="0,0,0,12"
+                         Visibility="{Binding CloudQuotaConfigured, Converter={StaticResource BoolVisibility}}">
+                    <StackPanel>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+
+                            <TextBlock Grid.Column="0"
+                                       Style="{StaticResource GroupTitle}"
+                                       Text="{Binding CloudQuotaTitle}" />
+
+                            <!-- 剩余低于警戒线时变红。和第 4 张磁贴同一套写法。 -->
+                            <TextBlock x:Name="CloudQuotaWarnLine" Grid.Column="1" Text="{Binding CloudQuotaWarnText}">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="FontSize" Value="12" />
+                                        <Setter Property="Foreground" Value="{DynamicResource MutedText}" />
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding CloudQuotaLow}" Value="True">
+                                                <Setter Property="Foreground" Value="{DynamicResource ErrorText}" />
+                                                <Setter Property="FontWeight" Value="SemiBold" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                        </Grid>
+
+                        <ProgressBar x:Name="CloudQuotaBar"
+                                     Height="6"
+                                     Margin="0,2,0,8"
+                                     Maximum="100"
+                                     Value="{Binding CloudUsedPercent, Mode=OneWay}" />
+
+                        <TextBlock x:Name="CloudQuotaUsageLine" Text="{Binding CloudQuotaUsageText}">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="FontWeight" Value="SemiBold" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding CloudQuotaLow}" Value="True">
+                                            <Setter Property="Foreground" Value="{DynamicResource ErrorText}" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+
+                        <TextBlock Margin="0,4,0,0"
+                                   FontSize="12"
+                                   Foreground="{DynamicResource ErrorText}"
+                                   Text="剩余容量已低于警戒线。放不下的那一轮会被直接拒绝，不会产生半个包。"
+                                   TextWrapping="Wrap"
+                                   Visibility="{Binding CloudQuotaLow, Converter={StaticResource BoolVisibility}}" />
+                    </StackPanel>
+                </ui:Card>
+
                 <!-- ==================== 当前批次 ==================== -->
                 <ui:Card Margin="0,0,0,12">
                     <StackPanel>

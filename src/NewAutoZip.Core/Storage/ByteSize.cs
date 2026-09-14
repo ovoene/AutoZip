@@ -113,4 +113,81 @@ public static class ByteSize
 
         return $"{(long)span.TotalHours}小时{span.Minutes}分{span.Seconds}秒";
     }
+
+    // ==================================================================
+    //  单位换算 —— 给"数值 + 单位下拉框"那种输入方式用
+    //
+    //  配置里一律存字节；界面上让用户按 GB / TB 填。换算只在这里做一次，
+    //  各处自己写 1024 * 1024 * 1024 迟早会有人少写一个或多写一个。
+    // ==================================================================
+
+    /// <summary>下拉框里能选的单位，索引就是 1024 的幂次（MB=2、GB=3、TB=4）。</summary>
+    public static IReadOnlyList<string> UnitNames => Units;
+
+    /// <summary>1024 的 <paramref name="power"/> 次方。超出范围按最接近的合法值处理。</summary>
+    public static long UnitFactor(int power)
+    {
+        power = Math.Clamp(power, 0, Units.Length - 1);
+
+        long factor = 1;
+
+        for (int i = 0; i < power; i++)
+        {
+            factor *= 1024;
+        }
+
+        return factor;
+    }
+
+    /// <summary>
+    /// 把"数值 + 单位幂次"还原成字节。
+    ///
+    /// 乘之前先判溢出：用户在 PB 那一档填个很大的数会让 <c>long</c> 绕回负数，
+    /// 而负的容量预算会让"放不下"的判断整个反过来 —— 宁可夹在上限。
+    /// </summary>
+    public static long FromUnit(double value, int power)
+    {
+        if (value <= 0 || double.IsNaN(value))
+        {
+            return 0;
+        }
+
+        double bytes = value * UnitFactor(power);
+
+        return bytes >= long.MaxValue ? long.MaxValue : (long)bytes;
+    }
+
+    /// <summary>
+    /// 把字节数拆成"数值 + 单位幂次"，挑<b>能整除的最大单位</b>。
+    ///
+    /// 1 TB 要显示成 <c>1 TB</c> 而不是 <c>1024 GB</c>：用户填进去什么，
+    /// 下次打开设置就该看到什么，否则每存一次读一次单位就往下掉一级。
+    /// 整除不了的（比如 1.5 GB 那种手改出来的值）就退到能整除的那一级。
+    ///
+    /// <paramref name="minPower"/> 是给下拉框用的：下拉框里只有 MB 起步，
+    /// 而手改出来的 1536 字节会被拆成"1.5 KB"——单位在下拉框里找不到，
+    /// 落到默认项上就成了"1.5 GB"，一百万倍的误差。给个下限，
+    /// 宁可显示成 0.0015 MB 这种难看的数字，也不能把用户的值悄悄放大。
+    /// </summary>
+    public static (double Value, int Power) ToUnit(long bytes, int minPower = 0)
+    {
+        minPower = Math.Clamp(minPower, 0, Units.Length - 1);
+
+        // 0 没有"最大单位"可言。默认给 GB —— 容量预算按 GB 起步最顺手。
+        if (bytes <= 0)
+        {
+            return (0, Math.Max(3, minPower));
+        }
+
+        int power = 0;
+
+        while (power < Units.Length - 1 && bytes % (UnitFactor(power) * 1024) == 0)
+        {
+            power++;
+        }
+
+        power = Math.Max(power, minPower);
+
+        return ((double)bytes / UnitFactor(power), power);
+    }
 }

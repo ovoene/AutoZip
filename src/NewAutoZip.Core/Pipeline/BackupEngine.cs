@@ -40,6 +40,16 @@ public sealed class BackupEngine : IAsyncDisposable
     private readonly MonitorService _monitor;
     private readonly StabilityTracker _tracker;
     private readonly ZipTempManager _zipTemp;
+
+    /// <summary>
+    /// 只用来<b>扫描云盘目录算占用</b>的第二个管理器。
+    ///
+    /// 复用 <see cref="ZipTempManager"/> 是因为"列出我们的包、含旁挂清单一起算"
+    /// 这件事它已经做对了。但这里<b>只调 ListArchives</b>——
+    /// 云盘目录里的包是备份本体，绝不能套用那套淘汰逻辑。
+    /// </summary>
+    private readonly ZipTempManager _cloudScanner;
+
     private readonly RetryQueue _retries;
 
     /// <summary>当前批次：路径 → 字节数。只在主循环线程上访问。</summary>
@@ -54,6 +64,7 @@ public sealed class BackupEngine : IAsyncDisposable
     private INotificationHub _notify = NullNotificationHub.Instance;
     private IUploadMonitor _uploads = DeliveryOnlyUploadMonitor.Instance;
     private SevenZipRunner? _runner;
+    private RestoreDrillService? _drill;
     private EngineState _state = new();
     private FileFilter _filter = new(null);
 
@@ -130,6 +141,7 @@ public sealed class BackupEngine : IAsyncDisposable
         _monitor = new MonitorService(log);
         _tracker = new StabilityTracker(_time, _probe, log);
         _zipTemp = new ZipTempManager(log, _time);
+        _cloudScanner = new ZipTempManager(log, _time);
         _retries = new RetryQueue(log, _time);
     }
 
@@ -137,6 +149,17 @@ public sealed class BackupEngine : IAsyncDisposable
     public EngineSnapshot Snapshot => Volatile.Read(ref _snapshot);
 
     public bool IsRunning => _loop is { IsCompleted: false };
+
+    /// <summary>
+    /// 当前运行状态的只读视图。引擎没跑过时是磁盘上那一份。
+    ///
+    /// 界面用它算"清空历史记录会清掉什么"。停止状态下 <c>_stateView</c> 还是
+    /// 上一次发布的那份，所以这里在引擎停着时现读一次磁盘 ——
+    /// 程序刚启动、引擎从没跑过时，内存里那份是空的，直接用会把
+    /// "有 3 条待上传记录"说成"没有"。
+    /// </summary>
+    public EngineState StateView =>
+        IsRunning ? Volatile.Read(ref _stateView) : _stateStore.Load();
 
     public string ZipTempDirectory => _zipTemp.Root;
 
@@ -180,6 +203,7 @@ public sealed class BackupEngine : IAsyncDisposable
             _notify = notifications ?? NullNotificationHub.Instance;
             _uploads = uploadMonitor ?? DeliveryOnlyUploadMonitor.Instance;
             _runner = new SevenZipRunner(sevenZipExePath ?? AppPaths.SevenZipExe, _log);
+            _drill = new RestoreDrillService(_runner, _log);
             _fileFloorUtc = ScheduleWindow.FromSettings(_settings).EffectiveFromUtc();
 
             SecretRedactor.Shared.SetSecrets(
@@ -262,6 +286,44 @@ public sealed class BackupEngine : IAsyncDisposable
         _monitor.Dispose();
     }
 
+    /// <summary>
+    /// 把运行状态复位成"全新的、从未运行过"的样子。
+    ///
+    /// <b>只能在引擎停止时调用，运行中直接返回 false。</b>
+    /// 引擎在 <see cref="Start"/> 时把状态读进 <c>_state</c> 这份内存副本，
+    /// 之后十几处 <c>_stateStore.Save(_state)</c> 会把它写回去 ——
+    /// 运行中复位磁盘上那份，下一次保存就把旧状态原样写回来了，
+    /// 用户看到的是"点了没反应"。
+    ///
+    /// 复位走引擎而不是让界面自己 new 一个 <see cref="StateStore"/>，是因为
+    /// 状态有<b>两份</b>：磁盘上那份和这里的内存副本。只清磁盘的话，
+    /// 内存副本还留着旧的累计数字，总览上的统计要等到下次重启才归零。
+    ///
+    /// 压缩包一个都不删 —— 清的是账本，不是备份。
+    /// </summary>
+    public bool ResetState(out string? error)
+    {
+        if (IsRunning)
+        {
+            error = "引擎正在运行。";
+            return false;
+        }
+
+        if (!_stateStore.Reset(out error))
+        {
+            return false;
+        }
+
+        _state = new EngineState();
+
+        // 快照里的累计数字是从 _state 读的，不重发一次的话界面会一直停在旧值。
+        // 停止状态下没有主循环再去发，只能在这里补一发。
+        Volatile.Write(ref _snapshot, EngineSnapshot.Stopped);
+        Volatile.Write(ref _stateView, _state.Clone());
+
+        return true;
+    }
+
     // ==================================================================
     //  主循环
     // ==================================================================
@@ -328,6 +390,10 @@ public sealed class BackupEngine : IAsyncDisposable
         SanitizeState();
         _zipTemp.Configure(_settings.ResolveZipTemp());
         _zipTemp.EnsureDirectory();
+
+        // 只配置、不建目录：云盘目录是用户指定的既存目录，
+        // 这里替他建一个空目录只会掩盖"路径填错了"这件事。
+        _cloudScanner.Configure(_settings.CloudPath);
 
         // 清扫上次异常退出留下的 .part / .list 残骸。
         _zipTemp.SweepIntermediates();
@@ -563,12 +629,135 @@ public sealed class BackupEngine : IAsyncDisposable
             return;
         }
 
+        // 7) 云端恢复演练。放在最后、且只在真正空闲时做 —— 它要下载并解开一整个包，
+        //    是这条流水线上最重的一件事，绝不能和打包/上传抢磁盘和带宽。
+        if (await MaybeCloudDrillAsync(nowUtc, ct).ConfigureAwait(false))
+        {
+            return;
+        }
+
         SetPhase(_batch.Count > 0
             ? EnginePhase.Collecting
             : _retries.Count > 0 ? EnginePhase.Retrying : EnginePhase.Idle);
 
         PublishSnapshot();
         await WaitForNextRoundAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 到期就抽一个云端的包验一遍。返回 true 表示本轮做了演练（调用方直接结束这一轮）。
+    ///
+    /// 这是本地演练<b>证明不了</b>的那一半：包传上去之后有没有在传输或存储中损坏、
+    /// 云端那份是不是还等于当初上传的那份。本地演练验的包从没离开过这台机器。
+    /// </summary>
+    private async Task<bool> MaybeCloudDrillAsync(DateTimeOffset nowUtc, CancellationToken ct)
+    {
+        if (!_settings.CloudDrillEnabled || _drill is null)
+        {
+            return false;
+        }
+
+        // 只在闲着的时候做。有待上传的包时尤其不能做 —— 那个包可能正在传，
+        // 这时候去读它既拖慢上传，读到的也可能是半个文件。
+        if (_batch.Count > 0 || _retries.Count > 0 || _state.PendingUploads.Count > 0)
+        {
+            return false;
+        }
+
+        // 从没演练过就立刻做一次。用户是<b>主动</b>打开这个开关的（默认关着），
+        // 让他等满一个周期才知道功能到底能不能用，等于把最该早点发现的问题往后推。
+        if (_state.LastCloudDrillUtc is { } last
+            && nowUtc - last < TimeSpan.FromHours(_settings.CloudDrillIntervalHours))
+        {
+            return false;
+        }
+
+        string? archive = PickCloudArchive();
+
+        if (archive is null)
+        {
+            // 目标目录里还一个包都没有。不推进计时器 —— 等第一个包送上去，
+            // 下一轮就会立刻验它，正好把整条链路走通一遍。
+            return false;
+        }
+
+        // 计时器在<b>开始之前</b>就推进：演练失败或跳过时也算用掉了这一次。
+        // 不这么做的话，一个反复失败的演练会变成每一轮都下载一次包。
+        _state.LastCloudDrillUtc = nowUtc;
+
+        SetPhase(EnginePhase.Drilling);
+        PublishSnapshot();
+
+        _log.Info($"开始云端恢复演练：{Path.GetFileName(archive)}。");
+
+        DrillResult drill = await _drill.RunAsync(
+            archive,
+            _settings.Password,
+            _zipTemp.Root,
+            TimeSpan.FromMinutes(_settings.DrillTimeoutMinutes),
+            _settings.MinFreeDiskBytes,
+            ct).ConfigureAwait(false);
+
+        RecordDrill(drill);
+        _stateStore.Save(_state);
+
+        if (drill.IsProblem)
+        {
+            _log.Error($"云端恢复演练未通过：{drill.Message}");
+
+            await NotifySafeAsync(
+                Msg(NotifyEvent.Failure, NotifyTag.Drill,
+                    "✗ 云端的备份包没能通过恢复演练。",
+                    drill.Message,
+                    $"压缩包：{drill.ArchiveFileName}",
+                    $"所在目录：{_settings.CloudPath}",
+                    drill.Outcome == DrillOutcome.WrongPassword
+                        ? "现在设置里的密码解不开这个包。请确认密码是否被改过 —— " +
+                          "在找回正确密码之前，这个包里的东西取不出来。"
+                        : "包可能在上传或云端存储过程中损坏了。建议尽快重做一份备份。"),
+                ct).ConfigureAwait(false);
+        }
+        else if (drill.Ok)
+        {
+            _log.Info(drill.Message);
+        }
+
+        PublishSnapshot();
+        await WaitForNextRoundAsync(ct).ConfigureAwait(false);
+
+        return true;
+    }
+
+    /// <summary>
+    /// 挑一个云端的包来验 —— 取<b>最新</b>的那个。
+    ///
+    /// 两个理由：它是真要恢复时最可能被用到的那一个；而且它验的是<b>当前</b>这条链路
+    /// （现在的密码、现在的 7za、现在的上传路径）是否还工作，
+    /// 这比确认三个月前那个包还在更有价值。
+    ///
+    /// 代价是老包不会被轮到。要覆盖全部就得逐包记录"上次验过没"，
+    /// 那是另一套状态；在没有那套状态之前，不假装这里做了全量巡检。
+    /// </summary>
+    private string? PickCloudArchive()
+    {
+        if (string.IsNullOrWhiteSpace(_settings.CloudPath) || !Directory.Exists(_settings.CloudPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            return new DirectoryInfo(_settings.CloudPath)
+                .EnumerateFiles("*.7z", SearchOption.TopDirectoryOnly)
+                .OrderByDescending(f => f.LastWriteTimeUtc)
+                .Select(f => f.FullName)
+                .FirstOrDefault();
+        }
+        catch (Exception ex)
+        {
+            _log.Debug($"枚举目标目录里的归档失败，本次跳过云端演练：{ex.Message}");
+            return null;
+        }
     }
 
     // ==================================================================
@@ -950,6 +1139,24 @@ public sealed class BackupEngine : IAsyncDisposable
     private const int LedgerCap = 500;
 
     /// <summary>
+    /// 隔离区的批次数上限。
+    ///
+    /// 隔离区原先<b>没有任何上限</b> —— 只在用户手动「重试」或「忽略」时才会变短。
+    /// 而每个批次都拖着一整份 <c>List&lt;string&gt; Files</c>（一批可能上千个路径），
+    /// 于是磁盘持续故障、云盘长期掉线这类场景下它只增不减：
+    /// 内存里的 <c>_state</c> 和磁盘上的 state.json 一起无限膨胀，
+    /// 而 state.json 每轮都要整份序列化写盘，越写越慢。
+    ///
+    /// 上限取 200：隔离区是给人看、要人逐个处理的列表，
+    /// 真到了 200 批还没人管，多留的那些也不会有人去看。
+    ///
+    /// 超限时淘汰<b>最旧的</b>，并且<b>必须留下 Warn 日志</b> —— 这一点和
+    /// <see cref="LedgerCap"/> 不同：例外名单是程序自用的内部账本，悄悄淘汰无妨；
+    /// 隔离区是「等用户处理」的待办，静默丢弃等于让用户永远不知道那批文件失败过。
+    /// </summary>
+    private const int QuarantineCap = 200;
+
+    /// <summary>
     /// 判断"文件的修改时间是不是落在未来"要用的参照时钟 —— <b>故意不走 <c>_time</c></b>。
     ///
     /// 文件的修改时间是操作系统按真实时钟写下来的，拿一个被测试注入、可以停在任意时刻的
@@ -997,6 +1204,7 @@ public sealed class BackupEngine : IAsyncDisposable
         }
 
         dirty |= PruneLedgers();
+        dirty |= PruneQuarantine();
 
         if (dirty)
         {
@@ -1030,6 +1238,30 @@ public sealed class BackupEngine : IAsyncDisposable
         }
 
         return removed > 0;
+    }
+
+    /// <summary>
+    /// 隔离区超过 <see cref="QuarantineCap"/> 时淘汰最旧的批次。
+    /// 列表按追加顺序排列，所以从头上砍就是最旧的。
+    /// 返回是否真的改动过（调用方据此决定要不要落盘）。
+    /// </summary>
+    private bool PruneQuarantine()
+    {
+        if (_state.Quarantined.Count <= QuarantineCap)
+        {
+            return false;
+        }
+
+        int excess = _state.Quarantined.Count - QuarantineCap;
+
+        // 必须留下记录：这些批次的文件确实失败过，而用户从此再也看不到它们了。
+        _log.Warn(
+            $"隔离区已达上限 {QuarantineCap} 批，丢弃最早的 {excess} 批记录。" +
+            "这些批次的源文件仍在磁盘上，但不会再出现在隔离区列表里。" +
+            "请尽快处理隔离区，或排查导致批次持续失败的原因。");
+
+        _state.Quarantined.RemoveRange(0, excess);
+        return true;
     }
 
     private static bool SafeExists(string path)
@@ -1128,6 +1360,7 @@ public sealed class BackupEngine : IAsyncDisposable
         List<string> files = [];
         List<PackedFile> packed = [];
         long totalBytes = 0;
+        string? stagedManifest = null;
 
         try
         {
@@ -1206,6 +1439,13 @@ public sealed class BackupEngine : IAsyncDisposable
             // ---------- 压缩 ----------
             string archivePath = BuildArchivePath();
 
+            // 包内清单要在打包<b>之前</b>算好并落盘 —— 它得作为一个普通文件被压进包里。
+            // 算不出来就退回"不带清单"，绝不让它拖垮一次本来能成功的备份。
+            (string? manifestFile, ArchiveManifestDocument? manifestDoc) =
+                await StageInnerManifestAsync(files, Path.GetFileName(archivePath), ct).ConfigureAwait(false);
+
+            stagedManifest = manifestFile;
+
             PackRequest request = new(
                 archivePath,
                 files,
@@ -1213,7 +1453,10 @@ public sealed class BackupEngine : IAsyncDisposable
                 _settings.CompressionLevel,
                 _settings.EncryptFileNames,
                 TimeSpan.FromMinutes(_settings.PackTimeoutMinutes),
-                VerifyAfterPack: true);
+                VerifyAfterPack: true)
+            {
+                ExtraFiles = manifestFile is null ? [] : [manifestFile],
+            };
 
             Progress<PackProgress> progress = new(p =>
             {
@@ -1257,6 +1500,14 @@ public sealed class BackupEngine : IAsyncDisposable
             _state.TotalFilesArchived += archivedCount;
             _state.LastPackSuccessUtc = _time.GetUtcNow();
 
+            // 旁挂清单要等归档原子晋级<b>之后</b>才能写 —— 它里面有最终 .7z 的 SHA-256。
+            if (_settings.WriteArchiveManifest && manifestDoc is not null)
+            {
+                await ArchiveManifest
+                    .WriteSidecarAsync(result.ArchivePath, manifestDoc, _log, ct)
+                    .ConfigureAwait(false);
+            }
+
             await NotifySafeAsync(
                 Msg(NotifyEvent.PackCompleted, NotifyTag.Packed,
                     [
@@ -1275,6 +1526,17 @@ public sealed class BackupEngine : IAsyncDisposable
                             : $"准备移动到{CloudTargetText.PathLabel(_settings.CloudTarget)}。",
                     ]),
                 ct).ConfigureAwait(false);
+
+            // ---------- 本地恢复演练：解不开的包不往云盘送 ----------
+            //
+            // 位置是刻意选的 —— 在交付<b>之前</b>。一个用存下来的密码打不开的包
+            // 送上云盘毫无意义：它占着云端空间，让人以为有备份，而真要恢复那天才发现打不开。
+            // 此刻包还在本机，还来得及不送、并且立刻告警。
+            if (!await LocalDrillPassedAsync(result.ArchivePath, retryId, files, totalBytes, ct)
+                    .ConfigureAwait(false))
+            {
+                return;
+            }
 
             // ---------- 交付到目标目录 ----------
             SetPhase(EnginePhase.Delivering);
@@ -1379,6 +1641,20 @@ public sealed class BackupEngine : IAsyncDisposable
             _packPercent = 0;
             _packFile = null;
 
+            // 包内清单的中转文件：它已经压进包里了，磁盘上这一份没用了。
+            // 放在 finally 里删 —— 打包失败、取消、抛异常时同样得删掉。
+            if (stagedManifest is not null)
+            {
+                try
+                {
+                    File.Delete(stagedManifest);
+                }
+                catch (Exception ex)
+                {
+                    _log.Debug($"删除包内清单中转文件失败（下次清扫会再试）：{ex.Message}");
+                }
+            }
+
             _zipTemp.SweepIntermediates();
             EnforceQuota();
             _stateStore.Save(_state);
@@ -1441,6 +1717,82 @@ public sealed class BackupEngine : IAsyncDisposable
                 HandleFailure(PipelineStage.Pack, retryId, files, totalBytes, cloudCheck.Reason!);
                 return false;
             }
+        }
+
+        return await PrecheckCloudQuotaAsync(files, totalBytes, retryId, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 容量预算检查 —— 第三道，也是唯一一道不看磁盘、只看用户填的预算的。
+    ///
+    /// OneDrive 的真实配额读不到（那个数字从不落盘），所以"云端还能放多少"
+    /// 只能靠用户自己填的总容量减去目录里实际占用。数字是人填的、可能不准，
+    /// 但一个填错的预算最坏只是拒绝打包，而没有预算的后果是包一直传上去直到云盘满，
+    /// 之后每一次上传都失败 —— 后者才是这个功能要防的。
+    ///
+    /// 预算没填（0）时整道检查跳过，老配置行为完全不变。
+    /// </summary>
+    private async Task<bool> PrecheckCloudQuotaAsync(
+        IReadOnlyList<string> files,
+        long totalBytes,
+        string? retryId,
+        CancellationToken ct)
+    {
+        if (_settings.CloudQuotaBytes <= 0)
+        {
+            return true;
+        }
+
+        CloudQuotaStatus quota = CloudQuota.Evaluate(_settings, CloudQuota.MeasureUsed(_cloudScanner));
+
+        // 与磁盘预检同一个系数：已压缩过的内容（图片 / 视频 / 压缩包）压缩比接近 1，
+        // 必须按最坏情况留量，否则"刚好放得下"的判断在真实数据上经常是错的。
+        long required = totalBytes <= 0
+            ? 0
+            : (long)Math.Min(long.MaxValue, totalBytes * 1.1);
+
+        string label = CloudTargetText.PathLabel(_settings.CloudTarget);
+
+        if (!quota.CanFit(required))
+        {
+            string reason =
+                $"{label}容量预算不足：已用 {ByteSize.Format(quota.UsedBytes)} / " +
+                $"{ByteSize.Format(quota.QuotaBytes)}，剩余 {ByteSize.Format(quota.FreeBytes)}，" +
+                $"本次预计需要 {ByteSize.Format(required)}。已拒绝打包，未产生任何文件。" +
+                (quota.DiskLimited
+                    ? "（剩余量受限于该卷的真实可用空间，不是预算本身。）"
+                    : "请清理目标目录里的旧压缩包，或在设置里调高容量上限。");
+
+            _log.Error(reason);
+
+            await NotifySafeAsync(
+                Msg(NotifyEvent.DiskWarning, NotifyTag.Disk,
+                    $"{label}容量已满，本次已拒绝打包（未产生任何文件）。",
+                    reason,
+                    ProgramDiskLine()),
+                ct).ConfigureAwait(false);
+
+            HandleFailure(PipelineStage.Pack, retryId, files, totalBytes, reason);
+            return false;
+        }
+
+        // 还塞得下，但已经低于警戒线：只提醒，照常打包投递。
+        // 这里拦下来是不对的 —— 用户要的是"快满了告诉我一声"，不是"快满了就停"。
+        if (quota.IsLow(_settings.CloudQuotaWarnBytes))
+        {
+            string warning =
+                $"{label}剩余容量 {ByteSize.Format(quota.FreeBytes)} " +
+                $"已低于警戒线 {ByteSize.Format(_settings.CloudQuotaWarnBytes)}" +
+                $"（已用 {ByteSize.Format(quota.UsedBytes)} / {ByteSize.Format(quota.QuotaBytes)}）。" +
+                "本次照常打包，但请及时清理旧压缩包，否则很快会无法继续备份。";
+
+            _log.Warn(warning);
+
+            await NotifySafeAsync(
+                Msg(NotifyEvent.DiskWarning, NotifyTag.Disk,
+                    $"{label}剩余容量已低于警戒线。",
+                    warning),
+                ct).ConfigureAwait(false);
         }
 
         return true;
@@ -1525,6 +1877,7 @@ public sealed class BackupEngine : IAsyncDisposable
         if (outcome.Quarantined is { } quarantined)
         {
             _state.Quarantined.Add(quarantined);
+            _ = PruneQuarantine();
 
             // 通知在这里是 fire-and-forget，但用的是 NotifySafeAsync，异常不会外泄。
             _ = NotifySafeAsync(
@@ -1549,6 +1902,142 @@ public sealed class BackupEngine : IAsyncDisposable
             CancellationToken.None);
     }
 
+    /// <summary>
+    /// 生成包内清单并落盘，返回 (中转文件路径, 清单文档)。
+    /// 关掉清单、或生成过程出任何问题，都返回 (null, null) —— 照常打包，只是没有清单。
+    /// </summary>
+    private async Task<(string? File, ArchiveManifestDocument? Document)> StageInnerManifestAsync(
+        IReadOnlyList<string> files,
+        string archiveFileName,
+        CancellationToken ct)
+    {
+        if (!_settings.WriteArchiveManifest)
+        {
+            return (null, null);
+        }
+
+        try
+        {
+            ArchiveManifestDocument document = await ArchiveManifest.BuildAsync(
+                files,
+                _settings.MonitorPath,
+                archiveFileName,
+                _time.GetLocalNow(),
+                _settings,
+                _log,
+                ct).ConfigureAwait(false);
+
+            string path = Path.Combine(_zipTemp.Root, ArchiveManifest.EntryName);
+            ArchiveManifest.WriteInnerManifest(path, document);
+
+            return (path, document);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn("生成包内清单失败，本次归档将不带清单（不影响备份本身）。", ex);
+            return (null, null);
+        }
+    }
+
+    /// <summary>
+    /// 打包后、交付前的本地演练。返回 false 表示<b>不要交付</b>。
+    ///
+    /// 用的密码是 <c>_settings.Password</c> —— 引擎启动时从 settings.json 解出来的那一份，
+    /// 正是"真要恢复那天会用到的"那一份。这是本地演练与打包末尾那次 <c>7za t</c>
+    /// 最关键的区别：后者验的是内存里刚用过的密码，近乎同义反复。
+    /// </summary>
+    private async Task<bool> LocalDrillPassedAsync(
+        string archivePath,
+        string? retryId,
+        IReadOnlyList<string> files,
+        long totalBytes,
+        CancellationToken ct)
+    {
+        if (!_settings.VerifyAfterPackByExtract || _drill is null)
+        {
+            return true;
+        }
+
+        SetPhase(EnginePhase.Drilling);
+        PublishSnapshot();
+
+        DrillResult drill = await _drill.RunAsync(
+            archivePath,
+            _settings.Password,
+            _zipTemp.Root,
+            TimeSpan.FromMinutes(_settings.DrillTimeoutMinutes),
+            _settings.MinFreeDiskBytes,
+            ct).ConfigureAwait(false);
+
+        RecordDrill(drill);
+
+        if (drill.Outcome == DrillOutcome.Cancelled)
+        {
+            return false;
+        }
+
+        if (!drill.IsProblem)
+        {
+            // 通过、或者因为空间不足之类的原因没验成 —— 都照常交付。
+            // 没验成不等于包有问题，不能拿它拦住一个本来好好的备份。
+            _log.Info(drill.Message);
+            return true;
+        }
+
+        _log.Error($"恢复演练未通过，本次归档不会送往目标目录：{drill.Message}");
+
+        await NotifySafeAsync(
+            Msg(NotifyEvent.Failure, NotifyTag.Drill,
+                "✗ 刚打好的压缩包没能通过恢复演练，已停止投递。",
+                drill.Message,
+                $"压缩包：{drill.ArchiveFileName}",
+                $"包保留在：{archivePath}",
+                drill.Outcome == DrillOutcome.WrongPassword
+                    ? "请检查设置里的压缩密码。密码与包对不上时，这个包在任何机器上都解不开。"
+                    : "包本身可能已损坏。请检查磁盘健康状况与可用空间。"),
+            ct).ConfigureAwait(false);
+
+        HandleFailure(PipelineStage.Pack, retryId, files, totalBytes, $"恢复演练未通过：{drill.Message}");
+
+        return false;
+    }
+
+    /// <summary>把演练结果记进状态。两处演练（本地 / 云端）共用。</summary>
+    private void RecordDrill(DrillResult drill)
+    {
+        if (drill.Outcome is DrillOutcome.Cancelled)
+        {
+            return;
+        }
+
+        // 跳过的演练不改写"上次演练结论"—— 它什么都没验，
+        // 覆盖掉上一次真实的结论等于把一条有效信息换成一条空信息。
+        if (drill.Outcome == DrillOutcome.Skipped)
+        {
+            _log.Info(drill.Message);
+            return;
+        }
+
+        _state.LastDrillUtc = _time.GetUtcNow();
+        _state.LastDrillOk = drill.Ok;
+        _state.LastDrillMessage = drill.Message;
+    }
+
+    /// <summary>
+    /// 把归档剪切进目标目录，<b>连同它的旁挂清单</b>。
+    ///
+    /// 两件事的顺序不能反：先搬归档，再搬清单。中途断电的话，
+    /// 前者留下的是"ZipTemp 里一份没人认领的清单"（下一轮清扫收走，无害），
+    /// 后者留下的却是"云盘里一份指向不存在归档的清单"—— 那是在谎报有备份。
+    ///
+    /// 清单名必须由 <see cref="MakeUnique"/> 之后的<b>最终</b>归档名派生。
+    /// 用改名前的名字去拼，一旦目标目录已有同名包被改成 <c>_2</c>，
+    /// 归档与清单就此错配，而两个文件都还在，谁也看不出来。
+    /// </summary>
     private string? TryDeliver(string archivePath, out string? error)
     {
         error = null;
@@ -1563,12 +2052,41 @@ public sealed class BackupEngine : IAsyncDisposable
             File.Move(archivePath, target);
 
             _log.Info($"已移入{CloudTargetText.PathLabel(_settings.CloudTarget)}：{target}");
+
+            MoveSidecar(archivePath, target);
+
             return target;
         }
         catch (Exception ex)
         {
             error = ex.Message;
             return null;
+        }
+    }
+
+    /// <summary>
+    /// 把旁挂清单跟着归档一起搬过去。搬不动只记警告 ——
+    /// 归档已经安全到位了，绝不能因为一份辅助文件没搬成就判定整轮失败。
+    /// </summary>
+    private void MoveSidecar(string originalArchivePath, string deliveredArchivePath)
+    {
+        string source = ArchiveManifest.SidecarPathFor(originalArchivePath);
+
+        if (!File.Exists(source))
+        {
+            return;
+        }
+
+        try
+        {
+            File.Move(source, ArchiveManifest.SidecarPathFor(deliveredArchivePath), overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"归档已移入目标目录，但旁挂清单没能跟过去：{Path.GetFileName(source)}。" +
+                "归档本身不受影响；留在临时目录里的那份清单会在下一轮清扫时收走。",
+                ex);
         }
     }
 
@@ -2316,6 +2834,12 @@ public sealed class BackupEngine : IAsyncDisposable
         IReadOnlyList<ArchiveInfo> archives = _zipTemp.ListArchives();
         DiskSpaceInfo disk = DiskSpace.Query(_zipTemp.Root);
 
+        // 没配总容量就别去扫云盘目录 —— 那是一次白花的目录枚举，
+        // 而这个方法每秒会被调用好几次（界面 4 Hz 轮询）。
+        CloudQuotaStatus quota = _settings.CloudQuotaBytes > 0
+            ? CloudQuota.Evaluate(_settings, CloudQuota.MeasureUsed(_cloudScanner))
+            : CloudQuotaStatus.NotConfigured;
+
         DateTimeOffset? windowCloses = _windowOpenedUtc is { } opened
             ? (opened + TimeSpan.FromMinutes(_settings.BatchWindowMinutes)).ToLocalTime()
             : null;
@@ -2343,6 +2867,10 @@ public sealed class BackupEngine : IAsyncDisposable
             ZipTempBytes: archives.Sum(a => a.Bytes),
             FreeDiskBytes: disk.FreeBytes,
             CloudTarget: _settings.CloudTarget,
+            CloudQuotaBytes: quota.QuotaBytes,
+            CloudUsedBytes: quota.UsedBytes,
+            CloudFreeBytes: quota.FreeBytes,
+            CloudQuotaWarnBytes: _settings.CloudQuotaWarnBytes,
             LastPackSuccessLocal: _state.LastPackSuccessUtc?.ToLocalTime(),
             LastPackFailureLocal: _state.LastPackFailureUtc?.ToLocalTime(),
             LastPackFailureReason: _state.LastPackFailureReason,

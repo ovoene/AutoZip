@@ -536,6 +536,451 @@ public sealed class SevenZipRealBinaryTests(ITestOutputHelper output) : IDisposa
         }
     }
 
+    // ==================================================================
+    //  归档清单 + 恢复演练：真的解一遍，证明包还能用
+    // ==================================================================
+
+    /// <summary>
+    /// 写一个<b>内容独一无二</b>的文件。
+    ///
+    /// <see cref="TempDir.WriteFile"/> 写全零字节：那样两个不同名的文件只要大小相同，
+    /// SHA-256 就一模一样，"解出来的内容和源文件一致"这类断言在张冠李戴时照样通过。
+    /// 凡是要逐字节比对、要验校验值的地方，一律用这个。
+    /// </summary>
+    private static string WriteUnique(TempDir dir, string name, string marker, int padTo = 0)
+    {
+        string content = marker + "|" + Guid.NewGuid().ToString("N");
+
+        if (padTo > content.Length)
+        {
+            content += new string('填', padTo - content.Length);
+        }
+
+        return dir.WriteText(name, content);
+    }
+
+    /// <summary>在解压结果里按文件名递归找那个文件。</summary>
+    private static string? FindExtracted(string extractRoot, string fileName) =>
+        Directory
+            .EnumerateFiles(extractRoot, fileName, SearchOption.AllDirectories)
+            .FirstOrDefault();
+
+    [Fact]
+    public async Task 打包再解开得到逐字节一致的文件()
+    {
+        // 只会打包不会解包的备份工具，等于从没验证过自己产出的东西还能不能用。
+        // 这里走完整条链路：压进去 → 解出来 → 逐字节比。
+        TempDir source = NewDir("naz-rt-src");
+        TempDir zipTemp = NewDir("naz-rt-out");
+        TempDir extract = NewDir("naz-rt-ext");
+
+        // 内容各不相同 —— 全零内容下面那个 SequenceEqual 会永远成立。
+        List<string> files =
+        [
+            WriteUnique(source, "报表.xlsx", "甲", 3000),
+            WriteUnique(source, "readme.txt", "乙"),
+            WriteUnique(source, "子目录/明细.csv", "丙", 5000),
+        ];
+
+        string output = zipTemp.File("Backup_roundtrip.7z");
+        SevenZipRunner runner = NewRunner(out RecordingLogger log);
+
+        PackResult result = await runner.CreateAsync(
+            new PackRequest(output, files, Password, CompressionLevel: 1, EncryptFileNames: true, PackTimeout),
+            progress: null,
+            CancellationToken.None);
+
+        try
+        {
+            Assert.True(result.Ok, $"压缩失败：{result.Error}");
+
+            ExtractResult extracted = await runner.ExtractAsync(
+                new ExtractRequest(output, extract.Path, Password, PackTimeout, Overwrite: true),
+                null,
+                CancellationToken.None);
+
+            Assert.True(extracted.Ok, $"解压失败：{extracted.Error}");
+            Assert.False(extracted.WrongPassword);
+
+            foreach (string original in files)
+            {
+                string name = Path.GetFileName(original);
+                string? restored = FindExtracted(extract.Path, name);
+
+                Assert.True(restored is not null, $"解压结果里没有 {name}");
+
+                Assert.True(
+                    File.ReadAllBytes(original).SequenceEqual(File.ReadAllBytes(restored!)),
+                    $"{name} 解出来的内容和源文件不一致");
+            }
+        }
+        catch
+        {
+            Dump(log, result, zipTemp);
+            throw;
+        }
+    }
+
+    [Fact]
+    public async Task 用错密码解压必须失败且判定为密码错误()
+    {
+        // 演练的首要目标就是发现"存着的密码打不开包"。
+        // 这个判定错了，那种最要命的故障就会被当成普通解压失败糊弄过去。
+        TempDir source = NewDir("naz-rt-wpsrc");
+        TempDir zipTemp = NewDir("naz-rt-wpout");
+        TempDir extract = NewDir("naz-rt-wpext");
+
+        string a = WriteUnique(source, "机密.dat", "内容", 2048);
+        string output = zipTemp.File("Backup_wrongpw.7z");
+
+        SevenZipRunner runner = NewRunner(out RecordingLogger log);
+
+        PackResult result = await runner.CreateAsync(
+            new PackRequest(output, [a], Password, CompressionLevel: 1, EncryptFileNames: true, PackTimeout),
+            progress: null,
+            CancellationToken.None);
+
+        try
+        {
+            Assert.True(result.Ok, $"压缩失败：{result.Error}");
+
+            ExtractResult bad = await runner.ExtractAsync(
+                new ExtractRequest(output, extract.Path, "这不是那个密码", PackTimeout, Overwrite: true),
+                null,
+                CancellationToken.None);
+
+            Assert.False(bad.Ok, "错密码居然解压成功了");
+            Assert.True(bad.WrongPassword, $"没能判定为密码错误。错误信息：{bad.Error}");
+
+            // 解错了就不该在目标目录里留下任何源文件。
+            Assert.Null(FindExtracted(extract.Path, "机密.dat"));
+
+            // 同一个包用对密码必须解得开 —— 否则上面的失败可能根本不是密码引起的。
+            TempDir good = NewDir("naz-rt-wpgood");
+
+            ExtractResult ok = await runner.ExtractAsync(
+                new ExtractRequest(output, good.Path, Password, PackTimeout, Overwrite: true),
+                null,
+                CancellationToken.None);
+
+            Assert.True(ok.Ok, $"对的密码也解不开：{ok.Error}");
+            Assert.False(ok.WrongPassword);
+            Assert.NotNull(FindExtracted(good.Path, "机密.dat"));
+        }
+        catch
+        {
+            Dump(log, result, zipTemp);
+            throw;
+        }
+    }
+
+    [Fact]
+    public async Task 开启文件名加密后仍能完整还原出原文件名()
+    {
+        // -mhe=on 把文件名表也加密了。要确认这只是"外人看不见"，
+        // 而不是"文件名在往返中丢了 / 变成乱码" —— 后者等于备份不可用。
+        TempDir source = NewDir("naz-rt-mhesrc");
+        TempDir zipTemp = NewDir("naz-rt-mheout");
+        TempDir extract = NewDir("naz-rt-mheext");
+
+        List<string> files =
+        [
+            WriteUnique(source, "中文名字.txt", "甲"),
+            WriteUnique(source, "带 空格 的 名字.dat", "乙"),
+            WriteUnique(source, "日本語とEmoji.dat", "丙"),
+        ];
+
+        string output = zipTemp.File("Backup_mhe.7z");
+        SevenZipRunner runner = NewRunner(out RecordingLogger log);
+
+        PackResult result = await runner.CreateAsync(
+            new PackRequest(output, files, Password, CompressionLevel: 1, EncryptFileNames: true, PackTimeout),
+            progress: null,
+            CancellationToken.None);
+
+        try
+        {
+            Assert.True(result.Ok, $"压缩失败：{result.Error}");
+
+            // 先确认文件名表真的被加密了：不给密码连列都列不出来。
+            Assert.NotEqual(0, await RunSevenZipAsync(runner.ExePath, ["l", "-p错误密码", output]));
+
+            ExtractResult extracted = await runner.ExtractAsync(
+                new ExtractRequest(output, extract.Path, Password, PackTimeout, Overwrite: true),
+                null,
+                CancellationToken.None);
+
+            Assert.True(extracted.Ok, $"解压失败：{extracted.Error}");
+
+            foreach (string original in files)
+            {
+                string name = Path.GetFileName(original);
+                string? restored = FindExtracted(extract.Path, name);
+
+                Assert.True(restored is not null, $"文件名没能还原：{name}");
+
+                // 名字对得上还不够，内容也得是原来那份。
+                Assert.True(
+                    File.ReadAllBytes(original).SequenceEqual(File.ReadAllBytes(restored!)),
+                    $"{name} 内容对不上");
+            }
+        }
+        catch
+        {
+            Dump(log, result, zipTemp);
+            throw;
+        }
+    }
+
+    [Fact]
+    public async Task ListAsync列得出条目_错密码时标记密码错误()
+    {
+        TempDir source = NewDir("naz-rt-lssrc");
+        TempDir zipTemp = NewDir("naz-rt-lsout");
+
+        List<string> files =
+        [
+            WriteUnique(source, "甲.dat", "一", 1024),
+            WriteUnique(source, "乙.dat", "二", 2048),
+            WriteUnique(source, "子目录/丙.dat", "三", 4096),
+        ];
+
+        string output = zipTemp.File("Backup_list.7z");
+        SevenZipRunner runner = NewRunner(out RecordingLogger log);
+
+        PackResult result = await runner.CreateAsync(
+            new PackRequest(output, files, Password, CompressionLevel: 1, EncryptFileNames: true, PackTimeout),
+            progress: null,
+            CancellationToken.None);
+
+        try
+        {
+            Assert.True(result.Ok, $"压缩失败：{result.Error}");
+
+            ArchiveListing listing = await runner.ListAsync(
+                output, Password, PackTimeout, CancellationToken.None);
+
+            Assert.True(listing.Ok, $"列出失败：{listing.Error}");
+            Assert.False(listing.WrongPassword);
+            Assert.False(listing.Truncated);
+
+            // 三个源文件都在（目录条目不算）。
+            Assert.Equal(3, listing.FileCount);
+
+            foreach (string original in files)
+            {
+                string name = Path.GetFileName(original);
+
+                Assert.Contains(
+                    listing.Entries,
+                    e => !e.IsDirectory
+                         && Path.GetFileName(e.Path).Equals(name, StringComparison.OrdinalIgnoreCase));
+            }
+
+            // 大小要如实报出来，而不是全 0。
+            Assert.Equal(
+                files.Sum(f => new FileInfo(f).Length),
+                listing.Entries.Where(e => !e.IsDirectory).Sum(e => e.Size));
+
+            Assert.True(listing.TotalBytes > 0);
+
+            // 错密码：-mhe=on 下连文件名表都读不了，必须明确标出是密码问题。
+            ArchiveListing bad = await runner.ListAsync(
+                output, "这不是那个密码", PackTimeout, CancellationToken.None);
+
+            Assert.False(bad.Ok, "错密码居然列出成功了");
+            Assert.True(bad.WrongPassword, $"没能判定为密码错误。错误信息：{bad.Error}");
+            Assert.Empty(bad.Entries);
+        }
+        catch
+        {
+            Dump(log, result, zipTemp);
+            throw;
+        }
+    }
+
+    [Fact]
+    public async Task 恢复演练全过_并且自己把演练目录清干净()
+    {
+        // 演练要解出一份和源文件等大的副本，是这个程序单次占用磁盘最多的操作。
+        // 它的 finally 必须无条件清理 —— 失败分支不清理正是这个项目最惨痛的教训。
+        TempDir source = NewDir("naz-drill-src");
+        TempDir zipTemp = NewDir("naz-drill-out");
+
+        List<string> files =
+        [
+            WriteUnique(source, "甲.dat", "一", 4096),
+            WriteUnique(source, "乙.dat", "二", 4096),
+            WriteUnique(source, "子目录/丙.dat", "三", 4096),
+        ];
+
+        string output = zipTemp.File("Backup_drill.7z");
+        SevenZipRunner runner = NewRunner(out RecordingLogger log);
+
+        // 包内清单随包一起压进去，演练才有得比对。
+        ArchiveManifestDocument doc = await ArchiveManifest.BuildAsync(
+            files, source.Path, "Backup_drill.7z",
+            new DateTimeOffset(2026, 9, 1, 12, 0, 0, TimeSpan.Zero),
+            new NewAutoZip.Core.Configuration.AppSettings(), log, CancellationToken.None);
+
+        string manifestPath = Path.Combine(zipTemp.Path, ArchiveManifest.EntryName);
+        ArchiveManifest.WriteInnerManifest(manifestPath, doc);
+
+        PackResult result = await runner.CreateAsync(
+            new PackRequest(output, files, Password, CompressionLevel: 1, EncryptFileNames: true, PackTimeout)
+            {
+                ExtraFiles = [manifestPath],
+            },
+            progress: null,
+            CancellationToken.None);
+
+        try
+        {
+            Assert.True(result.Ok, $"压缩失败：{result.Error}");
+
+            RestoreDrillService drill = new(runner, log);
+
+            DrillResult outcome = await drill.RunAsync(
+                output, Password, zipTemp.Path, PackTimeout, minFreeBytes: 0, CancellationToken.None);
+
+            Assert.True(outcome.Ok, $"演练没通过：{outcome.Outcome} / {outcome.Message}");
+            Assert.Equal(DrillOutcome.Passed, outcome.Outcome);
+            Assert.False(outcome.IsProblem);
+
+            // 真的逐条比对过，而不是解开就算数。
+            Assert.Equal(3, outcome.Checked);
+            Assert.Equal(0, outcome.Mismatched);
+            Assert.Equal(0, outcome.Missing);
+
+            // 演练自己的 finally 必须把 __drill_* 收干净 —— 不能等清扫来兜底。
+            Assert.Empty(Directory.GetDirectories(
+                zipTemp.Path, RestoreDrillService.DrillDirectoryPrefix + "*"));
+
+            // 正经归档一根汗毛都不能动。
+            Assert.True(File.Exists(output), "演练把归档本身弄没了");
+        }
+        catch
+        {
+            Dump(log, result, zipTemp);
+            throw;
+        }
+    }
+
+    [Fact]
+    public async Task 演练用错密码判定为密码错误_目录照样清干净()
+    {
+        // 最要命的那种故障：settings.json 里的密码已经打不开三天前的包了。
+        // 演练存在的首要理由就是在"真要恢复那天"之前把它抓出来。
+        TempDir source = NewDir("naz-drill-wpsrc");
+        TempDir zipTemp = NewDir("naz-drill-wpout");
+
+        string a = WriteUnique(source, "甲.dat", "一", 4096);
+        string output = zipTemp.File("Backup_drillwp.7z");
+
+        SevenZipRunner runner = NewRunner(out RecordingLogger log);
+
+        PackResult result = await runner.CreateAsync(
+            new PackRequest(output, [a], Password, CompressionLevel: 1, EncryptFileNames: true, PackTimeout),
+            progress: null,
+            CancellationToken.None);
+
+        try
+        {
+            Assert.True(result.Ok, $"压缩失败：{result.Error}");
+
+            RestoreDrillService drill = new(runner, log);
+
+            DrillResult outcome = await drill.RunAsync(
+                output, "这不是那个密码", zipTemp.Path, PackTimeout, minFreeBytes: 0, CancellationToken.None);
+
+            Assert.Equal(DrillOutcome.WrongPassword, outcome.Outcome);
+            Assert.True(outcome.IsProblem, "密码打不开包却没被算作问题");
+            Assert.False(outcome.Ok);
+
+            // 失败路径同样要清干净 —— 这正是"失败分支不清理导致磁盘填满"的翻版。
+            Assert.Empty(Directory.GetDirectories(
+                zipTemp.Path, RestoreDrillService.DrillDirectoryPrefix + "*"));
+
+            Assert.True(File.Exists(output), "演练失败时把归档删了");
+        }
+        catch
+        {
+            Dump(log, result, zipTemp);
+            throw;
+        }
+    }
+
+    [Fact]
+    public async Task 演练遇到损坏的包判失败_目录照样清干净()
+    {
+        TempDir zipTemp = NewDir("naz-drill-badout");
+
+        // 一个彻头彻尾不是 7z 的文件。
+        string output = zipTemp.WriteText("Backup_corrupt.7z", "这根本不是一个压缩包，只是一段文字。");
+
+        SevenZipRunner runner = NewRunner(out RecordingLogger log);
+        RestoreDrillService drill = new(runner, log);
+
+        DrillResult outcome = await drill.RunAsync(
+            output, Password, zipTemp.Path, PackTimeout, minFreeBytes: 0, CancellationToken.None);
+
+        Assert.Equal(DrillOutcome.Failed, outcome.Outcome);
+        Assert.True(outcome.IsProblem);
+
+        Assert.Empty(Directory.GetDirectories(
+            zipTemp.Path, RestoreDrillService.DrillDirectoryPrefix + "*"));
+    }
+
+    [Fact]
+    public async Task 演练云端目录里的包_复制进来验完再清干净()
+    {
+        // 云盘里的包不能就地解压（那是人家的同步目录），要先复制到 ZipTemp。
+        // 复制品必须落在 __drill_* 里面：放 ZipTemp 根部会被 ListArchives 当成正经归档，
+        // 配额可能在演练跑到一半时把它删掉。
+        TempDir source = NewDir("naz-drill-cloudsrc");
+        TempDir zipTemp = NewDir("naz-drill-cloudwork");
+        TempDir cloud = NewDir("naz-drill-cloud");
+
+        List<string> files =
+        [
+            WriteUnique(source, "甲.dat", "一", 4096),
+            WriteUnique(source, "乙.dat", "二", 4096),
+        ];
+
+        string output = cloud.File("Backup_cloud.7z");
+        SevenZipRunner runner = NewRunner(out RecordingLogger log);
+
+        PackResult result = await runner.CreateAsync(
+            new PackRequest(output, files, Password, CompressionLevel: 1, EncryptFileNames: true, PackTimeout),
+            progress: null,
+            CancellationToken.None);
+
+        try
+        {
+            Assert.True(result.Ok, $"压缩失败：{result.Error}");
+
+            RestoreDrillService drill = new(runner, log);
+
+            DrillResult outcome = await drill.RunAsync(
+                output, Password, zipTemp.Path, PackTimeout, minFreeBytes: 0, CancellationToken.None);
+
+            Assert.True(outcome.Ok, $"演练没通过：{outcome.Outcome} / {outcome.Message}");
+
+            // 工作目录里不能留下任何东西 —— 尤其不能留下那份复制进来的包。
+            Assert.Empty(Directory.GetDirectories(
+                zipTemp.Path, RestoreDrillService.DrillDirectoryPrefix + "*"));
+            Assert.Empty(zipTemp.Files("*.7z"));
+
+            // 云盘里那个原包一动不动。
+            Assert.True(File.Exists(output), "演练动了云盘里的包");
+        }
+        catch
+        {
+            Dump(log, result, zipTemp);
+            throw;
+        }
+    }
+
     /// <summary>直接跑一次 7za 拿退出码，用来独立验证归档（不经过被测代码）。</summary>
     private static async Task<int> RunSevenZipAsync(string exe, IReadOnlyList<string> args)
     {

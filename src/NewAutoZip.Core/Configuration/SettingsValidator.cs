@@ -73,9 +73,48 @@ public static class SettingsValidator
         ValidateSevenZip(sevenZipExePath, issues);
         ValidateNotifications(settings, issues);
         ValidateQuotaAndDisk(settings, issues);
+        ValidateCloudQuota(settings, issues);
         ValidateTiming(settings, issues);
+        ValidateDrill(settings, issues);
 
         return new ValidationReport(issues);
+    }
+
+    /// <summary>
+    /// 恢复演练相关。
+    ///
+    /// <b>全部只发提醒，一条都不拦启动。</b>演练是备份之上的一层保障，
+    /// 配得不理想顶多是"保障弱一点"，而拦下启动意味着连备份本身都不做了 ——
+    /// 那是拿更大的风险去换更小的风险。
+    /// </summary>
+    private static void ValidateDrill(AppSettings settings, List<ValidationIssue> issues)
+    {
+        // 两种演练都关掉 = 回到"从没验证过自己产出的包还能不能用"的状态。
+        // 这是默认配置下不会出现的（VerifyAfterPackByExtract 默认开），所以说一句是有意义的。
+        if (!settings.VerifyAfterPackByExtract && !settings.CloudDrillEnabled)
+        {
+            issues.Add(new ValidationIssue(IssueSeverity.Warning, nameof(settings.VerifyAfterPackByExtract),
+                "两种恢复演练都关着。压缩包会照常产出，但程序不会再验证“存着的密码解不解得开它”——" +
+                "密码写坏、改错或 DPAPI 失效，要等你真正需要恢复的那天才会发现。"));
+        }
+
+        // 关了清单，逐文件核对就没有账本可比。演练仍能验出"密码打不开 / 包坏了"，
+        // 但验不出"内容变了"。
+        if (!settings.WriteArchiveManifest && (settings.VerifyAfterPackByExtract || settings.CloudDrillEnabled))
+        {
+            issues.Add(new ValidationIssue(IssueSeverity.Warning, nameof(settings.WriteArchiveManifest),
+                "开了恢复演练但关了归档清单。演练仍能验出“密码打不开”和“包损坏”，" +
+                "但没有清单就无法逐文件核对内容是否与打包时一致。"));
+        }
+
+        // 云端演练比本地演练贵得多（要把包重新下载回来），周期设得太密只会持续烧流量。
+        if (settings.CloudDrillEnabled && settings.CloudDrillIntervalHours < 24)
+        {
+            issues.Add(new ValidationIssue(IssueSeverity.Warning, nameof(settings.CloudDrillIntervalHours),
+                $"云端演练间隔只有 {settings.CloudDrillIntervalHours} 小时。" +
+                "云端的包多半已脱水，每次演练都要把它重新下载回本地 —— " +
+                "按流量计费的线路上这会是一笔持续开销。建议至少 24 小时。"));
+        }
     }
 
     /// <summary>
@@ -418,6 +457,59 @@ public static class SettingsValidator
         {
             issues.Add(new ValidationIssue(IssueSeverity.Warning, nameof(settings.MinFreeDiskBytes),
                 "最低保留空间设为 0，等于关闭打包前的磁盘预检。磁盘可能被压缩包填满。"));
+        }
+    }
+
+    /// <summary>
+    /// 云盘/目标目录的容量预算。
+    ///
+    /// 独立成一个方法而不是并进 <see cref="ValidateQuotaAndDisk"/>：那里在
+    /// "读不到临时目录所在卷"时会直接 return，而容量预算跟临时目录所在的卷毫无关系，
+    /// 不该被那条早退顺手关掉。
+    ///
+    /// <b>全部以"用户填了非 0 值"为前提</b>：这两项默认都是 0（= 不启用），
+    /// 默认配置下这里一条都不该触发。
+    /// </summary>
+    private static void ValidateCloudQuota(AppSettings settings, List<ValidationIssue> issues)
+    {
+        long quota = settings.CloudQuotaBytes;
+        long warn = settings.CloudQuotaWarnBytes;
+
+        if (quota <= 0)
+        {
+            // 只填了警戒线、没填总容量：剩余量无从算起，这条警戒线永远不会触发。
+            if (warn > 0)
+            {
+                issues.Add(new ValidationIssue(IssueSeverity.Warning, nameof(settings.CloudQuotaWarnBytes),
+                    $"填了警戒容量 {ByteSize.Format(warn)}，但没有填总容量上限。" +
+                    "剩余空间无从计算，这条警戒线不会起作用。"));
+            }
+
+            return;
+        }
+
+        if (warn >= quota)
+        {
+            issues.Add(new ValidationIssue(IssueSeverity.Error, nameof(settings.CloudQuotaWarnBytes),
+                $"警戒容量 {ByteSize.Format(warn)} 不低于总容量上限 {ByteSize.Format(quota)}。" +
+                "这样一来剩余量从一开始就在警戒线之下，每一轮都会收到告警。请把警戒线调小。"));
+        }
+
+        // 普通目录才做这一条：OneDrive 的包会脱水，本地卷的大小和云端配额没有关系，
+        // 拿本地磁盘去质疑用户填的云盘容量是错的。
+        if (settings.CloudTarget != CloudTarget.Folder || string.IsNullOrWhiteSpace(settings.CloudPath))
+        {
+            return;
+        }
+
+        DiskSpaceInfo space = DiskSpace.Query(settings.CloudPath);
+
+        if (space.Known && quota > space.TotalBytes)
+        {
+            issues.Add(new ValidationIssue(IssueSeverity.Warning, nameof(settings.CloudQuotaBytes),
+                $"目标目录容量上限 {ByteSize.Format(quota)} " +
+                $"超过该卷的总容量 {ByteSize.Format(space.TotalBytes)}，这条预算起不到保护作用。" +
+                "实际能放多少仍以磁盘真实剩余空间为准。"));
         }
     }
 

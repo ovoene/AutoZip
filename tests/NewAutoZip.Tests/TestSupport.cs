@@ -65,6 +65,22 @@ internal sealed class TempDir : IDisposable
         return full;
     }
 
+    /// <summary>
+    /// 写一个<b>有指定内容</b>的文件（UTF-8 无 BOM），返回完整路径。
+    ///
+    /// <see cref="WriteFile"/> 写的是全零字节：两个不同名的文件只要大小相同，
+    /// SHA-256 就完全一样。凡是要验"校验值对不对得上""内容有没有变"的测试，
+    /// 用它就等于没测 —— 那种断言在哈希算错、甚至张冠李戴时照样通过。
+    /// 所以涉及校验值与内容比对的场景一律用这个方法，给每个文件不同的内容。
+    /// </summary>
+    public string WriteText(string name, string content)
+    {
+        string full = File(name);
+        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(full)!);
+        System.IO.File.WriteAllText(full, content, new System.Text.UTF8Encoding(false));
+        return full;
+    }
+
     public string Sub(string name)
     {
         string full = File(name);

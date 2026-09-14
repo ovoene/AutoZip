@@ -95,6 +95,21 @@ public static class NotifyTag
 
     public const string ScheduleClosed = "收工";
     public const string Failure = "失败";
+
+    /// <summary>
+    /// 【演练】恢复演练的结论 —— 主要是失败的那些。
+    ///
+    /// 借用 <see cref="NotifyEvent.Failure"/> 那一位，<b>不新增枚举位</b>：
+    /// 一来演练失败本来就属于"出问题了"，订阅了 <see cref="NotifyEvent.ProblemsOnly"/> 的人
+    /// 要的正是这条；二来这个枚举按<i>名字</i>序列化，加成员要连着改 <c>All</c>、
+    /// 改设置页的勾选项，而收益只是让人多勾一个框。
+    ///
+    /// 但<b>用词必须和"失败"分开</b>：备份失败是"这次没备份成"，
+    /// 演练失败是"以前备份的那些可能恢复不了"——后者要紧得多，也更急，
+    /// 混成同一个词会让人按处理前者的习惯去忽略它。
+    /// </summary>
+    public const string Drill = "演练";
+
     public const string Quarantined = "隔离";
     public const string Disk = "磁盘";
     public const string EngineStopped = "停止";

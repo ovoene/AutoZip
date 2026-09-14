@@ -89,10 +89,11 @@ public static class PipelineStepMap
     /// <summary>
     /// 当前阶段对应第几步，-1 表示「没有任何一步在跑」。
     ///
-    /// <see cref="EnginePhase.Retrying"/> 与 <see cref="EnginePhase.OutsideSchedule"/>
-    /// 故意映射成 -1：它们都不是流水线上的一步。前者是「上一批失败了，正在等下一次尝试」，
-    /// 后者是「压根不在工作时段，什么都没在看」—— 把「正在进行」挂到某一步上就是在撒谎。
-    /// 这两种情况由 <see cref="Note"/> 出面解释，所以有下标就没有说明、有说明就没有下标，
+    /// <see cref="EnginePhase.Retrying"/>、<see cref="EnginePhase.OutsideSchedule"/>
+    /// 与 <see cref="EnginePhase.Drilling"/> 故意映射成 -1：它们都不是流水线上的一步。
+    /// 第一个是「上一批失败了，正在等下一次尝试」，第二个是「压根不在工作时段，什么都没在看」，
+    /// 第三个是「在验一个<b>已经打完</b>的包」—— 把「正在进行」挂到某一步上就是在撒谎。
+    /// 这几种情况由 <see cref="Note"/> 出面解释，所以有下标就没有说明、有说明就没有下标，
     /// 两者恰好互补（自检会把这条互补关系钉住）。
     /// </summary>
     public static int ActiveIndex(EnginePhase phase) => phase switch
@@ -113,6 +114,14 @@ public static class PipelineStepMap
         EnginePhase.Stopping => "正在停止，等当前动作收尾。",
         EnginePhase.Retrying => "上一批失败了，正在按退避间隔等待重试。",
         EnginePhase.OutsideSchedule => "不在工作时段，到点自动开始。",
+
+        // 演练<b>不是</b>流水线上的一步，所以走说明而不是点亮某一步：
+        // 抽验已有的包这件事发生在流水线空闲的时候，和当前这一批文件没有关系；
+        // 就算是打完包顺手验的那次，包也已经打完了，点亮「正在打包」是在撒谎。
+        //
+        // 措辞不提"云盘"：这个阶段两种 CloudTarget 模式下都会出现（见 EnginePhase 的注释）。
+        EnginePhase.Drilling => "正在做恢复演练：把已有的压缩包解开核对一遍，验完立即删除。",
+
         _ => string.Empty,
     };
 }

@@ -235,7 +235,7 @@
 
             <!--
                 用 ListBox 而不是 ui:NavigationView：后者需要页面提供器与依赖注入，
-                在这个只有 5 个页面的程序里是纯粹的复杂度。
+                在这个只有 6 个页面的程序里是纯粹的复杂度。
             -->
             <ListBox x:Name="NavRail"
                      Grid.Column="0"
@@ -309,11 +309,25 @@
                                    Visibility="{Binding Settings.IsDirty, Converter={StaticResource BoolVisibility}}" />
                     </StackPanel>
                 </ListBoxItem>
+
+                <!--
+                    恢复页必须排在设置页<b>之后</b>。程序里有好几处按索引写死的页号
+                    （MainViewModel 的 LogPageIndex / RestorePageIndex、自检的遍历上限），
+                    往中间插一页会让它们全部指错页。
+                -->
+                <ListBoxItem>
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Width="24"
+                                   FontFamily="{StaticResource IconFont}"
+                                   Text="&#xE777;" />
+                        <TextBlock Text="恢复" />
+                    </StackPanel>
+                </ListBoxItem>
             </ListBox>
 
             <!--
-                5 个页面同时存在、靠 Visibility 切换。
-                好处是切页不重建控件、滚动位置与选中行都留着；代价是常驻 5 份可视树，
+                6 个页面同时存在、靠 Visibility 切换。
+                好处是切页不重建控件、滚动位置与选中行都留着；代价是常驻 6 份可视树，
                 在这个规模下完全可以接受。
             -->
             <Grid Grid.Column="1">
@@ -322,6 +336,7 @@
                 <views:QuarantinePage Visibility="{Binding SelectedPage, Converter={StaticResource IndexVisibility}, ConverterParameter=2}" />
                 <views:LogPage Visibility="{Binding SelectedPage, Converter={StaticResource IndexVisibility}, ConverterParameter=3}" />
                 <views:SettingsPage Visibility="{Binding SelectedPage, Converter={StaticResource IndexVisibility}, ConverterParameter=4}" />
+                <views:RestorePage Visibility="{Binding SelectedPage, Converter={StaticResource IndexVisibility}, ConverterParameter=5}" />
             </Grid>
         </Grid>
 

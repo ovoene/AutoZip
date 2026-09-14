@@ -53,6 +53,17 @@ public static class SettingsLimits
     public const long MinFreeDiskBytesMin = 0;
     public const long MinFreeDiskBytesMax = 4L * 1024 * 1024 * 1024 * 1024;
 
+    /// <summary>
+    /// 云盘/目标目录的容量预算。上限放到 1 PB —— 云盘是按 TB 卖的，
+    /// 沿用 4 TB 那条线会让填了 5 TB 的用户被悄悄夹回去。
+    /// 下限必须是 0：0 表示"不限制"，是这个功能的关闭开关。
+    /// </summary>
+    public const long CloudQuotaBytesMin = 0;
+    public const long CloudQuotaBytesMax = 1024L * 1024 * 1024 * 1024 * 1024;
+
+    public const long CloudQuotaWarnBytesMin = 0;
+    public const long CloudQuotaWarnBytesMax = 1024L * 1024 * 1024 * 1024 * 1024;
+
     public const int MaxAttemptsBeforeQuarantineMin = 1;
     public const int MaxAttemptsBeforeQuarantineMax = 100;
 
@@ -61,6 +72,22 @@ public static class SettingsLimits
 
     public const int UploadPollSecondsMin = 2;
     public const int UploadPollSecondsMax = 600;
+
+    /// <summary>
+    /// 云端恢复演练的间隔（小时）。1 小时 – 8760 小时（一年）。
+    ///
+    /// 不写死是有道理的：这个周期该多长完全取决于备份的价值和带宽成本 ——
+    /// 每天出一个包的机器和每月出一个包的机器，合理周期差一个数量级；
+    /// 而云端演练要把包重新下载回来，按流量计费的线路上一周一次都嫌频繁。
+    /// 下限 1 小时而不是更小：演练要解出一份和源文件等大的副本，
+    /// 比这更密集就会一直在跟备份主流程抢磁盘和 IO。
+    /// </summary>
+    public const int CloudDrillIntervalHoursMin = 1;
+    public const int CloudDrillIntervalHoursMax = 8760;
+
+    /// <summary>单次演练的总时限。与打包超时同量级。</summary>
+    public const int DrillTimeoutMinutesMin = 1;
+    public const int DrillTimeoutMinutesMax = 1440;
 
     /// <summary>背景图模糊半径。0 = 不模糊；上限 60，再大只是更慢，看上去已经是一片色块。</summary>
     public const int BackgroundBlurMin = 0;
@@ -180,6 +207,40 @@ public sealed class AppSettings
 
     public string ArchivePrefix { get; set; } = "Backup";
 
+    // ==================== 恢复演练与清单 ====================
+
+    /// <summary>
+    /// 为每个压缩包产出清单：明文旁挂的 <c>.manifest.json</c>（只有校验元数据，<b>不含文件名</b>）
+    /// + 打进包内、随 AES-256 加密的逐文件明细。见 <see cref="Packing.ArchiveManifest"/>。
+    /// </summary>
+    public bool WriteArchiveManifest { get; set; } = true;
+
+    /// <summary>
+    /// 打包成功后，就地对刚产出的包做一次<b>完整恢复演练</b>（真解开、逐条核对），
+    /// 通过了才投递。默认开。
+    ///
+    /// 与打包内部那次 <c>7za t</c> 不是一回事：那一次只解码不落盘，
+    /// 而且用的是内存里刚拿来打包的密码。这一次解到磁盘上，
+    /// 并且用<b>从 settings.json 重新读出来的密码</b> —— 验的就是"存下来的那个还好不好用"。
+    ///
+    /// 代价是要临时占用与源文件相当的磁盘空间，并让本轮多花一段时间。
+    /// 空间不够时会自动跳过并告警，绝不会把磁盘写满。
+    /// </summary>
+    public bool VerifyAfterPackByExtract { get; set; } = true;
+
+    /// <summary>
+    /// 定期抽一个<b>云端</b>的包做恢复演练。默认<b>关</b>——
+    /// OneDrive 上的包多半已经脱水，读它会触发重新下载，产生真实流量。
+    /// 想验"传上去之后有没有坏"就打开它。
+    /// </summary>
+    public bool CloudDrillEnabled { get; set; }
+
+    /// <summary>云端演练的间隔（小时）。默认 168 = 7 天。用户可改，见 <see cref="SettingsLimits"/>。</summary>
+    public int CloudDrillIntervalHours { get; set; } = 168;
+
+    /// <summary>单次演练的总时限（分钟）。</summary>
+    public int DrillTimeoutMinutes { get; set; } = 60;
+
     // ==================== 配额与磁盘 ====================
 
     public int ZipTempKeepDays { get; set; } = 3;
@@ -192,6 +253,32 @@ public sealed class AppSettings
 
     /// <summary>打包前要求卷上至少剩余这么多空间，否则拒绝打包并告警。</summary>
     public long MinFreeDiskBytes { get; set; } = 10L * 1024 * 1024 * 1024;
+
+    // ==================== 云盘容量预算 ====================
+    //
+    // OneDrive 的真实配额读不到 —— 那个数字从不落盘，OneDrive.exe 用自己的令牌
+    // 问服务端并只留在内存里（注册表、settings 数据库、按字节对齐搜都落空过）。
+    // 所以这里让用户自己填，程序按目录里实际存在的包动态算已用量。
+    //
+    // 两个默认值都是 0，这是新增字段遇上老 settings.json 的唯一安全默认：
+    // 反序列化拿到 0 就等于"没启用"，老用户升级后行为完全不变。
+
+    /// <summary>
+    /// 云盘/目标目录的总容量预算。<b>0 = 不限制</b>，整套容量检查直接跳过。
+    ///
+    /// 存字节而不是"数值 + 单位"两个字段：单位只是界面上的显示方式，
+    /// 存进来两个字段会让每个读它的地方都要先做一次换算，迟早有人漏掉。
+    /// </summary>
+    public long CloudQuotaBytes { get; set; }
+
+    /// <summary>
+    /// 剩余容量低于这个数就告警。<b>0 = 不告警</b>。
+    ///
+    /// 与 <see cref="CloudQuotaBytes"/> 分开的理由：一个是"总共有多少"，
+    /// 一个是"剩多少就该管了"。后者通常远小于前者，合成一个百分比反而难填 ——
+    /// 1 TB 的 5% 是多少，没人愿意在设置界面上心算。
+    /// </summary>
+    public long CloudQuotaWarnBytes { get; set; }
 
     // ==================== 失败处理 ====================
 
@@ -278,9 +365,13 @@ public sealed class AppSettings
         ZipTempMaxCount = Math.Clamp(ZipTempMaxCount, SettingsLimits.ZipTempMaxCountMin, SettingsLimits.ZipTempMaxCountMax);
         ZipTempMaxTotalBytes = Math.Clamp(ZipTempMaxTotalBytes, SettingsLimits.ZipTempMaxTotalBytesMin, SettingsLimits.ZipTempMaxTotalBytesMax);
         MinFreeDiskBytes = Math.Clamp(MinFreeDiskBytes, SettingsLimits.MinFreeDiskBytesMin, SettingsLimits.MinFreeDiskBytesMax);
+        CloudQuotaBytes = Math.Clamp(CloudQuotaBytes, SettingsLimits.CloudQuotaBytesMin, SettingsLimits.CloudQuotaBytesMax);
+        CloudQuotaWarnBytes = Math.Clamp(CloudQuotaWarnBytes, SettingsLimits.CloudQuotaWarnBytesMin, SettingsLimits.CloudQuotaWarnBytesMax);
         MaxAttemptsBeforeQuarantine = Math.Clamp(MaxAttemptsBeforeQuarantine, SettingsLimits.MaxAttemptsBeforeQuarantineMin, SettingsLimits.MaxAttemptsBeforeQuarantineMax);
         UploadTimeoutMinutes = Math.Clamp(UploadTimeoutMinutes, SettingsLimits.UploadTimeoutMinutesMin, SettingsLimits.UploadTimeoutMinutesMax);
         UploadPollSeconds = Math.Clamp(UploadPollSeconds, SettingsLimits.UploadPollSecondsMin, SettingsLimits.UploadPollSecondsMax);
+        CloudDrillIntervalHours = Math.Clamp(CloudDrillIntervalHours, SettingsLimits.CloudDrillIntervalHoursMin, SettingsLimits.CloudDrillIntervalHoursMax);
+        DrillTimeoutMinutes = Math.Clamp(DrillTimeoutMinutes, SettingsLimits.DrillTimeoutMinutesMin, SettingsLimits.DrillTimeoutMinutesMax);
 
         if (string.IsNullOrWhiteSpace(ArchivePrefix))
         {

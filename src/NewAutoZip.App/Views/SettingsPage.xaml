@@ -51,9 +51,11 @@
                             <ui:Button Margin="8,0,0,0" Appearance="Primary" Click="OnBrowseCloud" Content="浏览…" />
                         </StackPanel>
 
-                        <!-- 本机注册表里发现的账号，一键填入，免得手抄路径抄错。非 OneDrive 模式下这一行没有意义 -->
+                        <!-- 本机注册表里发现的账号，一键填入，免得手抄路径抄错。
+                             只在 OneDrive 模式且确实枚举到账号时才出现 —— 换成其他云盘后，
+                             填入的仍是 OneDrive 路径，对那条分支没有意义（见 ShowOneDriveAccounts）。 -->
                         <StackPanel Style="{StaticResource FieldRow}"
-                                    Visibility="{Binding OneDriveAccounts.Count, Converter={StaticResource HasContent}}">
+                                    Visibility="{Binding ShowOneDriveAccounts, Converter={StaticResource BoolVisibility}}">
                             <TextBlock Style="{StaticResource FieldLabel}" Text="本机发现的账号" />
                             <ComboBox x:Name="AccountPicker"
                                       Width="440"
@@ -344,6 +346,50 @@
                         <TextBlock Style="{StaticResource Hint}"
                                    Text="打包前先预检：预计体积放不下、或卷剩余低于这个值，就直接拒绝打包并发告警，一个文件都不产生。填 0 等于关掉预检。" />
 
+                        <!-- 云盘/目标目录容量预算。
+                             OneDrive 的真实配额读不到（那个数字从不落盘），所以由用户自己填。
+                             数值与单位分开两个控件，配置里仍然只存一个字节数。 -->
+                        <Separator Margin="0,14,0,12" />
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="云盘/目标总容量" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="1024"
+                                          Minimum="0"
+                                          SmallChange="1"
+                                          LargeChange="10"
+                                          MaxDecimalPlaces="2"
+                                          Value="{Binding CloudQuotaValue, Mode=TwoWay}" />
+                            <ComboBox Width="90"
+                                      Margin="8,0,0,0"
+                                      DisplayMemberPath="Text"
+                                      ItemsSource="{Binding ByteUnits}"
+                                      SelectedItem="{Binding CloudQuotaUnit, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <StackPanel Style="{StaticResource FieldRow}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="警戒最低容量" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="1024"
+                                          Minimum="0"
+                                          SmallChange="1"
+                                          LargeChange="10"
+                                          MaxDecimalPlaces="2"
+                                          Value="{Binding CloudQuotaWarnValue, Mode=TwoWay}" />
+                            <ComboBox Width="90"
+                                      Margin="8,0,0,0"
+                                      DisplayMemberPath="Text"
+                                      ItemsSource="{Binding ByteUnits}"
+                                      SelectedItem="{Binding CloudQuotaWarnUnit, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="{Binding CloudQuotaHint}" />
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Margin="0,6,0,0"
+                                   Text="已用量按目标目录里实际存在的包实时算，手动删包后数字会自己回落。程序永远不会替你删云盘里的备份，只会在放不下时拒绝打包。" />
+
                         <StackPanel Style="{StaticResource FieldRow}" Margin="0,12,0,0">
                             <TextBlock Style="{StaticResource FieldLabel}" Text="失败几次后隔离" />
                             <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
@@ -356,6 +402,67 @@
 
                         <TextBlock Style="{StaticResource Hint}"
                                    Text="同一批文件连续失败达到这个次数后进入隔离，程序停止重试并发出醒目通知。这是最后一道闸门：任何情况下一个批次都不可能无限重试。" />
+                    </StackPanel>
+                </ui:Card>
+
+                <!-- ==================================================
+                     恢复演练 —— 「没试过恢复的备份不算备份」这句话的落地处。
+                     放在配额后面是因为它和配额抢同一块临时空间：
+                     演练要把包真解出来，峰值占用比打包还高。
+                ================================================== -->
+                <ui:Card Margin="0,0,0,12">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource GroupTitle}" Text="恢复演练" />
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Margin="0,0,0,10"
+                                   Text="备份的价值只有在恢复成功时才兑现。这一组让程序自己定期把包解开核对一遍，不必等到真出事那天才发现解不开。" />
+
+                        <CheckBox Content="每个包旁边附一份清单文件"
+                                  IsChecked="{Binding WriteArchiveManifest}" />
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="明文的 .7z.manifest.json，跟着包一起进云盘。里面只有条目数、字节数和校验值，不含任何文件名 —— 文件名在包里是加密的，清单不会把它泄出去。" />
+
+                        <CheckBox Margin="0,12,0,0"
+                                  Content="打包后立即解压验证一次"
+                                  IsChecked="{Binding VerifyAfterPackByExtract}" />
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="比常规完整性校验更彻底：真解一遍并逐条比对清单，能发现“包是好的，但少压进去几个文件”这种校验查不出的问题。验不过就不投递。" />
+
+                        <CheckBox Margin="0,12,0,0"
+                                  Content="定期抽查已备份的包"
+                                  IsChecked="{Binding CloudDrillEnabled}" />
+
+                        <StackPanel Style="{StaticResource FieldRow}"
+                                    Margin="0,10,0,0"
+                                    Visibility="{Binding CloudDrillEnabled, Converter={StaticResource BoolVisibility}}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="抽查间隔（小时）" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="8760"
+                                          Minimum="1"
+                                          SmallChange="24"
+                                          LargeChange="168"
+                                          MaxDecimalPlaces="0"
+                                          Value="{Binding CloudDrillIntervalHours, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}" Text="{Binding DrillHint}" />
+
+                        <StackPanel Style="{StaticResource FieldRow}" Margin="0,12,0,0">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="演练超时（分钟）" />
+                            <ui:NumberBox Width="{StaticResource NumberBoxWidth}"
+                                          Maximum="1440"
+                                          Minimum="1"
+                                          SmallChange="10"
+                                          LargeChange="60"
+                                          MaxDecimalPlaces="0"
+                                          Value="{Binding DrillTimeoutMinutes, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="超时就结束这次演练并记一笔，不影响备份本身。演练解出来的临时文件无论成败都会立即删除。" />
                     </StackPanel>
                 </ui:Card>
 
@@ -670,6 +777,45 @@
 
                         <TextBlock Style="{StaticResource Hint}"
                                    Text="以上三项都是选完立刻生效、立刻记住，不用点下面的“保存配置”。" />
+                    </StackPanel>
+                </ui:Card>
+
+                <!-- ==================================================
+                     数据维护 —— 放最底下，和上面的配置项拉开距离。
+                     这里的按钮是真的会删东西，不该和"填个数字"混在一起。
+
+                     命令挂在 MainViewModel 上（它才有 EngineHost），
+                     而这一整块的 DataContext 是 SettingsViewModel，
+                     所以沿用第 649 行那个 AncestorType=UserControl 的写法往上取。
+                ================================================== -->
+                <ui:Card Margin="0,0,0,12">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource GroupTitle}" Text="数据维护" />
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Margin="0,0,0,10"
+                                   Text="把程序的“账本”整体复位成从未运行过的样子：累计统计、各类时间戳、增量水位线、待上传与隔离记录全部归零。压缩包一个都不会被删除，设置也不受影响。" />
+
+                        <CheckBox Margin="0,0,0,10"
+                                  Content="同时删除磁盘上的日志文件"
+                                  IsChecked="{Binding DataContext.ClearHistoryDeletesLogs, RelativeSource={RelativeSource AncestorType=UserControl}, Mode=TwoWay}" />
+
+                        <StackPanel Orientation="Horizontal">
+                            <ui:Button Appearance="Danger"
+                                       Command="{Binding DataContext.ClearHistoryCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                                       Content="清空历史记录…" />
+
+                            <TextBlock Margin="12,0,0,0"
+                                       VerticalAlignment="Center"
+                                       FontSize="12"
+                                       Foreground="{DynamicResource WarnText}"
+                                       Text="引擎正在运行，请先停止"
+                                       Visibility="{Binding DataContext.IsRunning, RelativeSource={RelativeSource AncestorType=UserControl}, Converter={StaticResource BoolVisibility}}" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Margin="0,10,0,0"
+                                   Text="点下去会先弹一个确认框，把将要清空的内容逐条列出来。若你设了“生效起始日期”，确认框还会提醒你：清空后该日期之后的文件会被重新备份一遍。" />
                     </StackPanel>
                 </ui:Card>
             </StackPanel>

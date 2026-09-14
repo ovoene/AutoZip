@@ -2,6 +2,7 @@ using Microsoft.Extensions.Time.Testing;
 using NewAutoZip.Core.Configuration;
 using NewAutoZip.Core.Notifications;
 using NewAutoZip.Core.OneDrive;
+using NewAutoZip.Core.Packing;
 using NewAutoZip.Core.Pipeline;
 using NewAutoZip.Core.Watching;
 using Xunit;
@@ -1903,6 +1904,725 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
         {
             holdOlder?.Dispose();
             holdNewer?.Dispose();
+            await h.Engine.StopAsync();
+        }
+    }
+
+    // ==================================================================
+    //  云端恢复演练：到期才做，做完把计时器推进去
+    //
+    //  这是本地演练证明不了的那一半 —— 包传上去之后有没有在传输或存储中损坏。
+    //  本地演练验的包从没离开过这台机器。
+    // ==================================================================
+
+    /// <summary>
+    /// 在指定目录里造一个<b>真的能解开</b>的归档，密码用 harness 的那个。
+    ///
+    /// 源文件放在监控目录<b>外面</b>：放进去会被 watcher 收进批次，
+    /// 于是引擎忙着打包，而云端演练只在真正空闲时才做 —— 测试就永远等不到它。
+    /// </summary>
+    private async Task<string> MakeCloudArchiveAsync(Harness h, string name)
+    {
+        TempDir source = NewDir("naz-clouddrill-src");
+        TempDir manifestDir = NewDir("naz-clouddrill-mf");
+
+        // 内容各不相同：全零内容下逐文件校验值比对等于没比。
+        List<string> files =
+        [
+            source.WriteText("甲.dat", "第一个文件的内容 " + Guid.NewGuid()),
+            source.WriteText("乙.dat", "第二个文件的内容 " + Guid.NewGuid()),
+        ];
+
+        RecordingLogger packLog = new();
+        SevenZipRunner runner = new(TestBinaries.SevenZip(), packLog);
+
+        // 带上包内清单，演练才能逐条核对而不是"解开了就算数"。
+        ArchiveManifestDocument doc = await ArchiveManifest.BuildAsync(
+            files, source.Path, name, Origin, h.Settings, packLog, CancellationToken.None);
+
+        // 清单中转文件不能落在 ZipTemp：引擎启动时的清扫会按名字把它删掉。
+        string manifestPath = Path.Combine(manifestDir.Path, ArchiveManifest.EntryName);
+        ArchiveManifest.WriteInnerManifest(manifestPath, doc);
+
+        string output = Path.Combine(h.OneDrive.Path, name);
+
+        PackResult result = await runner.CreateAsync(
+            new PackRequest(
+                output, files, h.Settings.Password,
+                CompressionLevel: 1, EncryptFileNames: true, TimeSpan.FromMinutes(3))
+            {
+                ExtraFiles = [manifestPath],
+            },
+            progress: null,
+            CancellationToken.None);
+
+        Assert.True(result.Ok, $"测试自己的准备工作失败了（造不出归档）：{result.Error}");
+
+        return output;
+    }
+
+    [Fact]
+    public async Task 云端演练没到期不做_到期才做并推进计时器()
+    {
+        // 计时器必须真的管用：做得太勤会把云端的包反复下载回来（按流量计费的线路上是持续开销），
+        // 而根本不推进计时器则会变成"每一轮都演练一次"。
+        Harness h = BuildHarness(
+            TestBinaries.SevenZip(),
+            tweak: s =>
+            {
+                s.CloudDrillEnabled = true;
+                s.CloudDrillIntervalHours = 6;
+
+                // 本轮不打包，所以本地演练无关；关掉它避免干扰日志断言。
+                s.VerifyAfterPackByExtract = false;
+            },
+            // 种一个"刚刚演练过"的时间点，否则从没演练过时引擎会立刻做一次。
+            seedState: st => st.LastCloudDrillUtc = Origin);
+
+        try
+        {
+            await MakeCloudArchiveAsync(h, "Backup_cloud.7z");
+
+            // ---- 还没到 6 小时：一次都不许做 ----
+            Assert.True(await AdvanceAndSettleAsync(h, TimeSpan.FromHours(1)));
+
+            Assert.False(
+                h.Log.Contains("开始云端恢复演练"),
+                $"离到期还有 5 小时就开演了。日志：{h.Log.Dump()}");
+            Assert.Equal(Origin, h.Store.Load().LastCloudDrillUtc);
+
+            // ---- 推过 6 小时：这一轮必须做 ----
+            h.Time.Advance(TimeSpan.FromHours(6));
+
+            Assert.True(
+                await PumpUntilAsync(h, _ => h.Store.Load().LastCloudDrillUtc > Origin),
+                $"到期了却没做云端演练。日志：{h.Log.Dump()}");
+
+            Assert.True(h.Log.Contains("开始云端恢复演练"), h.Log.Dump());
+
+            EngineState after = h.Store.Load();
+
+            // 计时器推进到了"现在"，而不是停在原地 —— 停在原地就是每轮都演练一次。
+            Assert.NotNull(after.LastCloudDrillUtc);
+            Assert.True(
+                after.LastCloudDrillUtc > Origin.AddHours(6),
+                $"计时器没推进：{after.LastCloudDrillUtc}");
+
+            // 演练结论也记下来了，而且是通过。
+            Assert.True(after.LastDrillOk, $"演练没通过：{after.LastDrillMessage}");
+            Assert.NotNull(after.LastDrillUtc);
+
+            // 包是好的，不该有任何失败通知。
+            Assert.Equal(0, h.Notify.CountOf(NotifyEvent.Failure));
+
+            // 演练目录不能留下 —— 它装的是解压出来的完整副本。
+            Assert.Empty(Directory.GetDirectories(
+                h.ZipTemp.Path, RestoreDrillService.DrillDirectoryPrefix + "*"));
+
+            // 云盘里那个包一动不动。
+            Assert.Single(h.OneDrive.Files("*.7z"));
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task 云端演练发现坏包时发演练通知_但不动那个包也不隔离()
+    {
+        // 【演练】标签必须和【失败】分开：备份失败是"这次没备份成"，
+        // 演练失败是"以前备份的那些可能恢复不了" —— 后者要紧得多。
+        Harness h = BuildHarness(
+            TestBinaries.SevenZip(),
+            tweak: s =>
+            {
+                s.CloudDrillEnabled = true;
+                s.CloudDrillIntervalHours = 6;
+                s.VerifyAfterPackByExtract = false;
+            });
+
+        try
+        {
+            // 一个彻头彻尾不是 7z 的文件。放在云盘目录里，等着被抽中。
+            string corrupt = Path.Combine(h.OneDrive.Path, "Backup_corrupt.7z");
+            File.WriteAllText(corrupt, "这根本不是一个压缩包，只是一段文字。");
+
+            // 没种 LastCloudDrillUtc：从没演练过就立刻做一次
+            //（用户是主动打开这个开关的，让他等满一个周期才知道能不能用是不合理的）。
+            Assert.True(
+                await PumpUntilAsync(h, _ => h.Store.Load().LastCloudDrillUtc is not null),
+                $"从没演练过却没有立刻做一次。日志：{h.Log.Dump()}");
+
+            Assert.True(h.Log.Contains("云端恢复演练未通过"), h.Log.Dump());
+
+            // ---- 发的是【演练】，不是【失败】 ----
+            NotifyMessage msg = h.Notify.First(NotifyEvent.Failure);
+            string[] lines = msg.ToPlainText().Split('\n', StringSplitOptions.RemoveEmptyEntries);
+
+            Assert.Equal($"【{NotifyTag.Drill}】", lines[1].Trim());
+
+            string text = msg.ToPlainText();
+            Assert.Contains("Backup_corrupt.7z", text);
+            Assert.Contains("恢复演练", text);
+
+            // ---- 坏包不归引擎处置 ----
+            // 它是既成事实，删了等于毁掉用户手里仅有的那份（哪怕是坏的）；
+            // 而隔离区是给"源文件反复打包失败"用的，与云端的包无关。
+            Assert.True(File.Exists(corrupt), "引擎把云盘里的包删了");
+            Assert.Equal(0, h.Engine.Snapshot.QuarantineCount);
+
+            EngineState after = h.Store.Load();
+
+            Assert.False(after.LastDrillOk, "坏包居然被记成演练通过");
+
+            // 失败也要推进计时器 —— 否则一个反复失败的演练会变成每一轮都下载一次包。
+            Assert.NotNull(after.LastCloudDrillUtc);
+
+            // 失败路径同样要清干净。
+            Assert.Empty(Directory.GetDirectories(
+                h.ZipTemp.Path, RestoreDrillService.DrillDirectoryPrefix + "*"));
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task 云端演练关着时一轮都不做()
+    {
+        // 默认就是关着的：它要把包重新下载回本地，得由用户自己决定值不值。
+        Harness h = BuildHarness(
+            TestBinaries.SevenZip(),
+            tweak: s =>
+            {
+                s.CloudDrillEnabled = false;
+                s.CloudDrillIntervalHours = 1;
+                s.VerifyAfterPackByExtract = false;
+            });
+
+        try
+        {
+            await MakeCloudArchiveAsync(h, "Backup_cloud.7z");
+
+            // 推过好几个周期。
+            Assert.True(await AdvanceAndSettleAsync(h, TimeSpan.FromHours(12)));
+
+            Assert.False(h.Log.Contains("开始云端恢复演练"), h.Log.Dump());
+            Assert.Null(h.Store.Load().LastCloudDrillUtc);
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task 云盘目录里一个包都没有时不推进计时器()
+    {
+        // 不推进是有意的：等第一个包送上去，下一轮就会立刻验它，
+        // 正好把"打包 → 上传 → 云端还能解开"整条链路走通一遍。
+        // 若在这里就把计时器推掉，那第一个包要再等一个完整周期才会被验。
+        Harness h = BuildHarness(
+            TestBinaries.SevenZip(),
+            tweak: s =>
+            {
+                s.CloudDrillEnabled = true;
+                s.CloudDrillIntervalHours = 6;
+                s.VerifyAfterPackByExtract = false;
+            });
+
+        try
+        {
+            // 云盘目录是空的。
+            Assert.Empty(h.OneDrive.Files("*.7z"));
+
+            Assert.True(await AdvanceAndSettleAsync(h, TimeSpan.FromHours(12)));
+
+            Assert.False(h.Log.Contains("开始云端恢复演练"), h.Log.Dump());
+            Assert.Null(h.Store.Load().LastCloudDrillUtc);
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    // ==================================================================
+    //  云盘容量预算：算出来放不下，就在打包之前拒绝
+    //
+    //  这道检查的位置是关键 —— 它在打包<b>之前</b>，所以拒绝的那一轮
+    //  压根不产生任何文件。放在打包之后就成了"先占满再说"。
+    // ==================================================================
+
+    /// <summary>在云盘目录里放一个假装的旧包，把预算吃掉一部分。</summary>
+    private static void SeedCloudUsage(Harness h, string name, int bytes) =>
+        h.OneDrive.WriteFile(name, bytes);
+
+    [Fact]
+    public async Task 容量预算不足时拒绝打包且不产生任何文件()
+    {
+        // 云盘目录里已经躺着 8 KB 的包，预算也正好是 8 KB —— 剩余为 0。
+        // 此时不管来多小的文件都放不下。
+        Harness h = BuildHarness(
+            maxAttempts: 2,
+            tweak: s =>
+            {
+                s.CloudQuotaBytes = 8192;
+                s.CloudQuotaWarnBytes = 0;
+            });
+
+        try
+        {
+            SeedCloudUsage(h, "Backup_old.7z", 8192);
+
+            h.Monitor.WriteFile("data.dat", 4096);
+
+            bool refused = await PumpUntilAsync(h, _ => h.Log.Contains("容量预算不足"));
+
+            Assert.True(refused, $"容量预算不足却照常打包了。日志：{h.Log.Dump()}");
+
+            // 核心断言：拒绝的那一轮一个中间文件都不该出现。
+            AssertZipTempClean(h);
+
+            // 云盘目录里还是只有那个旧包 —— 新的一个都没进来。
+            string[] cloud = h.OneDrive.Files("*.7z");
+            Assert.Single(cloud);
+            Assert.EndsWith("Backup_old.7z", cloud[0]);
+
+            Assert.Equal(0, h.Engine.Snapshot.ArchivesCreated);
+
+            // 借位 DiskWarning + NotifyTag.Disk，不新增 NotifyEvent 成员 ——
+            // 那个枚举按名字序列化，加成员要连着改 All 和设置页的勾选项。
+            Assert.True(h.Notify.Any(NotifyEvent.DiskWarning), "预算不足没有发【磁盘】通知");
+
+            // 拒绝一轮不等于引擎该停下：用户清理掉旧包之后它要能自己恢复。
+            Assert.True(h.Engine.IsRunning);
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task 没填容量预算时行为与改动前完全一致()
+    {
+        // 新字段遇上老 settings.json 拿到的就是 0。
+        // 云盘目录里堆着 4 MB，但预算没填 —— 整道检查必须跳过，照常打包。
+        // 这一条是所有老用户升级后的默认路径，挂了就是升级即故障。
+        Harness h = BuildHarness(
+            TestBinaries.SevenZip(),
+            tweak: s =>
+            {
+                s.CloudQuotaBytes = 0;
+                s.CloudQuotaWarnBytes = 0;
+            });
+
+        try
+        {
+            SeedCloudUsage(h, "Backup_old.7z", 4 * 1024 * 1024);
+
+            h.Monitor.WriteFile("data.dat", 4096);
+
+            Assert.True(
+                await PumpUntilAsync(h, s => s.ArchivesCreated > 0),
+                $"没填预算却没能跑完一轮。当前状态：{h.Engine.Snapshot.StatusText}");
+
+            Assert.False(h.Log.Contains("容量预算不足"), $"预算没填却做了预算检查。日志：{h.Log.Dump()}");
+            Assert.False(h.Log.Contains("低于警戒线"), h.Log.Dump());
+
+            // 旧包 + 新包，新的那个确实落进来了。
+            Assert.Equal(2, h.OneDrive.Files("*.7z").Length);
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task 剩余低于警戒线只告警_照常打包投递()
+    {
+        // 告警和拒绝是两件事：告警是"快满了，注意一下"，拒绝是"这一包放不进去"。
+        // 混在一起的后果是剩余一进入警戒区就再也不备份了 —— 那正是用户最需要备份的时候。
+        Harness h = BuildHarness(
+            TestBinaries.SevenZip(),
+            tweak: s =>
+            {
+                s.CloudQuotaBytes = 1024 * 1024;            // 总共 1 MB
+                s.CloudQuotaWarnBytes = 512 * 1024;         // 剩余低于 512 KB 就提醒
+            });
+
+        try
+        {
+            SeedCloudUsage(h, "Backup_old.7z", 900 * 1024);   // 已用 900 KB，剩 124 KB
+
+            h.Monitor.WriteFile("data.dat", 4096);            // 预计需要 ~4.5 KB，塞得下
+
+            Assert.True(
+                await PumpUntilAsync(h, s => s.ArchivesCreated > 0),
+                $"告警路径把打包也拦下了。当前状态：{h.Engine.Snapshot.StatusText}");
+
+            Assert.True(h.Log.Contains("低于警戒线"), $"剩余已在警戒线之下却没告警。日志：{h.Log.Dump()}");
+            Assert.False(h.Log.Contains("容量预算不足"), $"塞得下却被拒了。日志：{h.Log.Dump()}");
+
+            Assert.True(h.Notify.Any(NotifyEvent.DiskWarning), "低于警戒线没有发【磁盘】通知");
+
+            // 关键：告警之后包照样做出来、照样投递。
+            Assert.Equal(2, h.OneDrive.Files("*.7z").Length);
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    // ==================================================================
+    //  清空历史记录：复位成"全新的、从未运行过"的样子
+    // ==================================================================
+
+    [Fact]
+    public async Task 引擎运行中拒绝清空历史记录()
+    {
+        // 引擎在 Start 时把状态读进内存副本，之后十几处 Save 会把那份副本写回来。
+        // 运行中复位，下一次保存就把旧状态原样写回去了 —— 用户看到的是"点了没反应"。
+        // 所以拦在引擎里，而不是只把按钮置灰：置灰挡得住鼠标，挡不住别的调用方。
+        Harness h = BuildHarness();
+
+        try
+        {
+            Assert.True(h.Engine.IsRunning);
+
+            Assert.False(h.Engine.ResetState(out string? error), "引擎运行中竟然允许清空");
+            Assert.False(string.IsNullOrWhiteSpace(error));
+            Assert.Contains("运行", error!);
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task 清空历史记录后每个字段都回到初始值()
+    {
+        Harness h = BuildHarness(TestBinaries.SevenZip());
+
+        try
+        {
+            h.Monitor.WriteFile("data.dat", 4096);
+
+            Assert.True(
+                await PumpUntilAsync(h, s => s.ArchivesCreated > 0 && s.PendingUploadCount == 0),
+                $"没能跑完一轮，等于没有历史可清。当前状态：{h.Engine.Snapshot.StatusText}");
+
+            await h.Engine.StopAsync();
+
+            // 先确认真的攒下了东西 —— 否则"清空后是空的"这个断言毫无意义。
+            EngineState before = h.Store.Load();
+            Assert.True(before.TotalArchivesCreated > 0, "跑完一轮却没记下任何累计数字");
+            Assert.True(before.TotalBytesArchived > 0);
+            Assert.True(before.TotalFilesArchived > 0);
+            Assert.True(before.FirstRunCompleted);
+            Assert.NotNull(before.Checkpoint);
+            Assert.NotNull(before.LastPackSuccessUtc);
+
+            Assert.True(h.Engine.ResetState(out string? error), $"清空失败：{error}");
+            Assert.Null(error);
+
+            // ---- 磁盘上的状态：逐个字段对照 new EngineState() ----
+            EngineState after = h.Store.Load();
+            EngineState fresh = new();
+
+            Assert.Equal(fresh.TotalArchivesCreated, after.TotalArchivesCreated);
+            Assert.Equal(fresh.TotalBytesArchived, after.TotalBytesArchived);
+            Assert.Equal(fresh.TotalFilesArchived, after.TotalFilesArchived);
+            Assert.Equal(fresh.FirstRunCompleted, after.FirstRunCompleted);
+            Assert.Equal(fresh.Checkpoint, after.Checkpoint);
+            Assert.Equal(fresh.LastPackSuccessUtc, after.LastPackSuccessUtc);
+            Assert.Equal(fresh.LastPackFailureUtc, after.LastPackFailureUtc);
+            Assert.Equal(fresh.LastPackFailureReason, after.LastPackFailureReason);
+            Assert.Equal(fresh.LastDeliverSuccessUtc, after.LastDeliverSuccessUtc);
+            Assert.Equal(fresh.LastDeliverFailureUtc, after.LastDeliverFailureUtc);
+            Assert.Equal(fresh.LastDeliverFailureReason, after.LastDeliverFailureReason);
+            Assert.Equal(fresh.LastDrillUtc, after.LastDrillUtc);
+            Assert.Equal(fresh.LastDrillOk, after.LastDrillOk);
+            Assert.Equal(fresh.LastDrillMessage, after.LastDrillMessage);
+            Assert.Equal(fresh.LastCloudDrillUtc, after.LastCloudDrillUtc);
+
+            Assert.Empty(after.PendingUploads);
+            Assert.Empty(after.Quarantined);
+            Assert.Empty(after.ForcedFiles);
+            Assert.Empty(after.FutureStamped);
+
+            // ---- 内存里那份也得跟着空 ----
+            //
+            // 状态存在两个地方：磁盘上的 state.json，和引擎发布给界面的快照。
+            // 只清磁盘的话，总览上的累计数字会一直挂着旧值直到重启 ——
+            // 用户点了"清空"却看见数字没变，只会以为没清掉，然后再点一次。
+            Assert.Equal(0, h.Engine.Snapshot.ArchivesCreated);
+            Assert.Equal(0, h.Engine.StateView.TotalArchivesCreated);
+            Assert.Null(h.Engine.StateView.Checkpoint);
+
+            // ---- 压缩包一个都不许少 ----
+            //
+            // 清的是账本，不是备份。这一条是整个功能的底线：
+            // 将来谁在复位路径上顺手加了删文件的逻辑，会先在这里被挡下。
+            Assert.NotEmpty(h.OneDrive.Files("*.7z"));
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task 停止状态下的StateView读的是磁盘而不是空壳()
+    {
+        // 引擎从没跑过时，内存里那份 _stateView 是空的。
+        // 确认框要靠它念出"有 3 条待上传记录会被清掉"——
+        // 读空壳就会念成"没有"，用户点下去才发现清掉了真东西。
+        Harness h = BuildHarness(
+            seedState: st =>
+            {
+                st.TotalArchivesCreated = 7;
+                st.PendingUploads.Add(new PendingUpload
+                {
+                    ArchivePath = "X:\\cloud\\Backup_pending.7z",
+                    Bytes = 1024,
+                    FileCount = 2,
+                });
+            });
+
+        await h.Engine.StopAsync();
+
+        EngineState view = h.Engine.StateView;
+
+        Assert.Equal(7, view.TotalArchivesCreated);
+        Assert.Single(view.PendingUploads);
+    }
+
+    // ==================================================================
+    //  隔离区上限：内存与 state.json 都不能无限制地涨
+    //
+    //  隔离区曾是全状态里唯一<b>一点上限都没有</b>的集合。每个批次还拖着
+    //  一整份 List<string> Files，而 state.json 是每轮整份重新序列化的 ——
+    //  一个持续失败的目录（权限不对、被独占）能让它一轮一轮涨上去，
+    //  内存和每轮的写盘量一起变大。
+    // ==================================================================
+
+    /// <summary>造 <paramref name="count"/> 个隔离批次，Id 依次是 Q-0、Q-1……</summary>
+    private static void SeedQuarantine(EngineState state, int count)
+    {
+        for (int i = 0; i < count; i++)
+        {
+            state.Quarantined.Add(new QuarantinedBatch
+            {
+                Id = $"Q-{i}",
+                Files = [$"X:\\src\\f{i}.dat"],
+                Reason = "测试用：连续打包失败",
+                Attempts = 3,
+                QuarantinedUtc = Origin.AddMinutes(i),
+                TotalBytes = 4096,
+            });
+        }
+    }
+
+    [Fact]
+    public async Task 隔离区超过上限时裁掉最旧的批次()
+    {
+        const int Cap = 200;
+        const int Seeded = 250;
+
+        Harness h = BuildHarness(
+            tweak: NeverReady(),
+            seedState: s =>
+            {
+                s.FirstRunCompleted = true;
+                SeedQuarantine(s, Seeded);
+            });
+
+        try
+        {
+            // 裁剪发生在 StartupAsync 里的 SanitizeState —— 那是主循环的异步部分，
+            // Start() 返回时还没跑到。得等隔离区在快照里出现才能断言。
+            Assert.True(
+                await PumpUntilAsync(h, s => s.QuarantineCount > 0, maxSteps: 10, engineSecondsPerStep: 1),
+                "种进去的隔离批次一直没出现在快照里");
+
+            EngineState after = h.Engine.StateSnapshot();
+
+            Assert.Equal(Cap, after.Quarantined.Count);
+
+            // 留下的必须是最新的那一批：最旧的 Q-0 被丢掉，最新的 Q-249 还在。
+            Assert.DoesNotContain(after.Quarantined, q => q.Id == "Q-0");
+            Assert.DoesNotContain(after.Quarantined, q => q.Id == $"Q-{Seeded - Cap - 1}");
+            Assert.Equal($"Q-{Seeded - Cap}", after.Quarantined[0].Id);
+            Assert.Equal($"Q-{Seeded - 1}", after.Quarantined[^1].Id);
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    /// <summary>
+    /// 淘汰必须留下日志。
+    ///
+    /// 这一点跟 <c>LedgerCap</c> 那两个名单不一样：那些是程序自用的内部账本，
+    /// 悄悄淘汰无妨。隔离区是<b>给用户看的待办清单</b> —— 批次从这里消失，
+    /// 意味着用户再也不会知道那些文件失败过，而源文件还在磁盘上没被备份。
+    /// 不出声地丢掉，等于悄悄放弃了用户的数据。
+    /// </summary>
+    [Fact]
+    public async Task 裁剪隔离区必须留下告警()
+    {
+        Harness h = BuildHarness(
+            tweak: NeverReady(),
+            seedState: s =>
+            {
+                s.FirstRunCompleted = true;
+                SeedQuarantine(s, 250);
+            });
+
+        try
+        {
+            Assert.True(
+                await PumpUntilAsync(h, s => s.QuarantineCount > 0, maxSteps: 10, engineSecondsPerStep: 1),
+                "种进去的隔离批次一直没出现在快照里");
+
+            Assert.True(
+                h.Log.Contains("隔离区已达上限"),
+                "裁掉了 50 批隔离记录却一声不吭：" + h.Log.Dump());
+
+            // 丢了多少批要说清楚，只说"达到上限"等于没说。
+            Assert.True(h.Log.Contains("丢弃最早的 50 批"), h.Log.Dump());
+
+            // 也要讲清后果：源文件还在，但用户从此看不到它们了。
+            Assert.True(h.Log.Contains("源文件仍在磁盘上"), h.Log.Dump());
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task 没到上限的隔离区一条都不动()
+    {
+        Harness h = BuildHarness(
+            tweak: NeverReady(),
+            seedState: s =>
+            {
+                s.FirstRunCompleted = true;
+                SeedQuarantine(s, 5);
+            });
+
+        try
+        {
+            Assert.True(
+                await PumpUntilAsync(h, s => s.QuarantineCount > 0, maxSteps: 10, engineSecondsPerStep: 1),
+                "种进去的隔离批次一直没出现在快照里");
+
+            EngineState after = h.Engine.StateSnapshot();
+
+            Assert.Equal(5, after.Quarantined.Count);
+            Assert.Equal("Q-0", after.Quarantined[0].Id);
+            Assert.False(h.Log.Contains("隔离区已达上限"), h.Log.Dump());
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    /// <summary>裁剪结果必须落盘 —— 否则内存里裁了，下次启动又从磁盘读回 250 条。</summary>
+    [Fact]
+    public async Task 裁剪结果要写回state文件()
+    {
+        Harness h = BuildHarness(
+            tweak: NeverReady(),
+            seedState: s =>
+            {
+                s.FirstRunCompleted = true;
+                SeedQuarantine(s, 250);
+            });
+
+        try
+        {
+            Assert.True(
+                await PumpUntilAsync(h, s => s.QuarantineCount > 0, maxSteps: 10, engineSecondsPerStep: 1),
+                "种进去的隔离批次一直没出现在快照里");
+
+            EngineState onDisk = h.Store.Load();
+
+            Assert.Equal(200, onDisk.Quarantined.Count);
+            Assert.DoesNotContain(onDisk.Quarantined, q => q.Id == "Q-0");
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
             await h.Engine.StopAsync();
         }
     }

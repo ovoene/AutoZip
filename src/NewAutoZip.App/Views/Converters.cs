@@ -3,6 +3,7 @@ using System.Windows;
 using System.Windows.Data;
 using System.Windows.Media;
 using NewAutoZip.Core.Diagnostics;
+using NewAutoZip.Core.Storage;
 
 namespace NewAutoZip.App.Views;
 
@@ -118,6 +119,31 @@ public sealed class StampConverter : IValueConverter
         {
             DateTimeOffset dto => dto.ToString(Format, CultureInfo.InvariantCulture),
             DateTime dt => dt.ToString(Format, CultureInfo.InvariantCulture),
+            _ => string.Empty,
+        };
+
+    public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture) =>
+        Binding.DoNothing;
+}
+
+/// <summary>
+/// 字节数 → "1.2 GB"。
+///
+/// 快照那几个视图模型都自带 <c>SizeText</c>，用不着这个；它是给
+/// <see cref="NewAutoZip.Core.Packing.ArchiveEntry"/> 这种<b>从 Core 直接绑到界面上</b>
+/// 的记录用的 —— 那是 7za 解析出来的原始条目，为它在界面层再包一层
+/// 只为了加一个 <c>SizeText</c> 属性，得不偿失。
+///
+/// 这个转换器不碰资源系统（上一段注释里那三个被删掉的正是栽在这上面），
+/// 只是纯粹的值变换，换主题不受影响。
+/// </summary>
+public sealed class ByteSizeConverter : IValueConverter
+{
+    public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture) =>
+        value switch
+        {
+            long bytes => ByteSize.Format(bytes),
+            int bytes => ByteSize.Format(bytes),
             _ => string.Empty,
         };
 

@@ -4,6 +4,7 @@ using System.Windows.Media;
 using NewAutoZip.Core.Configuration;
 using NewAutoZip.Core.Diagnostics;
 using NewAutoZip.Core.Notifications;
+using NewAutoZip.Core.Storage;
 
 namespace NewAutoZip.App.ViewModels;
 
@@ -89,12 +90,27 @@ public sealed class SettingsViewModel : ObservableObject
     private bool _encryptFileNames = true;
     private double _packTimeoutMinutes = 180;
     private string _archivePrefix = "Backup";
+    private bool _writeArchiveManifest = true;
+    private bool _verifyAfterPackByExtract = true;
+
+    // 演练默认全关。它要解密、要占临时盘、云端包还得先下下来 ——
+    // 这种会自己跑起来干重活的功能，默认开是不礼貌的。
+    private bool _cloudDrillEnabled;
+    private double _cloudDrillIntervalHours = 168;
+    private double _drillTimeoutMinutes = 60;
 
     private double _zipTempKeepDays = 3;
     private double _zipTempMaxCount = 20;
     private double _zipTempMaxTotalGb = 5;
     private double _minFreeDiskGb = 10;
     private double _maxAttemptsBeforeQuarantine = 6;
+
+    // 容量预算。默认 0 = 不限制，与 AppSettings 的默认值一致；
+    // 单位默认 GB（幂次 3），用户一打开下拉框就在最常用的那一档上。
+    private double _cloudQuotaValue;
+    private ChoiceItem<int> _cloudQuotaUnit;
+    private double _cloudQuotaWarnValue;
+    private ChoiceItem<int> _cloudQuotaWarnUnit;
 
     private bool _releaseLocalSpace = true;
     private double _uploadTimeoutMinutes = 120;
@@ -142,9 +158,18 @@ public sealed class SettingsViewModel : ObservableObject
         _theme = Themes[0];
         _cloudTarget = CloudTargets[0];
 
+        // GB 那一档。不能写 ByteUnits[1] 之外的硬下标 —— 列表以后要是加了 KB，
+        // 下标会整体错位，而错位的后果是默认单位悄悄变成别的。按值找最稳。
+        _cloudQuotaUnit = UnitFor(3);
+        _cloudQuotaWarnUnit = UnitFor(3);
+
         PickAccentCommand = new RelayCommand<string>(PickAccent);
         ResetAccentCommand = new RelayCommand(() => AccentColor = AccentColorSpec.FollowSystem);
         ClearBackgroundCommand = new RelayCommand(() => BackgroundImagePath = string.Empty);
+
+        // 账号是构造完之后由 MainViewModel 灌进来的，灌进来这一刻「本机发现的账号」那一行
+        // 的显隐条件（ShowOneDriveAccounts）就变了，得主动通知界面重算一次。
+        OneDriveAccounts.CollectionChanged += (_, _) => Raise(nameof(ShowOneDriveAccounts));
     }
 
     // ==================== 下拉框数据源 ====================
@@ -179,6 +204,26 @@ public sealed class SettingsViewModel : ObservableObject
 
     /// <summary>本机发现的 OneDrive 账号目录，设置页可以一键填入。</summary>
     public ObservableCollection<OneDriveChoice> OneDriveAccounts { get; } = [];
+
+    /// <summary>
+    /// 下拉框里最小的那一档（MB）的幂次。读档换算时当下限用 ——
+    /// 拆出来的单位若比它还小，下拉框里根本没有对应项。
+    /// </summary>
+    private const int MinByteUnitPower = 2;
+
+    /// <summary>
+    /// 容量单位下拉框。<c>Value</c> 就是 1024 的幂次（MB=2、GB=3、TB=4）。
+    ///
+    /// 只给 MB 以上：容量预算填到 KB 这一档没有任何现实意义，
+    /// 而选项越少越不容易选错单位 —— 选错一档就是 1024 倍的偏差。
+    /// </summary>
+    public IReadOnlyList<ChoiceItem<int>> ByteUnits { get; } =
+    [
+        new(2, "MB"),
+        new(3, "GB"),
+        new(4, "TB"),
+        new(5, "PB"),
+    ];
 
     // ==================== 路径 ====================
 
@@ -220,6 +265,7 @@ public sealed class SettingsViewModel : ObservableObject
             {
                 MarkDirty();
                 Raise(nameof(IsOneDriveTarget));
+                Raise(nameof(ShowOneDriveAccounts));
                 Raise(nameof(CloudPathLabel));
                 Raise(nameof(CloudPathHint));
             }
@@ -228,6 +274,17 @@ public sealed class SettingsViewModel : ObservableObject
 
     /// <summary>OneDrive 模式才显示"等待上传确认""释放本地空间"那一组设置。</summary>
     public bool IsOneDriveTarget => _cloudTarget.Value == CloudTarget.OneDrive;
+
+    /// <summary>
+    /// 「本机发现的账号」那一行该不该显示。
+    ///
+    /// 两个条件缺一不可：<b>当前是 OneDrive 模式</b>，且<b>本机确实枚举到了账号</b>。
+    /// 只看有没有账号是不够的 —— 那一行的唯一作用是把某个 OneDrive 同步目录一键填进
+    /// 目标路径；一旦云盘类型切成"其他云盘 / 普通目录"，填进去的还是 OneDrive 的路径，
+    /// 对这条分支毫无意义，反倒会把人往错路径上带。XAML 里那句"非 OneDrive 模式下
+    /// 这一行没有意义"的注释一直都在，只是旧绑定漏了这半个条件。
+    /// </summary>
+    public bool ShowOneDriveAccounts => IsOneDriveTarget && OneDriveAccounts.Count > 0;
 
     public string CloudPathLabel => CloudTargetText.PathLabel(_cloudTarget.Value);
 
@@ -440,6 +497,31 @@ public sealed class SettingsViewModel : ObservableObject
         set { if (Set(ref _archivePrefix, value)) { MarkDirty(); } }
     }
 
+    /// <summary>
+    /// 每个归档旁边放一份明文清单（<c>.7z.manifest.json</c>）。
+    ///
+    /// 注意它<b>不含任何源文件名</b>：加密时 <c>-mhe=on</c> 隐藏的正是文件名表，
+    /// 清单里写名字等于把这道保护从旁边捅穿。清单只放条目数、总字节数、校验值，
+    /// 够用来判"包完不完整、和旁边的包对不对得上"就够了。
+    /// </summary>
+    public bool WriteArchiveManifest
+    {
+        get => _writeArchiveManifest;
+        set { if (Set(ref _writeArchiveManifest, value)) { MarkDirty(); Raise(nameof(DrillHint)); } }
+    }
+
+    /// <summary>
+    /// 打完包立刻把包解一遍、逐条比对，确认"它真的能还原"再交付。
+    ///
+    /// 比只跑 <c>7z t</c> 重得多（要真解压、要算校验值），但 <c>t</c> 只测压缩流本身，
+    /// 测不出"这一包其实少压了几个文件"—— 而后者恰恰是这个程序最需要发现的事。
+    /// </summary>
+    public bool VerifyAfterPackByExtract
+    {
+        get => _verifyAfterPackByExtract;
+        set { if (Set(ref _verifyAfterPackByExtract, value)) { MarkDirty(); } }
+    }
+
     // ==================== 配额与磁盘 ====================
 
     public double ZipTempKeepDays
@@ -470,6 +552,133 @@ public sealed class SettingsViewModel : ObservableObject
     {
         get => _maxAttemptsBeforeQuarantine;
         set { if (Set(ref _maxAttemptsBeforeQuarantine, value)) { MarkDirty(); } }
+    }
+
+    // ==================== 云盘容量预算 ====================
+    //
+    // 数值与单位分成两个属性，配置里仍然只存一个字节数。
+    // 换算集中在 ByteSize.ToUnit / FromUnit，这里不自己乘 1024。
+
+    /// <summary>总容量的数值部分。0 = 不限制，整套容量检查关闭。</summary>
+    public double CloudQuotaValue
+    {
+        get => _cloudQuotaValue;
+        set { if (Set(ref _cloudQuotaValue, value)) { MarkDirty(); Raise(nameof(CloudQuotaHint)); } }
+    }
+
+    public ChoiceItem<int> CloudQuotaUnit
+    {
+        get => _cloudQuotaUnit;
+        set { if (Set(ref _cloudQuotaUnit, value)) { MarkDirty(); Raise(nameof(CloudQuotaHint)); } }
+    }
+
+    /// <summary>警戒容量的数值部分。0 = 不告警。</summary>
+    public double CloudQuotaWarnValue
+    {
+        get => _cloudQuotaWarnValue;
+        set { if (Set(ref _cloudQuotaWarnValue, value)) { MarkDirty(); Raise(nameof(CloudQuotaHint)); } }
+    }
+
+    public ChoiceItem<int> CloudQuotaWarnUnit
+    {
+        get => _cloudQuotaWarnUnit;
+        set { if (Set(ref _cloudQuotaWarnUnit, value)) { MarkDirty(); Raise(nameof(CloudQuotaHint)); } }
+    }
+
+    /// <summary>
+    /// 这两个数字当前意味着什么，实时显示在输入框下面。
+    ///
+    /// 值得专门算一句：填的是"1 TB"，而用户真正关心的是"那还能放多少个包"。
+    /// 单位选错一档就是 1024 倍的偏差，把换算后的结果直接摆出来最容易发现填错了。
+    /// </summary>
+    public string CloudQuotaHint
+    {
+        get
+        {
+            long quota = ByteSize.FromUnit(CloudQuotaValue, CloudQuotaUnit.Value);
+
+            if (quota <= 0)
+            {
+                return "留空或填 0 表示不限制容量，程序不会因为容量而拒绝打包。";
+            }
+
+            long warn = ByteSize.FromUnit(CloudQuotaWarnValue, CloudQuotaWarnUnit.Value);
+
+            string head = $"上限 {ByteSize.Format(quota)}";
+
+            return warn <= 0
+                ? head + "。未设警戒线，只有真的放不下时才会拒绝打包。"
+                : warn >= quota
+                    ? head + $"，警戒线 {ByteSize.Format(warn)} —— 警戒线不低于上限，每一轮都会告警，请调小。"
+                    : head + $"，剩余不足 {ByteSize.Format(warn)} 时告警。";
+        }
+    }
+
+    /// <summary>按幂次取单位项。找不到就退到 GB。</summary>
+    private ChoiceItem<int> UnitFor(int power) =>
+        ByteUnits.FirstOrDefault(u => u.Value == power)
+        ?? ByteUnits.FirstOrDefault(u => u.Value == 3)
+        ?? ByteUnits[0];
+
+    // ==================== 恢复演练 ====================
+
+    /// <summary>
+    /// 让引擎自己隔一阵挑一个包真解一遍。
+    ///
+    /// 默认关。它和"打完包立刻验"不是一回事：那个验的是刚出炉的包，
+    /// 而包在云上躺三个月之后还坏没坏，只有在三个月后真去解一次才知道 ——
+    /// 而用户通常正是在这三个月里把本地那份删了。
+    /// </summary>
+    public bool CloudDrillEnabled
+    {
+        get => _cloudDrillEnabled;
+        set { if (Set(ref _cloudDrillEnabled, value)) { MarkDirty(); Raise(nameof(DrillHint)); } }
+    }
+
+    public double CloudDrillIntervalHours
+    {
+        get => _cloudDrillIntervalHours;
+        set { if (Set(ref _cloudDrillIntervalHours, value)) { MarkDirty(); Raise(nameof(DrillHint)); } }
+    }
+
+    public double DrillTimeoutMinutes
+    {
+        get => _drillTimeoutMinutes;
+        set { if (Set(ref _drillTimeoutMinutes, value)) { MarkDirty(); } }
+    }
+
+    /// <summary>把间隔小时数翻译成人话，顺带把两个已知的坑说出来。</summary>
+    public string DrillHint
+    {
+        get
+        {
+            if (!CloudDrillEnabled)
+            {
+                return "关着的时候一份包都不会被解，临时目录也不会多占一点空间。";
+            }
+
+            int hours = (int)Math.Round(CloudDrillIntervalHours);
+
+            string every = hours switch
+            {
+                < 0 => "每隔一段时间",
+                < 24 => $"每 {hours} 小时",
+                < 48 => "每天",
+                < 168 => $"每 {hours / 24} 天",
+                < 336 => "每周",
+                _ => $"每 {hours / 24} 天",
+            };
+
+            string warn = hours < 24
+                ? "\n间隔小于 24 小时意义不大 —— 云盘上的包不会一夜之间坏掉，只会白耗流量和临时空间。"
+                : string.Empty;
+
+            string manifest = WriteArchiveManifest
+                ? string.Empty
+                : "\n注意：关掉了「随包清单」，演练只能验出「解得开」，验不出「少压了几个文件」—— 建议一并打开。";
+
+            return $"大约{every}挑一份归档解出来核对一遍。云端包会先下载到临时目录，核对完立即删除。" + warn + manifest;
+        }
     }
 
     // ==================== OneDrive ====================
@@ -895,12 +1104,25 @@ public sealed class SettingsViewModel : ObservableObject
         _encryptFileNames = settings.EncryptFileNames;
         _packTimeoutMinutes = settings.PackTimeoutMinutes;
         _archivePrefix = settings.ArchivePrefix;
+        _writeArchiveManifest = settings.WriteArchiveManifest;
+        _verifyAfterPackByExtract = settings.VerifyAfterPackByExtract;
+
+        _cloudDrillEnabled = settings.CloudDrillEnabled;
+        _cloudDrillIntervalHours = settings.CloudDrillIntervalHours;
+        _drillTimeoutMinutes = settings.DrillTimeoutMinutes;
 
         _zipTempKeepDays = settings.ZipTempKeepDays;
         _zipTempMaxCount = settings.ZipTempMaxCount;
         _zipTempMaxTotalGb = ToGb(settings.ZipTempMaxTotalBytes);
         _minFreeDiskGb = ToGb(settings.MinFreeDiskBytes);
         _maxAttemptsBeforeQuarantine = settings.MaxAttemptsBeforeQuarantine;
+
+        // 挑能整除的最大单位显示：1 TB 要显示成"1 TB"而不是"1024 GB"。
+        // 否则每存一次读一次，单位就往下掉一档，用户会以为自己填错了。
+        (_cloudQuotaValue, int quotaPower) = ByteSize.ToUnit(settings.CloudQuotaBytes, MinByteUnitPower);
+        (_cloudQuotaWarnValue, int warnPower) = ByteSize.ToUnit(settings.CloudQuotaWarnBytes, MinByteUnitPower);
+        _cloudQuotaUnit = UnitFor(quotaPower);
+        _cloudQuotaWarnUnit = UnitFor(warnPower);
 
         _releaseLocalSpace = settings.ReleaseLocalSpace;
         _uploadTimeoutMinutes = settings.UploadTimeoutMinutes;
@@ -973,12 +1195,21 @@ public sealed class SettingsViewModel : ObservableObject
             EncryptFileNames = EncryptFileNames,
             PackTimeoutMinutes = (int)Math.Round(PackTimeoutMinutes),
             ArchivePrefix = ArchivePrefix.Trim(),
+            WriteArchiveManifest = WriteArchiveManifest,
+            VerifyAfterPackByExtract = VerifyAfterPackByExtract,
+
+            CloudDrillEnabled = CloudDrillEnabled,
+            CloudDrillIntervalHours = (int)Math.Round(CloudDrillIntervalHours),
+            DrillTimeoutMinutes = (int)Math.Round(DrillTimeoutMinutes),
 
             ZipTempKeepDays = (int)Math.Round(ZipTempKeepDays),
             ZipTempMaxCount = (int)Math.Round(ZipTempMaxCount),
             ZipTempMaxTotalBytes = FromGb(ZipTempMaxTotalGb),
             MinFreeDiskBytes = FromGb(MinFreeDiskGb),
             MaxAttemptsBeforeQuarantine = (int)Math.Round(MaxAttemptsBeforeQuarantine),
+
+            CloudQuotaBytes = ByteSize.FromUnit(CloudQuotaValue, CloudQuotaUnit.Value),
+            CloudQuotaWarnBytes = ByteSize.FromUnit(CloudQuotaWarnValue, CloudQuotaWarnUnit.Value),
 
             ReleaseLocalSpace = ReleaseLocalSpace,
             UploadTimeoutMinutes = (int)Math.Round(UploadTimeoutMinutes),

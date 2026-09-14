@@ -9,6 +9,7 @@ using System.Windows.Threading;
 using NewAutoZip.App.ViewModels;
 using NewAutoZip.Core.Configuration;
 using NewAutoZip.Core.Diagnostics;
+using NewAutoZip.Core.Packing;
 using NewAutoZip.Core.Pipeline;
 using NewAutoZip.Core.Watching;
 
@@ -21,7 +22,7 @@ namespace NewAutoZip.App.Services;
 /// 而错误信息只出现在调试输出窗口里。也就是说：<b>“编译通过”完全不代表界面是对的。</b>
 ///
 /// 这个自检把绑定错误变成一个可以被脚本检查的东西：挂上 WPF 的绑定诊断源，
-/// 把五个页面逐个显示并强制布局，往每个列表里塞入样例行（<b>空列表永远不会去求值
+/// 把六个页面逐个显示并强制布局，往每个列表里塞入样例行（<b>空列表永远不会去求值
 /// 单元格里的绑定，所以只看空界面等于什么都没测</b>），最后把捕获到的错误写进报告文件，
 /// 有错就以非零退出码结束。
 ///
@@ -211,11 +212,10 @@ internal static class SelfTest
 
             defects += CheckPalette(steps);
 
-            // 五个页面逐个过。折叠的元素不参与布局，不切过去就等于没测。
-            for (int page = 0; page < 5; page++)
+            // 六个页面逐个过。折叠的元素不参与布局，不切过去就等于没测。
+            for (int page = 0; page < 6; page++)
             {
-                model.SelectedPage = page;
-                Settle(window);
+                ShowPage(model, window, page, withSamples: false);
                 steps.Add($"页面 {page} 已显示并布局，累计错误 {listener.ErrorCount}。");
             }
 
@@ -226,10 +226,9 @@ internal static class SelfTest
             steps.Add("已注入样例行（文件 / 待上传 / 重试 / 隔离 / 日志）。");
 
             // 有数据的页面再过一遍 —— 这一轮才真正求值单元格与条目模板里的绑定。
-            for (int page = 0; page < 5; page++)
+            for (int page = 0; page < 6; page++)
             {
-                model.SelectedPage = page;
-                Settle(window);
+                ShowPage(model, window, page, withSamples: true);
                 steps.Add($"页面 {page}（有数据）已布局，累计错误 {listener.ErrorCount}。");
             }
 
@@ -238,6 +237,7 @@ internal static class SelfTest
             defects += ExerciseThemes(model, theme, window, steps, listener);
             defects += CheckPipelineSteps(model, theme, window, steps);
             defects += CheckCloudTargetSwitch(model, window, steps);
+            defects += CheckCloudQuotaCard(model, window, steps);
             defects += ExerciseBackground(model, theme, window, steps, listener);
             defects += CheckAppearanceNotDirty(steps);
             defects += CheckLayout(model, window, steps);
@@ -302,7 +302,7 @@ internal static class SelfTest
         {
             theme.Apply(mode, accent);
 
-            // 每个主题都要把五个页面重新布局一遍：切主题会换掉整份控件字典，
+            // 每个主题都要把六个页面重新布局一遍：切主题会换掉整份控件字典，
             // 只在当前页停留的话另外四页的模板一次都不会重新走。
             Relayout(model, window);
 
@@ -310,7 +310,7 @@ internal static class SelfTest
             defects += CheckListRowColors(window, theme, label, steps);
             defects += CheckRenderedNotStale(window, theme, label, steps);
 
-            steps.Add($"主题「{label}」五个页面已重新布局，累计错误 {listener.ErrorCount}。");
+            steps.Add($"主题「{label}」六个页面已重新布局，累计错误 {listener.ErrorCount}。");
         }
 
         return defects;
@@ -378,7 +378,7 @@ internal static class SelfTest
                 }
 
                 Relayout(model, window);
-                steps.Add($"背景图「{label}」五个页面已重新布局，累计错误 {listener.ErrorCount}。");
+                steps.Add($"背景图「{label}」六个页面已重新布局，累计错误 {listener.ErrorCount}。");
             }
 
             // ---- 模糊必须是烘进位图的，且拖滑块不能触发整套主题重应用 ----
@@ -465,7 +465,7 @@ internal static class SelfTest
     ///         用引用相等判断 —— 这是"有没有重新渲染"唯一不含时间因素的证据。</item>
     ///   <item><b>只改模糊/不透明度时 <c>ThemeApplyCount</c> 不能动。</b>
     ///         之前每一次滑块变化都会换掉整份 WPF-UI 控件字典、重刷 26 个语义画刷、
-    ///         重新解析五个页面里所有 <c>DynamicResource</c>，还顺带写一次盘。
+    ///         重新解析六个页面里所有 <c>DynamicResource</c>，还顺带写一次盘。
     ///         滑块按鼠标移动的频率抬 <c>Value</c>，一秒几十次，队列根本排不完 ——
     ///         这也是"左边点导航也卡"的原因：卡的不是导航，是整个消息队列。</item>
     ///   <item><b>但真的换主题时那套活必须照旧干。</b>
@@ -629,10 +629,9 @@ internal static class SelfTest
         // 不重新塞样例行，这道闸门就只量到了日志列表，表格那几处等于没测。
         InjectSamples(model);
 
-        for (int page = 0; page < 5; page++)
+        for (int page = 0; page < 6; page++)
         {
-            model.SelectedPage = page;
-            Settle(window);
+            ShowPage(model, window, page, withSamples: true);
 
             List<(TextBlock Block, Rect Box)> texts = [];
             List<(Control List, Rect Box)> lists = [];
@@ -671,7 +670,7 @@ internal static class SelfTest
 
         if (bad.Count == 0)
         {
-            steps.Add($"布局体检通过（{TestWidth}×{TestHeight}）：五个页面没有重叠文字，" +
+            steps.Add($"布局体检通过（{TestWidth}×{TestHeight}）：六个页面没有重叠文字，" +
                       $"表格与日志都拿到了够用的高度（共查了 {seen} 个列表）。");
             return 0;
         }
@@ -1192,13 +1191,12 @@ internal static class SelfTest
         return flat.Length <= 16 ? flat : flat[..16] + "…";
     }
 
-    /// <summary>五个页面全部重新布局一遍。切外观会换掉整份控件字典，只停在当前页等于只测了五分之一。</summary>
+    /// <summary>六个页面全部重新布局一遍。切外观会换掉整份控件字典，只停在当前页等于只测了六分之一。</summary>
     private static void Relayout(MainViewModel model, Views.MainWindow window)
     {
-        for (int page = 0; page < 5; page++)
+        for (int page = 0; page < 6; page++)
         {
-            model.SelectedPage = page;
-            Settle(window);
+            ShowPage(model, window, page, withSamples: true);
         }
     }
 
@@ -1951,6 +1949,202 @@ internal static class SelfTest
 
         steps.Add($"云盘模式切换核对失败 {bad.Count} 项：{string.Join("；", bad)}");
         return bad.Count;
+    }
+
+    /// <summary>
+    /// 容量卡片：三种情形各摆一份快照，核对卡片该藏的时候藏、该红的时候红。
+    ///
+    /// 必须自己喂快照 —— 卡片整张的可见性绑在 <c>CloudQuotaConfigured</c> 上，
+    /// 而 <see cref="Core.Pipeline.EngineSnapshot.Stopped"/> 里那个值是 0。
+    /// 不喂就永远折叠，而<b>折叠元素不参与布局</b>，里面那几条绑定一条都测不到。
+    ///
+    /// 三格：
+    /// <list type="number">
+    ///   <item>没填总容量 → 整张卡片藏起来；</item>
+    ///   <item>填了、剩余还宽裕 → 卡片出现、不红；</item>
+    ///   <item>填了、剩余已低于警戒线 → 卡片出现且变红。</item>
+    /// </list>
+    ///
+    /// 进度条那一格顺带核对"已用超过预算也不许超过 100"——
+    /// 用户把预算填得比现有占用还小是很常见的，而进度条吃到 130 会画到框外面去。
+    /// </summary>
+    private static int CheckCloudQuotaCard(
+        MainViewModel model,
+        Views.MainWindow window,
+        List<string> steps)
+    {
+        Views.DashboardPage? dash = Descendants(window).OfType<Views.DashboardPage>().FirstOrDefault();
+
+        if (dash is null)
+        {
+            steps.Add("检查未完成：可视树里找不到总览页，容量卡片核对已跳过。");
+            return 0;
+        }
+
+        const long gb = 1024L * 1024 * 1024;
+
+        List<string> bad = [];
+
+        // 期望值全部写死，不拿被测的那套算式去算。
+        (string Label, long Quota, long Used, long Free, long Warn, bool Shown, bool Low, double Percent)[] cases =
+        [
+            ("没填总容量",              0,        0,        0,       0,        false, false, 0),
+            ("填了 100 GB、剩余 60 GB", 100 * gb, 40 * gb,  60 * gb, 10 * gb,  true,  false, 40),
+            ("剩余 5 GB、警戒线 10 GB", 100 * gb, 95 * gb,  5 * gb,  10 * gb,  true,  true,  95),
+            ("已用超过预算",            10 * gb,  30 * gb,  0,       gb,       true,  true,  100),
+        ];
+
+        try
+        {
+            foreach ((string label, long quota, long used, long free, long warn,
+                bool shown, bool low, double percent) in cases)
+            {
+                model.ApplySnapshotForSelfTest(Core.Pipeline.EngineSnapshot.Stopped with
+                {
+                    CloudQuotaBytes = quota,
+                    CloudUsedBytes = used,
+                    CloudFreeBytes = free,
+                    CloudQuotaWarnBytes = warn,
+                });
+
+                model.SelectedPage = 0;
+                Settle(window);
+
+                bool visible = dash.CloudQuotaCard.Visibility == Visibility.Visible;
+
+                if (visible != shown)
+                {
+                    bad.Add($"{label}：卡片{(visible ? "出现了" : "没出现")}，"
+                        + $"应当{(shown ? "出现" : "不出现")}");
+                }
+
+                if (model.CloudQuotaLow != low)
+                {
+                    bad.Add($"{label}：CloudQuotaLow 是 {model.CloudQuotaLow}，应当是 {low}");
+                }
+
+                if (Math.Abs(model.CloudUsedPercent - percent) > 0.01)
+                {
+                    bad.Add($"{label}：进度条 {model.CloudUsedPercent:0.##}%，应当是 {percent:0.##}%");
+                }
+
+                if (!shown)
+                {
+                    continue;
+                }
+
+                // 界面上那两行必须和属性一字不差 —— 不然就是 XAML 没绑（或者绑到别处去了）。
+                if (!string.Equals(dash.CloudQuotaUsageLine.Text, model.CloudQuotaUsageText, StringComparison.Ordinal))
+                {
+                    bad.Add($"{label}：界面上用量那行是「{dash.CloudQuotaUsageLine.Text}」，"
+                        + $"属性值却是「{model.CloudQuotaUsageText}」（XAML 没绑 CloudQuotaUsageText）");
+                }
+
+                if (!string.Equals(dash.CloudQuotaWarnLine.Text, model.CloudQuotaWarnText, StringComparison.Ordinal))
+                {
+                    bad.Add($"{label}：界面上警戒线那行是「{dash.CloudQuotaWarnLine.Text}」，"
+                        + $"属性值却是「{model.CloudQuotaWarnText}」（XAML 没绑 CloudQuotaWarnText）");
+                }
+
+                if (Math.Abs(dash.CloudQuotaBar.Value - model.CloudUsedPercent) > 0.01)
+                {
+                    bad.Add($"{label}：进度条显示 {dash.CloudQuotaBar.Value:0.##}，"
+                        + $"属性值却是 {model.CloudUsedPercent:0.##}（XAML 没绑 CloudUsedPercent）");
+                }
+            }
+        }
+        finally
+        {
+            // 回到真实状态：往后还有布局体检等着，不能让它们看见自检摆出来的假场景。
+            model.ApplySnapshotForSelfTest(Core.Pipeline.EngineSnapshot.Stopped);
+            Relayout(model, window);
+        }
+
+        bad.AddRange(CheckQuotaSurvivesStop(model, dash, window));
+
+        if (bad.Count == 0)
+        {
+            steps.Add($"容量卡片核对通过：{cases.Length} 种情形下卡片的显隐、变红与进度条"
+                + "（含已用超预算时夹在 100%）全部一致，且引擎停止后卡片不会消失。");
+            return 0;
+        }
+
+        steps.Add($"容量卡片核对失败 {bad.Count} 项：{string.Join("；", bad)}");
+        return bad.Count;
+    }
+
+    /// <summary>
+    /// 引擎停止后，配了预算的容量卡片<b>必须还在</b>。
+    ///
+    /// 这一格补的是上面那批测不到的地方：那批直接把容量摆进快照，
+    /// 而真实的停止快照里容量四个字段全是 0
+    /// （<see cref="Core.Pipeline.EngineSnapshot.Stopped"/>），
+    /// 卡片当初就是这么整张消失的。这里走一遍
+    /// <see cref="Core.Pipeline.EngineSnapshot.QuotaSourceFor"/> ——
+    /// 界面停机时用的正是它。
+    ///
+    /// 容量账是<b>现编</b>的，不去扫用户真实的云盘目录：自检是诊断命令，
+    /// 跑一趟不该依赖用户当下的磁盘内容，否则结论会随目录里有几个包而变。
+    /// </summary>
+    private static List<string> CheckQuotaSurvivesStop(
+        MainViewModel model,
+        Views.DashboardPage dash,
+        Views.MainWindow window)
+    {
+        List<string> bad = [];
+        const long gb = 1024L * 1024 * 1024;
+
+        Core.Storage.CloudQuotaStatus saved = new(
+            Configured: true,
+            QuotaBytes: 100 * gb,
+            UsedBytes: 40 * gb,
+            FreeBytes: 60 * gb,
+            DiskLimited: false);
+
+        try
+        {
+            Core.Pipeline.EngineSnapshot stopped = Core.Pipeline.EngineSnapshot.Stopped;
+
+            // 前提先钉住：停止快照本来就不该带容量。哪天它带上了，
+            // 这一格就测不到东西了，得有人知道。
+            if (stopped.CloudQuotaConfigured)
+            {
+                bad.Add("前提变了：停止快照里居然带着容量，这一格已经测不到停机消失那个毛病了");
+            }
+
+            model.ApplySnapshotForSelfTest(
+                Core.Pipeline.EngineSnapshot.QuotaSourceFor(stopped, saved, savedWarnBytes: 10 * gb));
+
+            model.SelectedPage = 0;
+            Settle(window);
+
+            if (dash.CloudQuotaCard.Visibility != Visibility.Visible)
+            {
+                bad.Add("引擎停止后卡片消失了 —— 用户配了 100 GB 预算却什么都看不到");
+            }
+
+            if (!model.CloudQuotaConfigured)
+            {
+                bad.Add("引擎停止后 CloudQuotaConfigured 是 false，应当是 true");
+            }
+
+            if (Math.Abs(model.CloudUsedPercent - 40) > 0.01)
+            {
+                bad.Add($"引擎停止后进度条 {model.CloudUsedPercent:0.##}%，应当是 40%");
+            }
+
+            if (model.CloudQuotaLow)
+            {
+                bad.Add("引擎停止后卡片变红了 —— 剩余 60 GB 还在警戒线 10 GB 之上");
+            }
+        }
+        finally
+        {
+            model.ApplySnapshotForSelfTest(Core.Pipeline.EngineSnapshot.Stopped);
+            Relayout(model, window);
+        }
+
+        return bad;
     }
 
     /// <summary>
@@ -2718,6 +2912,61 @@ internal static class SelfTest
         model.AppendLog(new LogRecord(stamp.AddSeconds(2), LogLevel.Info, "自检：普通级别样例行。"));
         model.AppendLog(new LogRecord(stamp.AddSeconds(3), LogLevel.Warn, "自检：警告级别样例行。"));
         model.AppendLog(new LogRecord(stamp.AddSeconds(4), LogLevel.Error, "自检：错误级别样例行。"));
+    }
+
+    /// <summary>
+    /// 切到某一页并布局。<b>恢复页的样例行必须在切页之后才塞</b>。
+    ///
+    /// 别的页面的列表是被定时器按快照同步的，停掉定时器（<c>model.Dispose()</c>）
+    /// 就不会再被清空；恢复页不一样 —— 它的列表是在 <c>SelectedPage</c> 的 setter 里
+    /// 现扫磁盘填的（见 <c>MainViewModel.RefreshRestoreArchives</c>）。
+    /// 先塞样例再切页，切页那一下就把样例全换成真实扫描结果（自检环境下基本是空的），
+    /// 于是表格整片折叠，单元格模板里的绑定一条都测不到 —— 这正是这个方法要防的事。
+    /// </summary>
+    private static void ShowPage(MainViewModel model, Views.MainWindow window, int page, bool withSamples)
+    {
+        model.SelectedPage = page;
+
+        if (withSamples && page == MainViewModel.RestorePageIndex)
+        {
+            InjectRestoreSamples(model);
+        }
+
+        Settle(window);
+    }
+
+    /// <summary>
+    /// 恢复页的样例行。
+    ///
+    /// 两个列表都要有内容：包列表空着的话下面那块操作区里的按钮全是灰的，
+    /// 条目表也是折叠的 —— 那样这一页等于只测了标题和几行说明文字。
+    /// </summary>
+    private static void InjectRestoreSamples(MainViewModel model)
+    {
+        DateTimeOffset now = DateTimeOffset.Now;
+
+        model.RestoreArchives.Clear();
+
+        model.RestoreArchives.Add(new RestoreArchiveView(
+            @"C:\ZipTemp\Backup_20260901_2312.7z", "Backup_20260901_2312.7z",
+            555_000_000, now.AddHours(-2), true, "临时目录"));
+
+        // 第二条特意没有旁挂清单：选中它才会让那条黄色警告显示出来，
+        // 而那条警告本身也是一处绑定，不显示就等于没测。
+        model.RestoreArchives.Add(new RestoreArchiveView(
+            @"D:\OneDrive\备份\Backup_20260830_0100.7z", "Backup_20260830_0100.7z",
+            2_400_000_000, now.AddDays(-3), false, "云盘目录"));
+
+        // 选中要放在填条目之前：SelectedArchive 的 setter 会清空条目列表
+        // （换了包，上一个包的条目就不作数了）。反过来写，条目会被立刻清掉。
+        model.SelectedArchive = model.RestoreArchives[1];
+
+        model.RestoreEntries.Add(new ArchiveEntry(
+            @"Camera\IMG_0001.MOV", 1_234_567_890, now.AddDays(-4), false));
+        model.RestoreEntries.Add(new ArchiveEntry(
+            @"Camera\IMG_0002.MOV", 987_654_321, now.AddDays(-4), false));
+        model.RestoreEntries.Add(new ArchiveEntry(
+            @"Camera", 0, null, true));
     }
 
     // ==================================================================

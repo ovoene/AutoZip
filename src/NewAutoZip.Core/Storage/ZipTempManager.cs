@@ -1,10 +1,24 @@
 using NewAutoZip.Core.Diagnostics;
+using NewAutoZip.Core.Packing;
 
 namespace NewAutoZip.Core.Storage;
 
+/// <param name="Bytes">归档<b>自身</b>的字节数。</param>
 public sealed record ArchiveInfo(string Path, long Bytes, DateTimeOffset CreatedUtc)
 {
     public string FileName => System.IO.Path.GetFileName(Path);
+
+    /// <summary>旁挂清单的字节数；没有清单就是 0。</summary>
+    public long SidecarBytes { get; init; }
+
+    /// <summary>
+    /// 这个归档在磁盘上实际占的总量（含旁挂清单）。配额算账用它。
+    ///
+    /// 清单只有一两 KB，单看微不足道；但配额的意义是"ZipTemp 到底占了多少"，
+    /// 而不是"归档文件加起来多少"。漏算的部分永远不会被任何一条上限看见 ——
+    /// 这个项目要防的恰恰就是这种"没人负责的磁盘占用"。
+    /// </summary>
+    public long TotalBytes => Bytes + SidecarBytes;
 }
 
 public sealed record QuotaReport(
@@ -42,8 +56,18 @@ public sealed record PrecheckResult(bool Ok, string? Reason, long FreeBytes, lon
 /// </summary>
 public sealed class ZipTempManager
 {
-    /// <summary>Runner 产生的中间文件，启动时一律清扫。</summary>
-    private static readonly string[] IntermediatePatterns = ["*.7z.part", "*.7z.list", "*.tmp"];
+    /// <summary>
+    /// Runner 产生的中间文件，启动时一律清扫。
+    ///
+    /// <c>*.writing</c> 是旁挂清单的半成品后缀。它<b>不能</b>叫 <c>.tmp</c> ——
+    /// 那样会和下面这条 <c>*.tmp</c> 撞上，正在写的清单可能被同一轮清扫删掉。
+    ///
+    /// 最后一条是<b>包内</b>清单的中转文件。它必须以那个固定名字落在磁盘上
+    /// （演练解包后按名字找它），所以没法带临时后缀；正常路径下打包结束就删掉了，
+    /// 这里兜住"打包中途进程被杀"留下的那一份。
+    /// </summary>
+    private static readonly string[] IntermediatePatterns =
+        ["*.7z.part", "*.7z.list", "*.tmp", "*.writing", ArchiveManifest.EntryName];
 
     private readonly IAppLogger _log;
     private readonly TimeProvider _time;
@@ -105,10 +129,29 @@ public sealed class ZipTempManager
                         ? info.CreationTimeUtc
                         : info.LastWriteTimeUtc;
 
+                    long sidecarBytes = 0;
+
+                    try
+                    {
+                        FileInfo sidecar = new(ArchiveManifest.SidecarPathFor(info.FullName));
+
+                        if (sidecar.Exists)
+                        {
+                            sidecarBytes = sidecar.Length;
+                        }
+                    }
+                    catch
+                    {
+                        // 读不到清单信息不影响归档本身入账。
+                    }
+
                     archives.Add(new ArchiveInfo(
                         info.FullName,
                         info.Length,
-                        new DateTimeOffset(created, TimeSpan.Zero)));
+                        new DateTimeOffset(created, TimeSpan.Zero))
+                    {
+                        SidecarBytes = sidecarBytes,
+                    });
                 }
                 catch
                 {
@@ -127,7 +170,8 @@ public sealed class ZipTempManager
     }
 
     /// <summary>
-    /// 清扫 .part / .list / .tmp 残骸。程序启动时以及每次批次结束后都跑一遍。
+    /// 清扫 .part / .list / .tmp / .writing 残骸，以及演练留下的临时目录。
+    /// 程序启动时以及每次批次结束后都跑一遍。
     /// </summary>
     public int SweepIntermediates()
     {
@@ -160,9 +204,62 @@ public sealed class ZipTempManager
             }
         }
 
+        removed += SweepDrillDirectories();
+
         if (removed > 0)
         {
-            _log.Info($"已清扫 {removed} 个遗留的中间文件（.part / .list / .tmp）。");
+            _log.Info($"已清扫 {removed} 个遗留的中间文件（.part / .list / .tmp / 演练目录）。");
+        }
+
+        return removed;
+    }
+
+    /// <summary>
+    /// 删掉演练留下的临时目录。
+    ///
+    /// 这些目录里装的是<b>解压出来的完整副本</b>，和源文件一样大 ——
+    /// 是这个程序在磁盘上单次占用最多的东西。演练自己的 finally 会删，
+    /// 但进程被杀、解出来的文件正被杀毒软件占用时都删不掉，必须有人兜底。
+    ///
+    /// 跳过正在使用中的目录：手动演练和引擎演练在同一个进程里并行，
+    /// 引擎 tick 结束时的这一轮清扫正好能撞上界面那边跑了一半的演练。
+    /// </summary>
+    private int SweepDrillDirectories()
+    {
+        IEnumerable<string> directories;
+
+        try
+        {
+            directories = Directory.EnumerateDirectories(
+                _directory, RestoreDrillService.DrillDirectoryPrefix + "*");
+        }
+        catch
+        {
+            return 0;
+        }
+
+        int removed = 0;
+
+        foreach (string dir in directories)
+        {
+            if (RestoreDrillService.IsActive(dir))
+            {
+                continue;
+            }
+
+            try
+            {
+                Directory.Delete(dir, recursive: true);
+                removed++;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                // 已经没了，正是我们要的结果。
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"删除演练临时目录失败，下次清扫会再试：{dir}", ex);
+            }
         }
 
         return removed;
@@ -170,6 +267,10 @@ public sealed class ZipTempManager
 
     /// <summary>
     /// 执行三重配额。<paramref name="protectedPaths"/> 里的归档绝不删除。
+    ///
+    /// 删归档时<b>连带删掉它的旁挂清单</b>。漏了这一步，清单就成了孤儿：
+    /// 归档被淘汰一个它留下一个，谁也不会再删，一直攒到手动清理为止 ——
+    /// 这正是这个类存在的理由那类 bug。
     /// </summary>
     public QuotaReport Enforce(
         int keepDays,
@@ -178,6 +279,15 @@ public sealed class ZipTempManager
         IReadOnlySet<string>? protectedPaths = null)
     {
         IReadOnlyList<ArchiveInfo> archives = ListArchives();
+
+        // 先收走那些"归档已经不在了，清单还留着"的孤儿。它们可能来自上一个版本、
+        // 也可能来自某次删除只删掉了一半的中断 —— 不管怎么来的，留着没有任何用处。
+        int orphans = SweepOrphanSidecars(archives);
+
+        if (orphans > 0)
+        {
+            _log.Info($"清理了 {orphans} 份没有对应归档的旁挂清单。");
+        }
 
         if (archives.Count == 0)
         {
@@ -215,10 +325,10 @@ public sealed class ZipTempManager
                 continue;
             }
 
-            if (TryDelete(archive.Path))
+            if (DeleteArchive(archive))
             {
                 deleted.Add(archive.FileName);
-                deletedBytes += archive.Bytes;
+                deletedBytes += archive.TotalBytes;
             }
             else
             {
@@ -229,7 +339,7 @@ public sealed class ZipTempManager
         // 第二、三轮：按数量与总容量，都是最旧优先淘汰。survivors 已经是从旧到新排好的。
         // index 只在"这个文件不能删"时前进；能删就 RemoveAt，下一个最旧的自动落到同一位置。
         // 因此 survivors.Count 始终是真实剩余数量，index >= Count 表示剩下的全都不能删。
-        long totalBytes = survivors.Sum(a => a.Bytes);
+        long totalBytes = survivors.Sum(a => a.TotalBytes);
         int index = 0;
 
         while (index < survivors.Count
@@ -243,11 +353,11 @@ public sealed class ZipTempManager
                 continue;
             }
 
-            if (TryDelete(candidate.Path))
+            if (DeleteArchive(candidate))
             {
                 deleted.Add(candidate.FileName);
-                deletedBytes += candidate.Bytes;
-                totalBytes -= candidate.Bytes;
+                deletedBytes += candidate.TotalBytes;
+                totalBytes -= candidate.TotalBytes;
                 survivors.RemoveAt(index);
             }
             else
@@ -257,7 +367,7 @@ public sealed class ZipTempManager
         }
 
         int remainingCount = survivors.Count;
-        long remainingBytes = survivors.Sum(a => a.Bytes);
+        long remainingBytes = survivors.Sum(a => a.TotalBytes);
 
         if (remainingCount > maxCount || remainingBytes > maxTotalBytes)
         {
@@ -280,6 +390,64 @@ public sealed class ZipTempManager
         }
 
         return new QuotaReport(deleted.Count, deletedBytes, remainingCount, remainingBytes, deleted, notes);
+    }
+
+    /// <summary>删一个归档，连同它的旁挂清单。归档本身删掉了才算成功。</summary>
+    private bool DeleteArchive(ArchiveInfo archive)
+    {
+        if (!TryDelete(archive.Path))
+        {
+            // 归档没删掉就别动清单 —— 那会把一个还在的包变成没有账本的包。
+            return false;
+        }
+
+        TryDelete(ArchiveManifest.SidecarPathFor(archive.Path));
+        return true;
+    }
+
+    /// <summary>删掉那些对应归档已经不存在的旁挂清单。</summary>
+    private int SweepOrphanSidecars(IReadOnlyList<ArchiveInfo> archives)
+    {
+        IEnumerable<string> sidecars;
+
+        try
+        {
+            sidecars = Directory.EnumerateFiles(_directory, "*" + ArchiveManifest.SidecarSuffix);
+        }
+        catch
+        {
+            return 0;
+        }
+
+        HashSet<string> known = new(
+            archives.Select(a => ArchiveManifest.SidecarPathFor(a.Path)),
+            StringComparer.OrdinalIgnoreCase);
+
+        int removed = 0;
+
+        foreach (string sidecar in sidecars)
+        {
+            if (known.Contains(sidecar))
+            {
+                continue;
+            }
+
+            // 归档不在了才删。这里不能反过来按"清单名去掉后缀"推归档路径就直接判断 ——
+            // ListArchives 可能因为读不到某个文件而跳过它，那时归档其实还在。
+            string archivePath = sidecar[..^ArchiveManifest.SidecarSuffix.Length];
+
+            if (File.Exists(archivePath))
+            {
+                continue;
+            }
+
+            if (TryDelete(sidecar))
+            {
+                removed++;
+            }
+        }
+
+        return removed;
     }
 
     /// <summary>打包前的磁盘预检：放不下就直接拒绝，不产生任何文件。</summary>

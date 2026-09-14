@@ -29,6 +29,7 @@
             <views:HasContentVisibilityConverter x:Key="HasContent" />
             <views:TimeOfDayConverter x:Key="TimeOfDay" />
             <views:StampConverter x:Key="Stamp" />
+            <views:ByteSizeConverter x:Key="ByteSize" />
 
             <!--
                 ==================== 语义配色 ====================

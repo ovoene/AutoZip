@@ -3,7 +3,9 @@ using NewAutoZip.Core.Configuration;
 using NewAutoZip.Core.Diagnostics;
 using NewAutoZip.Core.Notifications;
 using NewAutoZip.Core.OneDrive;
+using NewAutoZip.Core.Packing;
 using NewAutoZip.Core.Pipeline;
+using NewAutoZip.Core.Storage;
 
 namespace NewAutoZip.App.Services;
 
@@ -23,11 +25,23 @@ public sealed class EngineHost : IAsyncDisposable
     private readonly SettingsStore _store;
     private readonly BackupEngine _engine;
 
+    /// <summary>
+    /// 只用来数云盘目录里的包，给 <see cref="DescribeCloudQuota"/> 用。
+    ///
+    /// 引擎自己也有一个，但那个是私有的、且只在引擎跑起来后才配好路径 ——
+    /// 而这里要回答的恰恰是"引擎停着的时候容量卡片显示什么"。
+    ///
+    /// <b>只调 <c>ListArchives</c>，永远不调 <c>Enforce</c>。</b>
+    /// 云盘目录里的包是备份本体，不是中转站（见 <see cref="CloudQuota"/> 的类注释）。
+    /// </summary>
+    private readonly ZipTempManager _cloudScanner;
+
     public EngineHost(IAppLogger log)
     {
         _log = log;
         _store = new SettingsStore(AppPaths.SettingsFile);
         _engine = new BackupEngine(log);
+        _cloudScanner = new ZipTempManager(log, TimeProvider.System);
 
         Settings = _store.Load(out string? warning);
         Settings.ClampToLimits();
@@ -172,6 +186,249 @@ public sealed class EngineHost : IAsyncDisposable
     /// <summary>界面上「测试发送」按钮：忽略事件勾选，直接发一条。</summary>
     public Task<NotifyResult> TestNotifyAsync(AppSettings settings, CancellationToken ct) =>
         NotificationHub.TestAsync(settings, _log, ct);
+
+    // ==================================================================
+    //  恢复
+    //
+    //  「恢复」页要的四件事全从这里走。界面不碰 SevenZipRunner，
+    //  也不碰 RestoreDrillService —— 那两个都要知道 7za 在哪、临时目录在哪、
+    //  密码从哪来，这些装配知识只应该存在于这个类里。
+    // ==================================================================
+
+    /// <summary>
+    /// 现在能拿来恢复的包。临时目录与云盘目录各扫一遍，新的排前面。
+    ///
+    /// 两个目录都扫，是因为一个包在它的生命周期里会先后待在这两处：
+    /// 刚打好时在临时目录，投递之后在云盘目录。只扫一处必然有一半的包看不见。
+    /// </summary>
+    public IReadOnlyList<ArchiveInfo> ListRestorableArchives()
+    {
+        List<ArchiveInfo> found = [];
+        HashSet<string> seen = new(StringComparer.OrdinalIgnoreCase);
+
+        foreach (string directory in new[] { Settings.ResolveZipTemp(), Settings.CloudPath })
+        {
+            if (string.IsNullOrWhiteSpace(directory))
+            {
+                continue;
+            }
+
+            // 同一个目录被配置两次（临时目录就设在云盘目录里）时只扫一遍，
+            // 否则列表里每个包都会出现两次。
+            if (!seen.Add(NormalizeDirectory(directory)))
+            {
+                continue;
+            }
+
+            ZipTempManager scanner = new(_log, TimeProvider.System);
+            scanner.Configure(directory);
+
+            found.AddRange(scanner.ListArchives());
+        }
+
+        // ListArchives 给的是从旧到新，恢复场景要的恰好相反 ——
+        // 十有八九是想拿最近那个包。
+        found.Sort((a, b) => b.CreatedUtc.CompareTo(a.CreatedUtc));
+
+        return found;
+    }
+
+    /// <summary>解之前先看看里面有什么。密码不对时 <c>WrongPassword</c> 为 true。</summary>
+    public Task<ArchiveListing> ListArchiveContentsAsync(
+        string archivePath,
+        string password,
+        CancellationToken ct) =>
+        NewRunner().ListAsync(
+            archivePath,
+            password,
+            TimeSpan.FromMinutes(Settings.DrillTimeoutMinutes),
+            ct);
+
+    /// <summary>把整个包解到指定目录。</summary>
+    public Task<ExtractResult> ExtractAsync(
+        string archivePath,
+        string targetDirectory,
+        string password,
+        IProgress<PackProgress>? progress,
+        CancellationToken ct) =>
+        NewRunner().ExtractAsync(
+            new ExtractRequest(
+                archivePath,
+                targetDirectory,
+                password,
+                TimeSpan.FromMinutes(Settings.DrillTimeoutMinutes),
+                Overwrite: true),
+            progress,
+            ct);
+
+    /// <summary>
+    /// 手动演练一个包 —— 解出来、逐条核对、立刻删干净，不在磁盘上留东西。
+    ///
+    /// 密码<b>从磁盘上重新读</b>，不用内存里这份。演练要回答的问题正是
+    /// "settings.json 里存着的那个密码，现在还解得开这个包吗"；
+    /// 拿内存里的副本去验，等于自己考自己。
+    /// </summary>
+    public Task<DrillResult> RunDrillAsync(string archivePath, CancellationToken ct)
+    {
+        AppSettings onDisk = _store.Load(out _);
+        onDisk.ClampToLimits();
+
+        RestoreDrillService drill = new(NewRunner(), _log);
+
+        return drill.RunAsync(
+            archivePath,
+            onDisk.Password,
+            onDisk.ResolveZipTemp(),
+            TimeSpan.FromMinutes(onDisk.DrillTimeoutMinutes),
+            onDisk.MinFreeDiskBytes,
+            ct);
+    }
+
+    /// <summary>
+    /// 演练与解压默认用的密码 —— 磁盘上现存的那个。
+    ///
+    /// 界面把它填进密码框当默认值，用户可以改：换过密码的老包需要旧密码才解得开，
+    /// 而那种包恰恰是最需要能被恢复出来的。
+    /// </summary>
+    public string CurrentPassword => Settings.Password;
+
+    private SevenZipRunner NewRunner() => new(AppPaths.SevenZipExe, _log);
+
+    // ==================================================================
+    //  云盘容量
+    // ==================================================================
+
+    /// <summary>
+    /// 按<b>磁盘上那份配置</b>算一遍容量账。引擎停着时总览的容量卡片用它。
+    ///
+    /// 引擎在跑的时候快照里就带着这份数字（<c>BackupEngine.BuildSnapshot</c> 每轮算），
+    /// 停了之后那四个字段全是 0 —— 而"0 总容量"在界面上的含义是"没配预算，把卡片藏起来"。
+    /// 用户明明填了容量却看不见卡片，就是这么来的。
+    ///
+    /// <b>这里会真的枚举一次目录，别放到 4 Hz 的轮询路径上。</b>
+    /// 调用点只有 <c>MainViewModel.SyncCloudDisplay</c> 那几个（保存 / 重新读取 /
+    /// 引擎启停 / 构造），与云盘类型的同步点是同一批。
+    ///
+    /// 没填总容量时直接返回 <see cref="CloudQuotaStatus.NotConfigured"/>，
+    /// 连目录都不扫 —— 那是一次白花的枚举，与引擎里那道早退是同一个理由。
+    /// </summary>
+    public CloudQuotaStatus DescribeCloudQuota()
+    {
+        if (Settings.CloudQuotaBytes <= 0)
+        {
+            return CloudQuotaStatus.NotConfigured;
+        }
+
+        // 每次都重新 Configure：保存配置可能刚把 CloudPath 改到别处，
+        // 只在构造时配一次的话，改完路径算的还是旧目录。
+        _cloudScanner.Configure(Settings.CloudPath);
+
+        return CloudQuota.Evaluate(Settings, CloudQuota.MeasureUsed(_cloudScanner));
+    }
+
+    // ==================================================================
+    //  清空历史记录
+    // ==================================================================
+
+    /// <summary>
+    /// 清空之后会发生什么 —— 界面拿它拼确认框正文。
+    ///
+    /// 状态从引擎取：引擎停着时它会现读磁盘那一份，运行中则给内存里的视图。
+    /// 界面自己 new 一个 <see cref="StateStore"/> 去读也能读到，但那样就有
+    /// 两条通往同一个文件的路，日后改路径必定漏掉一条。
+    /// </summary>
+    public ClearHistoryAdvice DescribeClearHistory() =>
+        ClearHistoryAdvice.For(Settings, _engine.StateView);
+
+    /// <summary>
+    /// 把运行状态复位成"从未运行过"，并按需删掉磁盘上的日志文件。
+    ///
+    /// <b>引擎必须先停。</b>运行中的引擎持有状态的内存副本，
+    /// 下一次保存会把旧状态原样写回去 —— 用户看到的是"点了没反应"。
+    /// 拦这一道的是 <see cref="BackupEngine.ResetState"/>，不指望界面记得禁用按钮。
+    ///
+    /// <b>压缩包一个都不删。</b>清的是账本，不是备份。
+    /// </summary>
+    public bool ClearHistory(bool deleteLogFiles, out string message)
+    {
+        if (!_engine.ResetState(out string? error))
+        {
+            message = _engine.IsRunning
+                ? "引擎正在运行，请先停止再清空历史记录。"
+                : $"清空运行状态失败：{error}";
+
+            return false;
+        }
+
+        string tail = string.Empty;
+
+        if (deleteLogFiles)
+        {
+            int deleted = DeleteLogFiles(out string? logError);
+
+            tail = logError is null
+                ? $"，并删除了 {deleted} 个日志文件"
+                : $"。日志文件未能全部删除（{logError}）";
+        }
+
+        message = $"历史记录已清空{tail}。下次启动将按首次运行处理。";
+        _log.Info(message);
+
+        return true;
+    }
+
+    /// <summary>
+    /// 删掉日志目录里的 <c>*.log</c>。
+    ///
+    /// <see cref="RollingFileLogger"/> 用 <c>File.AppendAllText</c> 写盘、不持有文件句柄，
+    /// 所以当前正在写的那个也删得掉，下一条日志会自动把它重建出来。
+    /// </summary>
+    private static int DeleteLogFiles(out string? error)
+    {
+        error = null;
+        int deleted = 0;
+
+        try
+        {
+            if (!Directory.Exists(AppPaths.LogDirectory))
+            {
+                return 0;
+            }
+
+            foreach (string file in Directory.EnumerateFiles(AppPaths.LogDirectory, "*.log"))
+            {
+                try
+                {
+                    File.Delete(file);
+                    deleted++;
+                }
+                catch (Exception ex)
+                {
+                    // 单个文件删不掉（被别的程序打开着）不该让整件事失败 ——
+                    // 状态已经清了，这里再抛出去只会让用户以为清空没成功。
+                    error ??= ex.Message;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            error ??= ex.Message;
+        }
+
+        return deleted;
+    }
+
+    private static string NormalizeDirectory(string path)
+    {
+        try
+        {
+            return Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+        }
+        catch
+        {
+            return path;
+        }
+    }
 
     // ==================================================================
     //  辅助

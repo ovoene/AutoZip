@@ -103,6 +103,93 @@ public class FormattingTests
     [Fact]
     public void FormatClock_负数归零不产生负号() =>
         Assert.Equal("0小时0分0秒", ByteSize.FormatClock(TimeSpan.FromSeconds(-30)));
+
+    // ==================================================================
+    //  单位换算 —— 给"数值 + 单位下拉框"那种输入方式用
+    // ==================================================================
+
+    [Theory]
+    [InlineData(0, 1L)]
+    [InlineData(2, 1024L * 1024)]
+    [InlineData(3, 1024L * 1024 * 1024)]
+    [InlineData(4, 1024L * 1024 * 1024 * 1024)]
+    public void UnitFactor_按1024的幂次(int power, long expected) =>
+        Assert.Equal(expected, ByteSize.UnitFactor(power));
+
+    [Fact]
+    public void UnitFactor_幂次越界夹到合法范围()
+    {
+        Assert.Equal(1L, ByteSize.UnitFactor(-5));
+        Assert.Equal(ByteSize.UnitFactor(5), ByteSize.UnitFactor(99));
+    }
+
+    [Theory]
+    [InlineData(1024L * 1024 * 1024 * 1024, 1.0, 4)]          // 1 TB 要显示成 1 TB，不是 1024 GB
+    [InlineData(100L * 1024 * 1024 * 1024, 100.0, 3)]         // 100 GB
+    [InlineData(512L * 1024 * 1024, 512.0, 2)]                // 512 MB
+    public void ToUnit_挑能整除的最大单位(long bytes, double value, int power)
+    {
+        (double actual, int actualPower) = ByteSize.ToUnit(bytes);
+
+        Assert.Equal(value, actual, 6);
+        Assert.Equal(power, actualPower);
+    }
+
+    [Fact]
+    public void ToUnit_零退到GB()
+    {
+        // 0 没有"最大单位"可言。容量预算按 GB 起步最顺手。
+        (double value, int power) = ByteSize.ToUnit(0);
+
+        Assert.Equal(0, value);
+        Assert.Equal(3, power);
+    }
+
+    [Fact]
+    public void ToUnit_下限之下的值按下限那一档拆()
+    {
+        // 手改出来的 1536 字节本来会被拆成 1.5 KB，而设置页的下拉框最低只有 MB ——
+        // 单位在下拉框里找不到、落回默认项，1.5 KB 就成了 1.5 GB，一百万倍的误差。
+        (double value, int power) = ByteSize.ToUnit(1536, minPower: 2);
+
+        Assert.Equal(2, power);
+        Assert.Equal(1536.0 / (1024 * 1024), value, 9);
+    }
+
+    [Theory]
+    [InlineData(1.0, 4)]
+    [InlineData(100.0, 3)]
+    [InlineData(512.0, 2)]
+    [InlineData(1.5, 3)]
+    public void 单位换算来回跑不失真(double value, int power)
+    {
+        // 界面上填的是"数值 + 单位"，磁盘上存的是字节。
+        // 存一次读一次要能原样回来，否则用户每打开一次设置页，单位就往下掉一档。
+        long bytes = ByteSize.FromUnit(value, power);
+
+        (double backValue, int backPower) = ByteSize.ToUnit(bytes, minPower: 2);
+
+        Assert.Equal(bytes, ByteSize.FromUnit(backValue, backPower));
+    }
+
+    [Fact]
+    public void FromUnit_零和负数都归零()
+    {
+        // 负的容量预算会让"放不下"的判断整个反过来。
+        Assert.Equal(0, ByteSize.FromUnit(0, 3));
+        Assert.Equal(0, ByteSize.FromUnit(-5, 3));
+    }
+
+    [Fact]
+    public void FromUnit_溢出夹在上限而不是绕回负数()
+    {
+        // PB 那一档填个很大的数，乘出来会超过 long.MaxValue。
+        // 绕回负数比夹在上限危险得多：负预算 = 永远"放不下" = 再也不打包。
+        long bytes = ByteSize.FromUnit(1_000_000, 5);
+
+        Assert.True(bytes > 0, "溢出后绕回了负数");
+        Assert.Equal(long.MaxValue, bytes);
+    }
 }
 
 public class ScheduleWindowTests
@@ -415,6 +502,92 @@ public class SettingsLimitsTests
 
         Assert.Single(a.ExcludePatterns);
         Assert.Equal(2, b.ExcludePatterns.Count);
+    }
+
+    [Fact]
+    public void ClampToLimits_演练参数的零值被抬到安全下限()
+    {
+        // 演练间隔 0 小时 = 每一轮都做一次云端演练：每次都要把包重新下载回本地，
+        // 按流量计费的线路上等于持续烧钱，而且会一直占着主循环。
+        // 超时 0 分钟 = 演练必然超时，于是永远验不成 —— 那比不做演练更糟：
+        // 它会持续产生"失败"噪音，把真正的失败淹掉。
+        AppSettings s = new()
+        {
+            CloudDrillIntervalHours = 0,
+            DrillTimeoutMinutes = 0,
+        };
+
+        s.ClampToLimits();
+
+        Assert.Equal(SettingsLimits.CloudDrillIntervalHoursMin, s.CloudDrillIntervalHours);
+        Assert.Equal(SettingsLimits.DrillTimeoutMinutesMin, s.DrillTimeoutMinutes);
+
+        Assert.True(s.CloudDrillIntervalHours > 0);
+        Assert.True(s.DrillTimeoutMinutes > 0);
+    }
+
+    [Fact]
+    public void ClampToLimits_演练参数的负值与超大值都被压住()
+    {
+        // 负值会走到 TimeSpan.FromHours(负数)：演练间隔判定恒为真，
+        // 超时是负的则一启动就算超时。两者都是"配置写错 → 程序行为彻底反转"。
+        AppSettings negative = new()
+        {
+            CloudDrillIntervalHours = -1,
+            DrillTimeoutMinutes = int.MinValue,
+        };
+
+        negative.ClampToLimits();
+
+        Assert.Equal(SettingsLimits.CloudDrillIntervalHoursMin, negative.CloudDrillIntervalHours);
+        Assert.Equal(SettingsLimits.DrillTimeoutMinutesMin, negative.DrillTimeoutMinutes);
+
+        AppSettings huge = new()
+        {
+            CloudDrillIntervalHours = int.MaxValue,
+            DrillTimeoutMinutes = int.MaxValue,
+        };
+
+        huge.ClampToLimits();
+
+        Assert.Equal(SettingsLimits.CloudDrillIntervalHoursMax, huge.CloudDrillIntervalHours);
+        Assert.Equal(SettingsLimits.DrillTimeoutMinutesMax, huge.DrillTimeoutMinutes);
+    }
+
+    [Fact]
+    public void ClampToLimits_合法的演练参数原样保留()
+    {
+        // 夹紧不能把用户认真填的值也改掉 —— 那样设置页会出现"存进去和显示出来不一样"。
+        AppSettings s = new()
+        {
+            CloudDrillIntervalHours = 168,
+            DrillTimeoutMinutes = 60,
+        };
+
+        s.ClampToLimits();
+
+        Assert.Equal(168, s.CloudDrillIntervalHours);
+        Assert.Equal(60, s.DrillTimeoutMinutes);
+    }
+
+    [Fact]
+    public void 演练参数的默认值本身就在合法区间内()
+    {
+        // 默认值落在区间外的话，一份全新配置存盘再读回来就会"自己变样"。
+        AppSettings fresh = new();
+
+        int interval = fresh.CloudDrillIntervalHours;
+        int timeout = fresh.DrillTimeoutMinutes;
+
+        fresh.ClampToLimits();
+
+        Assert.Equal(interval, fresh.CloudDrillIntervalHours);
+        Assert.Equal(timeout, fresh.DrillTimeoutMinutes);
+
+        Assert.InRange(interval,
+            SettingsLimits.CloudDrillIntervalHoursMin, SettingsLimits.CloudDrillIntervalHoursMax);
+        Assert.InRange(timeout,
+            SettingsLimits.DrillTimeoutMinutesMin, SettingsLimits.DrillTimeoutMinutesMax);
     }
 }
 

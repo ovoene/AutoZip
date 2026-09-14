@@ -72,6 +72,39 @@ public sealed class StateStore
         }
     }
 
+    /// <summary>
+    /// 把运行状态复位成"全新的、从未运行过"的样子。
+    ///
+    /// 清的是<b>账本</b>：累计计数、各类时间戳、增量水位线 <c>Checkpoint</c>、
+    /// 首次运行标记、待上传队列、隔离批次、强制/未来时间戳台账 —— 全部回到初始值。
+    ///
+    /// 清的<b>不是备份</b>：ZipTemp 与云盘目录里的压缩包一个都不碰。
+    /// 这个区分是这个方法存在的全部意义，调用方的确认文案里必须说清楚。
+    ///
+    /// <b>只能在引擎停止时调用。</b><see cref="BackupEngine"/> 启动时把状态读进内存副本，
+    /// 之后十几处 <see cref="Save"/> 会把那份副本写回来 —— 运行中复位，
+    /// 下一次保存就把旧状态原样写回去了，用户看到的是"点了没反应"。
+    ///
+    /// 与 <see cref="Save"/> 不同，这里<b>会</b>把失败报告给调用方：
+    /// 这是用户主动点的一次性操作，失败了必须当场说，不能只记一行日志。
+    /// </summary>
+    /// <returns>成功为 true；失败时 <paramref name="error"/> 带上原因。</returns>
+    public bool Reset(out string? error)
+    {
+        lock (_gate)
+        {
+            if (AtomicJsonFile.TryWrite(_path, new EngineState(), out error))
+            {
+                _warnedAboutSaveFailure = false;
+                _log.Info("运行状态已清空，下次启动按首次运行处理。");
+                return true;
+            }
+
+            _log.Error($"清空运行状态失败：{error}");
+            return false;
+        }
+    }
+
     private void TryPreserveBadFile()
     {
         try

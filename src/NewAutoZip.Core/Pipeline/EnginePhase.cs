@@ -28,6 +28,12 @@ public enum EnginePhase
     /// <summary>上一批失败，正在按退避间隔等待重试。</summary>
     Retrying,
 
+    /// <summary>
+    /// 正在做恢复演练：把包真的解开一遍，确认它还能用。
+    /// 两种 <c>CloudTarget</c> 模式下都可能出现（本地刚打完的包、以及云端抽验的包）。
+    /// </summary>
+    Drilling,
+
     Stopping,
 }
 
@@ -66,6 +72,7 @@ public static class EnginePhaseText
         EnginePhase.WaitingUpload => "等待上传完成",
         EnginePhase.Releasing => "释放本地空间",
         EnginePhase.Retrying => "等待重试",
+        EnginePhase.Drilling => "恢复演练中",
         EnginePhase.Stopping => "正在停止",
         _ => phase.ToString(),
     };
