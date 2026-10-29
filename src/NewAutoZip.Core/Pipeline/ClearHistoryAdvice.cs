@@ -37,6 +37,12 @@ public sealed record ClearHistoryAdvice(
     long TotalArchivesCreated,
     long TotalBytesArchived)
 {
+    /// <summary>会被清掉的待重试批次条数（重试队列现在也存在状态里，清空时一起清）。</summary>
+    public int RetryCount { get; init; }
+
+    /// <summary>其中已经打好包、只等重新投递的条数 —— 清掉之后那些包不会再被自动投递。</summary>
+    public int PendingRedeliveryCount { get; init; }
+
     /// <summary>
     /// 看一眼当前配置与状态，算出清空后的后果。
     ///
@@ -58,7 +64,12 @@ public sealed record ClearHistoryAdvice(
             state.PendingUploads.Count,
             state.Quarantined.Count,
             state.TotalArchivesCreated,
-            state.TotalBytesArchived);
+            state.TotalBytesArchived)
+        {
+            RetryCount = (state.Retries?.Count ?? 0) + (state.InFlightDelivery is null ? 0 : 1),
+            PendingRedeliveryCount = (state.Retries?.Count(r => !string.IsNullOrEmpty(r.ArchivePath)) ?? 0)
+                                     + (string.IsNullOrEmpty(state.InFlightDelivery?.ArchivePath) ? 0 : 1),
+        };
     }
 
     /// <summary>
@@ -84,6 +95,14 @@ public sealed record ClearHistoryAdvice(
         if (QuarantineCount > 0)
         {
             lines.Add($"　· 隔离批次 {QuarantineCount} 条");
+        }
+
+        if (RetryCount > 0)
+        {
+            lines.Add(PendingRedeliveryCount > 0
+                ? $"　· 待重试批次 {RetryCount} 条（其中 {PendingRedeliveryCount} 个包已经打好、还没送进目标目录：" +
+                  "它们会留在临时目录里，不再自动投递）"
+                : $"　· 待重试批次 {RetryCount} 条");
         }
 
         if (deleteLogFiles)

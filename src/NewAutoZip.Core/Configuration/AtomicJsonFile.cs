@@ -39,6 +39,9 @@ public static class AtomicJsonFile
             string json = File.ReadAllText(path, Encoding.UTF8);
             if (string.IsNullOrWhiteSpace(json))
             {
+                // 文件在、却是空的：几乎只可能是写到一半断电。必须说出来 ——
+                // 原先这里当成"没有文件"静默返回，调用方就悄悄换上了一份默认配置。
+                error = "文件是空的（可能是上次写入时断电或进程被强制结束）。";
                 return null;
             }
 
@@ -61,9 +64,19 @@ public static class AtomicJsonFile
         }
 
         string temp = path + ".tmp";
-        string json = JsonSerializer.Serialize(value, Options);
+        byte[] json = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)
+            .GetBytes(JsonSerializer.Serialize(value, Options));
 
-        File.WriteAllText(temp, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        // 先把内容真正写到盘上，再改名。
+        //
+        // 只靠"写 .tmp 再改名"挡不住断电：改名是文件系统元数据，NTFS 的日志会先把它落盘，
+        // 而文件内容还在缓存里 —— 断电后得到的是一个改好了名、内容却是空的（或半截的）文件，
+        // 比原子写想避免的情况还糟。Flush(true) 等内容落盘之后才返回。
+        using (FileStream stream = new(temp, FileMode.Create, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough))
+        {
+            stream.Write(json);
+            stream.Flush(flushToDisk: true);
+        }
 
         // File.Move(overwrite:true) 在同目录内是原子替换。
         File.Move(temp, path, overwrite: true);

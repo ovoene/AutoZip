@@ -82,6 +82,13 @@ public sealed class EngineHost : IAsyncDisposable
 
     public ValidationReport Validate() => Validate(Settings);
 
+    /// <summary>
+    /// 设置页上边打字边校验用的轻量版：只看路径在不在，不往磁盘写任何东西。
+    /// 每敲一个字就调一次，所以绝不能写探测文件或建目录（见 SettingsValidator.Validate）。
+    /// </summary>
+    public ValidationReport ValidateLive(AppSettings settings) =>
+        SettingsValidator.Validate(settings, AppPaths.SevenZipExe, probeWrites: false);
+
     // ==================================================================
     //  生命周期
     // ==================================================================
@@ -170,6 +177,29 @@ public sealed class EngineHost : IAsyncDisposable
             $"背景图 {(saved.HasBackground ? $"{saved.BackgroundImagePath}（模糊 {saved.BackgroundBlur}、不透明度 {saved.BackgroundOpacity}%）" : "无")}。");
     }
 
+    /// <summary>
+    /// 只改「随登录启动并最小化到托盘」这一项，其余字段沿用磁盘上的现值。
+    ///
+    /// 开机自启注册成功后要把这条旧方式撤掉。它和 <see cref="SaveAppearance"/> 同一个道理：
+    /// 设置页上可能躺着没提交的编辑，不能借这个机会把它们一起写下去。
+    /// </summary>
+    public void SaveStartMinimized(bool value)
+    {
+        if (Settings.StartMinimized == value)
+        {
+            return;
+        }
+
+        AppSettings next = Settings.Clone();
+        next.StartMinimized = value;
+
+        next.ClampToLimits();
+        _store.Save(next);
+        Settings = next;
+
+        _log.Debug($"已单独保存「随登录启动」= {value}。");
+    }
+
     public AppSettings ReloadSettings()
     {
         Settings = _store.Load(out string? warning);
@@ -245,10 +275,16 @@ public sealed class EngineHost : IAsyncDisposable
             ct);
 
     /// <summary>把整个包解到指定目录。</summary>
+    /// <param name="overwrite">
+    /// 目标目录里已有同名文件时：true 覆盖，false 保留原有文件、跳过包里那一份。
+    /// 由界面先问过用户再传 —— 原先固定为覆盖且不提示，解回原目录时
+    /// 较新的文件会被旧备份静静盖掉。
+    /// </param>
     public Task<ExtractResult> ExtractAsync(
         string archivePath,
         string targetDirectory,
         string password,
+        bool overwrite,
         IProgress<PackProgress>? progress,
         CancellationToken ct) =>
         NewRunner().ExtractAsync(
@@ -257,7 +293,7 @@ public sealed class EngineHost : IAsyncDisposable
                 targetDirectory,
                 password,
                 TimeSpan.FromMinutes(Settings.DrillTimeoutMinutes),
-                Overwrite: true),
+                Overwrite: overwrite),
             progress,
             ct);
 

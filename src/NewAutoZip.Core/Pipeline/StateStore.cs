@@ -43,6 +43,7 @@ public sealed class StateStore
                 state.Quarantined ??= [];
                 state.ForcedFiles ??= [];
                 state.FutureStamped ??= [];
+                state.Retries ??= [];
                 return state;
             }
 

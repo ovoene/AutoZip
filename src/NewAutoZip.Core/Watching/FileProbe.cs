@@ -106,7 +106,13 @@ public sealed class Win32FileProbe : IFileProbe
         {
             RecurseSubdirectories = recurse,
             IgnoreInaccessible = true,
-            AttributesToSkip = FileAttributes.Directory | FileAttributes.ReparsePoint,
+
+            // 不能写 Directory：AttributesToSkip 跳过的目录<b>连递归也一起跳过</b>，
+            // 原先这里带着它，"包含子目录"时对账扫描一层子目录都不进 ——
+            // 首次运行认不到子目录里已有的文件，watcher 丢了的子目录事件也永远补不回来。
+            // EnumerateFiles 本来就只返回文件，不需要它。
+            // ReparsePoint 留着：不顺着联接点 / 符号链接跑出监控目录，也不碰云占位符文件。
+            AttributesToSkip = FileAttributes.ReparsePoint,
             MatchType = MatchType.Simple,
         };
 

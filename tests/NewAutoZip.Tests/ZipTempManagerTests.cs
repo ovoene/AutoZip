@@ -42,7 +42,7 @@ public class ZipTempManagerTests
 
         for (int i = 0; i < 5; i++)
         {
-            MakeArchive(dir, $"Backup_{i}.7z", 1024, ageDays: 5 - i);   // i 越大越新
+            MakeArchive(dir, $"Backup_{i}_20260101_000000.7z", 1024, ageDays: 5 - i);   // i 越大越新
         }
 
         QuotaReport report = mgr.Enforce(NoAgeCap, maxCount: 3, NoByteCap);
@@ -51,7 +51,7 @@ public class ZipTempManagerTests
         Assert.Equal(3, report.RemainingCount);
 
         string[] left = dir.Files("*.7z").Select(Path.GetFileName).OfType<string>().Order().ToArray();
-        Assert.Equal(["Backup_2.7z", "Backup_3.7z", "Backup_4.7z"], left);
+        Assert.Equal(["Backup_2_20260101_000000.7z", "Backup_3_20260101_000000.7z", "Backup_4_20260101_000000.7z"], left);
     }
 
     [Fact]
@@ -62,7 +62,7 @@ public class ZipTempManagerTests
 
         for (int i = 0; i < 5; i++)
         {
-            MakeArchive(dir, $"Backup_{i}.7z", 40 * 1024 * 1024, ageDays: 5 - i);   // 每个 40 MB
+            MakeArchive(dir, $"Backup_{i}_20260101_000000.7z", 40 * 1024 * 1024, ageDays: 5 - i);   // 每个 40 MB
         }
 
         // 上限 100 MB（下限保护是 1 MB，所以这个值有效）→ 只能留下 2 个。
@@ -71,7 +71,7 @@ public class ZipTempManagerTests
         Assert.True(report.RemainingBytes <= 100L * 1024 * 1024,
             $"配额执行后仍有 {report.RemainingBytes} 字节，超过 100 MB 上限");
         Assert.True(report.DeletedCount >= 3);
-        Assert.DoesNotContain("Backup_0.7z", dir.Files("*.7z").Select(Path.GetFileName).OfType<string>());
+        Assert.DoesNotContain("Backup_0_20260101_000000.7z", dir.Files("*.7z").Select(Path.GetFileName).OfType<string>());
     }
 
     [Fact]
@@ -80,14 +80,14 @@ public class ZipTempManagerTests
         using TempDir dir = new();
         (ZipTempManager mgr, _, _) = Build(dir);
 
-        MakeArchive(dir, "old.7z", 1024, ageDays: 10);
-        MakeArchive(dir, "fresh.7z", 1024, ageDays: 1);
+        MakeArchive(dir, "old_20260101_000000.7z", 1024, ageDays: 10);
+        MakeArchive(dir, "fresh_20260101_000000.7z", 1024, ageDays: 1);
 
         QuotaReport report = mgr.Enforce(keepDays: 3, NoCountCap, NoByteCap);
 
         Assert.Equal(1, report.DeletedCount);
         Assert.Single(dir.Files("*.7z"));
-        Assert.EndsWith("fresh.7z", dir.Files("*.7z")[0]);
+        Assert.EndsWith("fresh_20260101_000000.7z", dir.Files("*.7z")[0]);
     }
 
     [Fact]
@@ -98,7 +98,7 @@ public class ZipTempManagerTests
         using TempDir dir = new();
         (ZipTempManager mgr, _, _) = Build(dir);
 
-        MakeArchive(dir, "veryold.7z", 1024, ageDays: 30);
+        MakeArchive(dir, "veryold_20260101_000000.7z", 1024, ageDays: 30);
 
         QuotaReport report = mgr.Enforce(keepDays: 0, NoCountCap, NoByteCap);
 
@@ -112,9 +112,9 @@ public class ZipTempManagerTests
         using TempDir dir = new();
         (ZipTempManager mgr, _, _) = Build(dir);
 
-        string locked = MakeArchive(dir, "pending.7z", 1024, ageDays: 99);   // 最旧的
-        string b = MakeArchive(dir, "b.7z", 1024, ageDays: 2);
-        string c = MakeArchive(dir, "c.7z", 1024, ageDays: 1);
+        string locked = MakeArchive(dir, "pending_20260101_000000.7z", 1024, ageDays: 99);   // 最旧的
+        string b = MakeArchive(dir, "b_20260101_000000.7z", 1024, ageDays: 2);
+        string c = MakeArchive(dir, "c_20260101_000000.7z", 1024, ageDays: 1);
 
         HashSet<string> keep = new([locked], StringComparer.OrdinalIgnoreCase);
         QuotaReport report = mgr.Enforce(keepDays: 1, maxCount: 1, NoByteCap, keep);
@@ -135,8 +135,8 @@ public class ZipTempManagerTests
         using TempDir dir = new();
         (ZipTempManager mgr, _, _) = Build(dir);
 
-        string a = MakeArchive(dir, "a.7z", 1024, ageDays: 99);
-        string b = MakeArchive(dir, "b.7z", 1024, ageDays: 98);
+        string a = MakeArchive(dir, "a_20260101_000000.7z", 1024, ageDays: 99);
+        string b = MakeArchive(dir, "b_20260101_000000.7z", 1024, ageDays: 98);
 
         HashSet<string> keep = new([a, b], StringComparer.OrdinalIgnoreCase);
         QuotaReport report = mgr.Enforce(keepDays: 1, maxCount: 1, 1024, keep);
@@ -154,19 +154,55 @@ public class ZipTempManagerTests
         using TempDir dir = new();
         (ZipTempManager mgr, _, _) = Build(dir);
 
-        dir.WriteFile("Backup_1.7z.part", 4096);
-        dir.WriteFile("Backup_1.7z.list", 128);
+        dir.WriteFile("Backup_1_20260101_000000.7z.part", 4096);
+        dir.WriteFile("Backup_1_20260101_000000.7z.list", 128);
+        dir.WriteFile(".newautozip-write-test-1234.tmp", 0);    // 启动前校验的探测文件
+        dir.WriteFile("Backup_0_20260101_000000.7z", 1024);
+
+        // 别人的同后缀文件：临时目录可能选在一个共用目录里，这些都不是我们的残骸。
         dir.WriteFile("scratch.tmp", 64);
-        dir.WriteFile("Backup_0.7z", 1024);
+        dir.WriteFile("电影.mkv.part", 4096);
+        dir.WriteFile("别人的.7z", 2048);
 
         int swept = mgr.SweepIntermediates();
 
         Assert.Equal(3, swept);
-        Assert.Single(dir.Files("*.7z"));
-        Assert.Empty(dir.Files("*.part"));
+        Assert.Equal(2, dir.Files("*.7z").Length);
+        Assert.Equal(new[] { dir.File("电影.mkv.part") }, dir.Files("*.part"));
         Assert.Empty(dir.Files("*.list"));
-        Assert.Empty(dir.Files("*.tmp"));
+        Assert.Equal(new[] { dir.File("scratch.tmp") }, dir.Files("*.tmp"));
     }
+
+    [Fact]
+    public void 配额只淘汰本程序打的包_目录里别人的压缩包一个不碰()
+    {
+        // 临时目录要是选在一个本来就放着别的压缩包的目录里，原先这些包会被当成
+        // "超过保留天数的旧包"一起删掉 —— 而它们是用户自己的文件。
+        using TempDir dir = new();
+        (ZipTempManager mgr, _, _) = Build(dir);
+
+        string foreign = MakeArchive(dir, "去年的照片.7z", 1024, ageDays: 400);
+        string ours = MakeArchive(dir, "Backup_20250101_000000.7z", 1024, ageDays: 400);
+
+        mgr.Enforce(keepDays: 3, maxCount: 20, maxTotalBytes: long.MaxValue);
+
+        Assert.True(File.Exists(foreign));
+        Assert.False(File.Exists(ours));
+        Assert.DoesNotContain(mgr.ListArchives(), a => a.Path == foreign);
+    }
+
+    [Theory]
+    [InlineData("Backup_20260813_180900.7z", true)]
+    [InlineData("My_Backup___20260813_180900.7z", true)]
+    [InlineData("Backup_20260813_180900_2.7z", true)]
+    [InlineData("Backup_20260813_180900_0123456789abcdef0123456789abcdef.7z", true)]
+    [InlineData("backup_20260813_180900.7Z", true)]
+    [InlineData("Backup_0.7z", false)]
+    [InlineData("20260813_180900.7z", false)]
+    [InlineData("照片.7z", false)]
+    [InlineData("Backup_20260813_180900.7z.part", false)]
+    public void 本程序的包名才认(string name, bool expected) =>
+        Assert.Equal(expected, Core.Packing.ArchiveNaming.IsOurs(name));
 
     [Fact]
     public void 磁盘预检_空间不够时拒绝()
@@ -227,17 +263,17 @@ public class ZipTempManagerTests
         using TempDir dir = new();
         (ZipTempManager mgr, _, _) = Build(dir);
 
-        MakeArchive(dir, "ancient.7z", 1024, ageDays: 100);         // 被天数淘汰
-        MakeArchive(dir, "big1.7z", 30 * 1024 * 1024, ageDays: 2);
-        MakeArchive(dir, "big2.7z", 30 * 1024 * 1024, ageDays: 1);
-        MakeArchive(dir, "big3.7z", 30 * 1024 * 1024, ageDays: 0);
+        MakeArchive(dir, "ancient_20260101_000000.7z", 1024, ageDays: 100);         // 被天数淘汰
+        MakeArchive(dir, "big1_20260101_000000.7z", 30 * 1024 * 1024, ageDays: 2);
+        MakeArchive(dir, "big2_20260101_000000.7z", 30 * 1024 * 1024, ageDays: 1);
+        MakeArchive(dir, "big3_20260101_000000.7z", 30 * 1024 * 1024, ageDays: 0);
 
         QuotaReport report = mgr.Enforce(keepDays: 3, maxCount: 2, maxTotalBytes: 40L * 1024 * 1024);
 
         Assert.True(report.RemainingCount <= 2, $"数量上限失效，还剩 {report.RemainingCount} 个");
         Assert.True(report.RemainingBytes <= 40L * 1024 * 1024,
             $"容量上限失效，还剩 {report.RemainingBytes} 字节");
-        Assert.False(File.Exists(dir.File("ancient.7z")));
+        Assert.False(File.Exists(dir.File("ancient_20260101_000000.7z")));
     }
 
     // ==================================================================
@@ -272,13 +308,13 @@ public class ZipTempManagerTests
         using TempDir dir = new();
         (ZipTempManager mgr, _, _) = Build(dir);
 
-        string archive = MakeArchive(dir, "Backup_0.7z", 1024);
+        string archive = MakeArchive(dir, "Backup_0_20260101_000000.7z", 1024);
         MakeSidecar(archive);
 
         IReadOnlyList<ArchiveInfo> archives = mgr.ListArchives();
 
         Assert.Single(archives);
-        Assert.Equal("Backup_0.7z", archives[0].FileName);
+        Assert.Equal("Backup_0_20260101_000000.7z", archives[0].FileName);
     }
 
     [Fact]
@@ -289,7 +325,7 @@ public class ZipTempManagerTests
         using TempDir dir = new();
         (ZipTempManager mgr, _, _) = Build(dir);
 
-        string archive = MakeArchive(dir, "Backup_0.7z", 1024);
+        string archive = MakeArchive(dir, "Backup_0_20260101_000000.7z", 1024);
         string sidecar = MakeSidecar(archive);
 
         ArchiveInfo info = Assert.Single(mgr.ListArchives());
@@ -312,7 +348,7 @@ public class ZipTempManagerTests
 
         for (int i = 0; i < 5; i++)
         {
-            string path = MakeArchive(dir, $"Backup_{i}.7z", 1024, ageDays: 5 - i);  // i 越大越新
+            string path = MakeArchive(dir, $"Backup_{i}_20260101_000000.7z", 1024, ageDays: 5 - i);  // i 越大越新
             MakeSidecar(path);
             archives.Add(path);
         }
@@ -350,8 +386,8 @@ public class ZipTempManagerTests
         using TempDir dir = new();
         (ZipTempManager mgr, _, _) = Build(dir);
 
-        string old = MakeArchive(dir, "old.7z", 1024, ageDays: 10);
-        string fresh = MakeArchive(dir, "fresh.7z", 1024, ageDays: 1);
+        string old = MakeArchive(dir, "old_20260101_000000.7z", 1024, ageDays: 10);
+        string fresh = MakeArchive(dir, "fresh_20260101_000000.7z", 1024, ageDays: 1);
         MakeSidecar(old);
         MakeSidecar(fresh);
 
@@ -372,7 +408,7 @@ public class ZipTempManagerTests
         using TempDir dir = new();
         (ZipTempManager mgr, _, _) = Build(dir);
 
-        string locked = MakeArchive(dir, "pending.7z", 1024, ageDays: 99);
+        string locked = MakeArchive(dir, "pending_20260101_000000.7z", 1024, ageDays: 99);
         MakeSidecar(locked);
 
         HashSet<string> keep = new([locked], StringComparer.OrdinalIgnoreCase);
@@ -393,9 +429,9 @@ public class ZipTempManagerTests
         (ZipTempManager mgr, _, RecordingLogger log) = Build(dir);
 
         // 三份清单，一个归档都没有。
-        MakeSidecar(dir.File("Backup_0.7z"));
-        MakeSidecar(dir.File("Backup_1.7z"));
-        MakeSidecar(dir.File("Backup_2.7z"));
+        MakeSidecar(dir.File("Backup_0_20260101_000000.7z"));
+        MakeSidecar(dir.File("Backup_1_20260101_000000.7z"));
+        MakeSidecar(dir.File("Backup_2_20260101_000000.7z"));
 
         Assert.Equal(3, Sidecars(dir).Length);
 
@@ -413,10 +449,10 @@ public class ZipTempManagerTests
         using TempDir dir = new();
         (ZipTempManager mgr, _, _) = Build(dir);
 
-        string alive = MakeArchive(dir, "alive.7z", 1024);
+        string alive = MakeArchive(dir, "alive_20260101_000000.7z", 1024);
         string aliveSidecar = MakeSidecar(alive);
 
-        string orphanSidecar = MakeSidecar(dir.File("ghost.7z"));   // 归档从来不存在
+        string orphanSidecar = MakeSidecar(dir.File("ghost_20260101_000000.7z"));   // 归档从来不存在
 
         mgr.Enforce(NoAgeCap, NoCountCap, NoByteCap);
 
@@ -443,7 +479,7 @@ public class ZipTempManagerTests
 
         Directory.CreateDirectory(Path.Combine(drill1, "extracted", "子目录"));
         File.WriteAllText(Path.Combine(drill1, "extracted", "子目录", "解出来的.dat"), "内容");
-        File.WriteAllText(Path.Combine(drill1, "Backup_1.7z"), "复制进来的包");
+        File.WriteAllText(Path.Combine(drill1, "Backup_1_20260101_000000.7z"), "复制进来的包");
         Directory.CreateDirectory(drill2);
 
         // 一个名字不沾边的目录，绝不能被误删。
@@ -468,14 +504,14 @@ public class ZipTempManagerTests
         using TempDir dir = new();
         (ZipTempManager mgr, _, _) = Build(dir);
 
-        dir.WriteFile("Backup_1.7z.part", 4096);
-        dir.WriteFile("Backup_1.7z.list", 128);
-        dir.WriteFile("scratch.tmp", 64);
+        dir.WriteFile("Backup_1_20260101_000000.7z.part", 4096);
+        dir.WriteFile("Backup_1_20260101_000000.7z.list", 128);
+        dir.WriteFile(".newautozip-write-test-77.tmp", 0);      // 启动前校验的探测文件
         dir.WriteFile(ArchiveManifest.EntryName, 256);          // 包内清单的中转残骸
-        dir.WriteFile("Backup_9.7z.manifest.json.writing", 32); // 旁挂清单的半成品
-        dir.WriteFile("Backup_0.7z", 1024);                     // 正经归档，不许动
+        dir.WriteFile("Backup_9_20260101_000000.7z.manifest.json.writing", 32); // 旁挂清单的半成品
+        dir.WriteFile("Backup_0_20260101_000000.7z", 1024);                     // 正经归档，不许动
 
-        string archive = MakeArchive(dir, "Backup_8.7z", 1024);
+        string archive = MakeArchive(dir, "Backup_8_20260101_000000.7z", 1024);
         string sidecar = MakeSidecar(archive);                  // 正经清单，同样不许动
 
         Directory.CreateDirectory(Path.Combine(
@@ -504,7 +540,7 @@ public class ZipTempManagerTests
         using TempDir dir = new();
         (ZipTempManager mgr, _, _) = Build(dir);
 
-        MakeArchive(dir, "Backup_0.7z", 1024);
+        MakeArchive(dir, "Backup_0_20260101_000000.7z", 1024);
 
         Assert.Equal(0, mgr.SweepIntermediates());
     }

@@ -2782,6 +2782,33 @@ internal static class SelfTest
 
         Settle(window);
         steps.Add($"设置页：压缩级别 0–9 说明文字已求值，累计错误 {listener.ErrorCount}。");
+
+        // 开机自启那一块有三种长相：没注册（只有一个按钮）、已注册（多出「取消」）、
+        // 要用户出手（警告色那一行）。测试机上多半只有第一种，不喂的话后两种的绑定永远测不到。
+        // 喂的是状态而不是真去注册 —— 注册要提权、要密码，还会改用户的系统。
+        string exe = Environment.ProcessPath ?? @"C:\AutoZip\AutoZip.exe";
+
+        (string Label, Core.Startup.BootTaskStatus Status)[] bootStates =
+        [
+            ("未注册", Core.Startup.BootTaskStatus.NotRegistered),
+            ("已注册", new Core.Startup.BootTaskStatus(
+                null, true, true, true, $"\"{exe}\"", Core.Startup.BootTaskDefinition.BackgroundArgument,
+                @"PC\user", Core.Startup.BootTaskStatus.PasswordLogon, DateTime.Now, 0)),
+            ("指向旧位置", new Core.Startup.BootTaskStatus(
+                null, true, true, false, "\"C:\\Old\\AutoZip.exe\"", Core.Startup.BootTaskDefinition.BackgroundArgument,
+                @"PC\user", Core.Startup.BootTaskStatus.PasswordLogon, DateTime.Now, 0)),
+            ("读失败", Core.Startup.BootTaskStatus.Failed("拒绝访问")),
+        ];
+
+        foreach ((string label, Core.Startup.BootTaskStatus status) in bootStates)
+        {
+            model.ApplyBootTaskStatus(status);
+            Settle(window);
+            steps.Add($"设置页：开机自启「{label}」已布局，累计错误 {listener.ErrorCount}。");
+        }
+
+        // 摆回真实状态，免得后面的检查看到一份编出来的。
+        model.RefreshBootTask();
     }
 
     /// <summary>日志页那个列表的名字。核对显示顺序要靠它取到界面上真正排在第一位的那一项。</summary>

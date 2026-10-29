@@ -65,6 +65,70 @@ public class SettingsValidatorTests
     }
 
     [Fact]
+    public void 临时目录与目标目录是同一个目录必须是错误()
+    {
+        // 临时目录按配额淘汰旧包。两者是同一个目录时，淘汰的就是已经送达的备份本体，
+        // OneDrive 还会把删除同步到云端。原先这里只给一条"会反复上传 .part"的提醒。
+        using TempDir root = new();
+        AppSettings s = Healthy(root, out string exe);
+        s.ZipTempPath = s.CloudPath + Path.DirectorySeparatorChar;   // 写法不同，目录相同
+
+        ValidationReport report = SettingsValidator.Validate(s, exe);
+
+        Assert.False(report.CanStart);
+        Assert.Contains(report.Errors, i => i.Field == nameof(AppSettings.ZipTempPath)
+                                            && i.Message.Contains("同一个目录", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void 校验不会替用户把还不存在的目录建出来(bool probeWrites)
+    {
+        // 设置页每敲一个字就校验一次。原先校验里有一句 CreateDirectory，
+        // 敲完 D:\Backup 磁盘上就留下 D:\B、D:\Ba、D:\Bac…… 一串空目录。
+        using TempDir root = new();
+        AppSettings s = Healthy(root, out string exe);
+        s.ZipTempPath = Path.Combine(root.Path, "还", "没", "建");
+
+        ValidationReport report = SettingsValidator.Validate(s, exe, probeWrites: probeWrites);
+
+        Assert.False(Directory.Exists(Path.Combine(root.Path, "还")));
+        Assert.DoesNotContain(report.Errors, i => i.Field == nameof(AppSettings.ZipTempPath));
+    }
+
+    [Fact]
+    public void 边打字边校验时不往目录里写探测文件()
+    {
+        // 探测文件写进 OneDrive 目录就会被同步客户端上传、再删除 —— 每敲一个字一次。
+        using TempDir root = new();
+        AppSettings s = Healthy(root, out string exe);
+
+        using FileSystemWatcher watcher = new(s.CloudPath) { EnableRaisingEvents = true };
+        int created = 0;
+        watcher.Created += (_, _) => Interlocked.Increment(ref created);
+
+        SettingsValidator.Validate(s, exe, probeWrites: false);
+        Thread.Sleep(200);
+
+        Assert.Equal(0, created);
+    }
+
+    [Fact]
+    public void 临时目录在目标目录的子目录里仍只是提醒()
+    {
+        // 子目录不受影响：配额只清理临时目录这一层，碰不到上一层里已送达的包。
+        using TempDir root = new();
+        AppSettings s = Healthy(root, out string exe);
+        s.ZipTempPath = Path.Combine(s.CloudPath, "staging");
+
+        ValidationReport report = SettingsValidator.Validate(s, exe);
+
+        Assert.True(report.CanStart, report.ToText());
+        Assert.Contains(report.Warnings, i => i.Field == nameof(AppSettings.ZipTempPath));
+    }
+
+    [Fact]
     public void 监控目录不存在是错误()
     {
         using TempDir root = new();

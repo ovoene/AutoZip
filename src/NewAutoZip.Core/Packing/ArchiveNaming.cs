@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.RegularExpressions;
 
 namespace NewAutoZip.Core.Packing;
 
@@ -21,6 +22,25 @@ public static class ArchiveNaming
 
     public static string Build(string prefix, DateTimeOffset localTime) =>
         $"{Sanitize(prefix)}_{Stamp(localTime)}{Extension}";
+
+    /// <summary>
+    /// 本程序起的名字：<c>前缀_yyyyMMdd_HHmmss.7z</c>，撞名时后面再加 <c>_2</c>… 或一段 32 位十六进制
+    /// （见 BackupEngine.MakeUnique）。前缀不限 —— 用户中途改过前缀，老包也得认得出来。
+    /// </summary>
+    private static readonly Regex OursPattern = new(
+        @"^.+_\d{8}_\d{6}(?:_(?:\d{1,4}|[0-9a-fA-F]{32}))?\.7z$",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    /// <summary>
+    /// 这个文件名是不是本程序打出来的包。
+    ///
+    /// 临时目录按配额淘汰旧包、云端演练挑包来验、恢复页列包，全都只认这个名字。
+    /// 原先认的是所有 <c>*.7z</c>：临时目录要是选了一个本来就放着别的压缩包的目录，
+    /// 用户自己的包会被当成"超过保留天数的旧包"删掉；目标目录里别人的 .7z
+    /// 会被拿去演练，然后报一条"现在的密码解不开这个包"的假警报。
+    /// </summary>
+    public static bool IsOurs(string? fileName) =>
+        !string.IsNullOrEmpty(fileName) && OursPattern.IsMatch(fileName);
 
     /// <summary>
     /// 前缀来自配置，用户可能敲进非法字符。挨个换成下划线，空前缀退回 <c>Backup</c>，

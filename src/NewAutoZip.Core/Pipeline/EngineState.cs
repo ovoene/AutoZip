@@ -35,6 +35,15 @@ public sealed class PendingUpload
     /// <summary>轮询次数，用于日志与超时判断。</summary>
     public int Polls { get; set; }
 
+    /// <summary>
+    /// 上传超时用的那只表：只累计 OneDrive 客户端<b>在运行</b>的时间（秒）。
+    ///
+    /// 原先按"移进目录以来的墙钟时间"算：开机自启后没人登录、OneDrive 根本没起来的那几个小时
+    /// 也算进去，于是包一个个被记成"未能确认上传"、从此不再跟踪、本地空间也永不释放 ——
+    /// 而它们只是在等有人登录。为空 = 老版本留下的记录，第一次检查时按墙钟时间补上。
+    /// </summary>
+    public double? ClientRunningSeconds { get; set; }
+
     [JsonIgnore]
     public string FileName => Path.GetFileName(ArchivePath);
 }
@@ -128,6 +137,21 @@ public sealed class EngineState
     /// </summary>
     public List<FutureStampedFile> FutureStamped { get; set; } = [];
 
+    /// <summary>
+    /// 等待重试的批次（含已打好、等重新投递的包）。由引擎在每次存盘前从重试队列抄过来，
+    /// 启动时再交还给重试队列 —— 重启之后失败次数接着数，隔离那道闸才不会被重启绕过去。
+    /// </summary>
+    public List<RetryEntry> Retries { get; set; } = [];
+
+    /// <summary>
+    /// 正在途中的那个包：已经打好、校验过，还没送进目标目录。只在那一小段时间里有值。
+    ///
+    /// 包一打好就记下来、立刻存盘：打包之后还有一步"解压验证"，大包要几分钟，
+    /// 这时候被停止或被界面接管，原先这个包就成了临时目录里没人认领的孤儿，
+    /// 重启后只能把源文件重新打一遍。记下来之后，下次启动会把它接回去（见 RetryQueue.AdoptInterrupted）。
+    /// </summary>
+    public RetryEntry? InFlightDelivery { get; set; }
+
     /// <summary>首次运行已完成（决定 ProcessExistingFilesOnFirstRun 是否还生效）。</summary>
     public bool FirstRunCompleted { get; set; }
 
@@ -207,6 +231,7 @@ public sealed class EngineState
                 DeliveredUtc = u.DeliveredUtc,
                 ReleaseRequested = u.ReleaseRequested,
                 Polls = u.Polls,
+                ClientRunningSeconds = u.ClientRunningSeconds,
             }).ToList(),
             Quarantined = Quarantined.Select(q => new QuarantinedBatch
             {
@@ -228,6 +253,8 @@ public sealed class EngineState
                 Path = f.Path,
                 LastWriteUtc = f.LastWriteUtc,
             }).ToList(),
+            Retries = Retries.Select(r => r.Clone()).ToList(),
+            InFlightDelivery = InFlightDelivery?.Clone(),
         };
     }
 }

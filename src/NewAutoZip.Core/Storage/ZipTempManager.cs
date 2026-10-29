@@ -67,7 +67,7 @@ public sealed class ZipTempManager
     /// 这里兜住"打包中途进程被杀"留下的那一份。
     /// </summary>
     private static readonly string[] IntermediatePatterns =
-        ["*.7z.part", "*.7z.list", "*.tmp", "*.writing", ArchiveManifest.EntryName];
+        ["*.7z.part", "*.7z.list", ".newautozip-write-test-*.tmp", "*.writing", ArchiveManifest.EntryName];
 
     private readonly IAppLogger _log;
     private readonly TimeProvider _time;
@@ -103,6 +103,35 @@ public sealed class ZipTempManager
         }
     }
 
+    /// <summary>
+    /// 这个中间文件是不是本程序留下的：<c>本程序的包名.part / .list</c>、旁挂清单的 <c>.writing</c>、
+    /// 包内清单的中转文件、启动前校验写的探测文件。别人的同后缀文件一律不算。
+    /// </summary>
+    internal static bool IsOurIntermediate(string? fileName)
+    {
+        if (string.IsNullOrEmpty(fileName))
+        {
+            return false;
+        }
+
+        if (fileName.Equals(ArchiveManifest.EntryName, StringComparison.OrdinalIgnoreCase)
+            || (fileName.StartsWith(".newautozip-write-test-", StringComparison.OrdinalIgnoreCase)
+                && fileName.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        foreach (string suffix in (string[])[".part", ".list", ArchiveManifest.SidecarSuffix + ".writing"])
+        {
+            if (fileName.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+            {
+                return ArchiveNaming.IsOurs(fileName[..^suffix.Length]);
+            }
+        }
+
+        return false;
+    }
+
     public IReadOnlyList<ArchiveInfo> ListArchives()
     {
         if (string.IsNullOrWhiteSpace(_directory) || !Directory.Exists(_directory))
@@ -116,6 +145,13 @@ public sealed class ZipTempManager
         {
             foreach (string path in Directory.EnumerateFiles(_directory, "*.7z"))
             {
+                // 只认本程序打的包（见 ArchiveNaming.IsOurs）。这份列表是配额淘汰的依据，
+                // 认错一个就是删错一个用户自己的文件。
+                if (!ArchiveNaming.IsOurs(Path.GetFileName(path)))
+                {
+                    continue;
+                }
+
                 try
                 {
                     FileInfo info = new(path);
@@ -197,7 +233,9 @@ public sealed class ZipTempManager
 
             foreach (string file in files)
             {
-                if (TryDelete(file))
+                // 同样只动自己的：别的程序在这个目录里留下的 .tmp、浏览器下载到一半的 .part
+                // 都不是我们的残骸。
+                if (IsOurIntermediate(Path.GetFileName(file)) && TryDelete(file))
                 {
                     removed++;
                 }
@@ -428,6 +466,12 @@ public sealed class ZipTempManager
         foreach (string sidecar in sidecars)
         {
             if (known.Contains(sidecar))
+            {
+                continue;
+            }
+
+            // 不是本程序的包名派生出来的清单不碰。
+            if (!ArchiveNaming.IsOurs(Path.GetFileName(sidecar)[..^ArchiveManifest.SidecarSuffix.Length]))
             {
                 continue;
             }

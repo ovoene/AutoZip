@@ -1010,4 +1010,138 @@ public sealed class SevenZipRealBinaryTests(ITestOutputHelper output) : IDisposa
 
         return process.ExitCode;
     }
+
+    // ==================================================================
+    //  审计回归：子目录里的同名文件 / 解压时的同名覆盖
+    // ==================================================================
+
+    [Fact]
+    public async Task 子目录里的同名文件都能进包_并且保留目录结构()
+    {
+        // 原先清单里写绝对路径，7-Zip 只存文件名：a\x.txt 和 b\x.txt 撞成同一个 x.txt，
+        // 7za 报 "Duplicate filename on disk" 整批失败，重试满次数就进隔离区。
+        TempDir source = NewDir("naz-dup-src");
+        TempDir zipTemp = NewDir("naz-dup-tmp");
+        TempDir extract = NewDir("naz-dup-ext");
+
+        List<string> files =
+        [
+            WriteUnique(source, "a/x.txt", "甲"),
+            WriteUnique(source, "b/x.txt", "乙"),
+            WriteUnique(source, "y.txt", "丙"),
+        ];
+
+        string output = zipTemp.File("Backup_20260901_120000.7z");
+        SevenZipRunner runner = NewRunner(out RecordingLogger log);
+
+        PackResult result = await runner.CreateAsync(
+            new PackRequest(output, files, Password, CompressionLevel: 1, EncryptFileNames: true, PackTimeout)
+            {
+                BaseDirectory = source.Path,
+            },
+            progress: null,
+            CancellationToken.None);
+
+        Assert.True(result.Ok, $"压缩失败：{result.Error}{Environment.NewLine}{log.Dump()}");
+        Assert.Equal(3, result.FileCount);
+
+        ArchiveListing listing = await runner.ListAsync(output, Password, PackTimeout, CancellationToken.None);
+        HashSet<string> stored = new(
+            listing.Entries.Where(e => !e.IsDirectory).Select(e => e.Path),
+            StringComparer.OrdinalIgnoreCase);
+
+        Assert.Contains(Path.Combine("a", "x.txt"), stored);
+        Assert.Contains(Path.Combine("b", "x.txt"), stored);
+        Assert.Contains("y.txt", stored);
+
+        ExtractResult extracted = await runner.ExtractAsync(
+            new ExtractRequest(output, extract.Path, Password, PackTimeout, Overwrite: true),
+            null,
+            CancellationToken.None);
+
+        Assert.True(extracted.Ok, extracted.Error);
+        Assert.StartsWith("甲|", File.ReadAllText(Path.Combine(extract.Path, "a", "x.txt")));
+        Assert.StartsWith("乙|", File.ReadAllText(Path.Combine(extract.Path, "b", "x.txt")));
+    }
+
+    [Fact]
+    public async Task 不在基准目录下的文件照旧按文件名存()
+    {
+        // 包内清单这类附加文件、以及万一不在监控目录下的源文件：退回原来的存法，不能因此失败。
+        TempDir source = NewDir("naz-base-src");
+        TempDir elsewhere = NewDir("naz-base-other");
+        TempDir zipTemp = NewDir("naz-base-tmp");
+
+        string inside = WriteUnique(source, "sub/in.txt", "里");
+        string outside = WriteUnique(elsewhere, "out.txt", "外");
+
+        string output = zipTemp.File("Backup_20260901_120001.7z");
+        SevenZipRunner runner = NewRunner(out _);
+
+        PackResult result = await runner.CreateAsync(
+            new PackRequest(output, [inside, outside], Password, CompressionLevel: 1, EncryptFileNames: false, PackTimeout)
+            {
+                BaseDirectory = source.Path,
+            },
+            progress: null,
+            CancellationToken.None);
+
+        Assert.True(result.Ok, result.Error);
+
+        ArchiveListing listing = await runner.ListAsync(output, Password, PackTimeout, CancellationToken.None);
+        string[] stored = [.. listing.Entries.Where(e => !e.IsDirectory).Select(e => e.Path)];
+
+        Assert.Contains(Path.Combine("sub", "in.txt"), stored);
+        Assert.Contains("out.txt", stored);
+    }
+
+    [Theory]
+    [InlineData(@"C:\w\a\x.txt", @"C:\w", @"a\x.txt")]
+    [InlineData(@"C:\w\x.txt", @"C:\w", "x.txt")]
+    [InlineData(@"C:\other\x.txt", @"C:\w", @"C:\other\x.txt")]
+    [InlineData(@"D:\x.txt", @"C:\w", @"D:\x.txt")]
+    [InlineData(@"C:\w\..foo.txt", @"C:\w", "..foo.txt")]
+    public void 清单行在基准目录之内才写相对路径(string file, string baseDir, string expected) =>
+        Assert.Equal(expected, SevenZipRunner.ListEntryFor(file, baseDir));
+
+    [Fact]
+    public async Task 解压时可以选择保留目录里已有的同名文件()
+    {
+        // 恢复页原先固定覆盖、也不问：解回原目录时，较新的文件会被旧备份静静盖掉。
+        TempDir source = NewDir("naz-ow-src");
+        TempDir zipTemp = NewDir("naz-ow-tmp");
+        TempDir target = NewDir("naz-ow-dst");
+
+        string file = source.WriteText("x.txt", "包里的旧版本");
+        string output = zipTemp.File("Backup_20260901_120002.7z");
+        SevenZipRunner runner = NewRunner(out _);
+
+        PackResult result = await runner.CreateAsync(
+            new PackRequest(output, [file], Password, CompressionLevel: 1, EncryptFileNames: true, PackTimeout)
+            {
+                BaseDirectory = source.Path,
+            },
+            progress: null,
+            CancellationToken.None);
+
+        Assert.True(result.Ok, result.Error);
+
+        string existing = target.WriteText("x.txt", "目录里的新版本");
+
+        ExtractResult keep = await runner.ExtractAsync(
+            new ExtractRequest(output, target.Path, Password, PackTimeout, Overwrite: false),
+            null,
+            CancellationToken.None);
+
+        Assert.True(keep.Ok, keep.Error);
+        Assert.Equal("目录里的新版本", File.ReadAllText(existing));
+
+        ExtractResult replace = await runner.ExtractAsync(
+            new ExtractRequest(output, target.Path, Password, PackTimeout, Overwrite: true),
+            null,
+            CancellationToken.None);
+
+        Assert.True(replace.Ok, replace.Error);
+        Assert.Equal("包里的旧版本", File.ReadAllText(existing));
+    }
 }

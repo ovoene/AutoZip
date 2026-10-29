@@ -313,3 +313,39 @@ public class SettingsStoreSecretTests
         Assert.Contains(SecretRedactor.Mask, redacted, StringComparison.Ordinal);
     }
 }
+
+/// <summary>审计回归：写到一半断电留下的空文件必须报出来，不能悄悄换成默认配置。</summary>
+public class EmptyFileTests
+{
+    [Fact]
+    public void 空的配置文件读出来要带原因()
+    {
+        using TempDir dir = new();
+        string path = dir.WriteFile("settings.json", 0);
+
+        Core.Configuration.AppSettings? read =
+            Core.Configuration.AtomicJsonFile.TryRead<Core.Configuration.AppSettings>(path, out string? error);
+
+        Assert.Null(read);
+        Assert.NotNull(error);
+
+        new Core.Configuration.SettingsStore(path, new Core.Diagnostics.SecretRedactor()).Load(out string? warning);
+        Assert.NotNull(warning);
+    }
+
+    [Fact]
+    public void 原子写之后文件内容完整()
+    {
+        using TempDir dir = new();
+        string path = dir.File("state.json");
+
+        Core.Configuration.AtomicJsonFile.Write(path, new Core.Pipeline.EngineState { TotalArchivesCreated = 7 });
+
+        Core.Pipeline.EngineState? back =
+            Core.Configuration.AtomicJsonFile.TryRead<Core.Pipeline.EngineState>(path, out string? error);
+
+        Assert.Null(error);
+        Assert.Equal(7, back!.TotalArchivesCreated);
+        Assert.False(File.Exists(path + ".tmp"));
+    }
+}

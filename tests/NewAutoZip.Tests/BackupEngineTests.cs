@@ -78,7 +78,9 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
         Action<AppSettings>? tweak = null,
         Action<EngineState>? seedState = null,
         Action<TempDir>? seedMonitor = null,
-        IFileProbe? probe = null)
+        IFileProbe? probe = null,
+        FakeUploadMonitor? uploadMonitor = null,
+        Func<OneDriveClientState>? oneDriveClient = null)
     {
         TempDir monitor = NewDir("naz-watch");
         TempDir oneDrive = NewDir("naz-od");
@@ -112,7 +114,7 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
         FakeTimeProvider time = new(Origin);
         RecordingLogger log = new();
         RecordingNotificationHub notify = new();
-        FakeUploadMonitor uploads = new();
+        FakeUploadMonitor uploads = uploadMonitor ?? new();
 
         StateStore store = new(Path.Combine(state.Path, "state.json"), log);
 
@@ -131,7 +133,12 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
             store.Save(seeded);
         }
 
-        BackupEngine engine = new(log, time, probe ?? Win32FileProbe.Instance, store);
+        BackupEngine engine = new(log, time, probe ?? Win32FileProbe.Instance, store)
+        {
+            // 上传超时只累计 OneDrive 客户端在跑的时间。测试机上有没有 OneDrive 进程不归测试管，
+            // 默认当它在跑（= 原来的计时行为）；要测"没在跑"的测试自己换掉它。
+            OneDriveClientProbe = oneDriveClient ?? (() => OneDriveClientState.Running),
+        };
 
         Assert.True(engine.Start(settings, notify, uploads, sevenZipExePath));
 
@@ -434,6 +441,12 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
                 await PumpUntilAsync(h, _ => h.Notify.Any(NotifyEvent.RoundFinished)),
                 $"窗口到期后没有任何收尾通知。状态：{h.Engine.Snapshot.StatusText}");
 
+            // 【取消】是在 RunBatchAsync 里、它的 finally 清空批次<b>之前</b>发出的，
+            // 而上面那个条件看的是通知、不是快照 —— 条件成立的那一刻，那一轮可能还没走完，
+            // 快照里的批次还是 1 个文件。全量并行跑、CPU 被抢的时候正好会撞上
+            // （"单独跑一直过，全量跑偶尔挂"）。等这一轮走完再看快照。
+            Assert.True(await WaitOneRoundAsync(h), "发完【取消】之后那一轮没能走完");
+
             Assert.Equal(1, h.Notify.CountOf(NotifyEvent.RoundFinished));
 
             NotifyMessage cancelled = h.Notify.First(NotifyEvent.RoundFinished);
@@ -602,8 +615,12 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
             Assert.True(await PumpUntilAsync(h, s => s.QuarantineCount > 0));
             AssertZipTempClean(h);
 
-            string again = h.Engine.Snapshot.Quarantines[0].Id;
-            Assert.NotEqual(id, again);
+            // 放回去的是<b>同一个批次</b>（独立重试，不并进别的文件），所以编号不变；
+            // 失败次数从头数，又失败满 maxAttempts 次才回到隔离区。
+            QuarantineView back = h.Engine.Snapshot.Quarantines[0];
+            string again = back.Id;
+            Assert.Equal(id, again);
+            Assert.Equal(2, back.Attempts);
 
             Assert.True(h.Engine.DiscardQuarantined(again));
             Assert.True(
@@ -2131,7 +2148,7 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
 
         try
         {
-            await MakeCloudArchiveAsync(h, "Backup_cloud.7z");
+            await MakeCloudArchiveAsync(h, "Backup_cloud_20260101_000000.7z");
 
             // ---- 还没到 6 小时：一次都不许做 ----
             Assert.True(await AdvanceAndSettleAsync(h, TimeSpan.FromHours(1)));
@@ -2200,7 +2217,7 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
         try
         {
             // 一个彻头彻尾不是 7z 的文件。放在云盘目录里，等着被抽中。
-            string corrupt = Path.Combine(h.OneDrive.Path, "Backup_corrupt.7z");
+            string corrupt = Path.Combine(h.OneDrive.Path, "Backup_corrupt_20260101_000000.7z");
             File.WriteAllText(corrupt, "这根本不是一个压缩包，只是一段文字。");
 
             // 没种 LastCloudDrillUtc：从没演练过就立刻做一次
@@ -2218,7 +2235,7 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
             Assert.Equal($"【{NotifyTag.Drill}】", lines[1].Trim());
 
             string text = msg.ToPlainText();
-            Assert.Contains("Backup_corrupt.7z", text);
+            Assert.Contains("Backup_corrupt_20260101_000000.7z", text);
             Assert.Contains("恢复演练", text);
 
             // ---- 坏包不归引擎处置 ----
@@ -2264,7 +2281,7 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
 
         try
         {
-            await MakeCloudArchiveAsync(h, "Backup_cloud.7z");
+            await MakeCloudArchiveAsync(h, "Backup_cloud_20260101_000000.7z");
 
             // 推过好几个周期。
             Assert.True(await AdvanceAndSettleAsync(h, TimeSpan.FromHours(12)));
@@ -2345,7 +2362,7 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
 
         try
         {
-            SeedCloudUsage(h, "Backup_old.7z", 8192);
+            SeedCloudUsage(h, "Backup_old_20260101_000000.7z", 8192);
 
             h.Monitor.WriteFile("data.dat", 4096);
 
@@ -2359,7 +2376,7 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
             // 云盘目录里还是只有那个旧包 —— 新的一个都没进来。
             string[] cloud = h.OneDrive.Files("*.7z");
             Assert.Single(cloud);
-            Assert.EndsWith("Backup_old.7z", cloud[0]);
+            Assert.EndsWith("Backup_old_20260101_000000.7z", cloud[0]);
 
             Assert.Equal(0, h.Engine.Snapshot.ArchivesCreated);
 
@@ -2397,7 +2414,7 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
 
         try
         {
-            SeedCloudUsage(h, "Backup_old.7z", 4 * 1024 * 1024);
+            SeedCloudUsage(h, "Backup_old_20260101_000000.7z", 4 * 1024 * 1024);
 
             h.Monitor.WriteFile("data.dat", 4096);
 
@@ -2437,7 +2454,7 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
 
         try
         {
-            SeedCloudUsage(h, "Backup_old.7z", 900 * 1024);   // 已用 900 KB，剩 124 KB
+            SeedCloudUsage(h, "Backup_old_20260101_000000.7z", 900 * 1024);   // 已用 900 KB，剩 124 KB
 
             h.Monitor.WriteFile("data.dat", 4096);            // 预计需要 ~4.5 KB，塞得下
 
@@ -2765,6 +2782,641 @@ public sealed class BackupEngineTests(ITestOutputHelper output) : IDisposable
 
             Assert.Equal(200, onDisk.Quarantined.Count);
             Assert.DoesNotContain(onDisk.Quarantined, q => q.Id == "Q-0");
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    // ==================================================================
+    //  审计回归
+    // ==================================================================
+
+    /// <summary>引擎跑起来、一个文件都不放时，让它空转几轮再看结果。</summary>
+    private static Task IdleAsync(Harness h, int rounds = 3) =>
+        PumpUntilAsync(h, _ => false, maxSteps: rounds, engineSecondsPerStep: 30);
+
+    [Fact]
+    public async Task 临时目录与目标目录是同一个目录时_配额清理不删已送达的包()
+    {
+        // 启动前校验已经把这种配置当错误拦下了（见 SettingsValidatorTests），
+        // 这里验的是第二道闸：引擎自己也不在目标目录上做淘汰。
+        string delivered = string.Empty;
+
+        Harness h = BuildHarness(tweak: s =>
+        {
+            s.ZipTempPath = s.CloudPath;
+            s.ZipTempKeepDays = 1;
+
+            delivered = Path.Combine(s.CloudPath, "Backup_20250101_000000.7z");
+            File.WriteAllBytes(delivered, new byte[2048]);
+            File.SetCreationTimeUtc(delivered, Origin.UtcDateTime.AddDays(-30));
+            File.SetLastWriteTimeUtc(delivered, Origin.UtcDateTime.AddDays(-30));
+        });
+
+        try
+        {
+            await IdleAsync(h);
+
+            Assert.True(File.Exists(delivered), "超过保留天数的那个包被删了 —— 它是已经送达的备份本体");
+            Assert.True(h.Log.Contains("已停止按配额清理"), h.Log.Dump());
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task 子目录里同名同大小的文件_打包演练投递全都过()
+    {
+        // 两层问题：原先 7za 会因为两个 x.txt 撞名整批失败；就算打得出来，
+        // 演练按"文件名 + 大小"配对，同名同大小的两个文件会拿错对象去比校验值 —— 演练不过、不投递。
+        Harness h = BuildHarness(
+            sevenZipExePath: TestBinaries.SevenZip(),
+            tweak: s =>
+            {
+                s.IncludeSubdirectories = true;
+                s.CloudTarget = CloudTarget.Folder;
+                s.WriteArchiveManifest = true;
+                s.VerifyAfterPackByExtract = true;
+            },
+            seedMonitor: m =>
+            {
+                m.WriteText("a/x.txt", "甲甲甲甲");
+                m.WriteText("b/x.txt", "乙乙乙乙");    // 和上一个字节数相同、内容不同
+            });
+
+        try
+        {
+            Assert.True(
+                await PumpUntilAsync(h, s => s.ArchivesCreated == 1 && s.Phase == EnginePhase.Idle),
+                $"没能打出包。状态：{h.Engine.Snapshot.StatusText}");
+
+            Assert.Single(h.OneDrive.Files("*.7z"));
+            Assert.Equal(0, h.Engine.Snapshot.RetryCount);
+            Assert.False(h.Log.Contains("Duplicate filename"), h.Log.Dump());
+            Assert.False(h.Log.Contains("恢复演练未通过"), h.Log.Dump());
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task 打包期间快照能看到进度()
+    {
+        // 快照原本只在打包开始和结束时各发布一次，中间（大包可以是几个小时）进度条一直是 0%。
+        Harness h = BuildHarness(
+            sevenZipExePath: TestBinaries.SevenZip(),
+            tweak: s =>
+            {
+                s.CloudTarget = CloudTarget.Folder;
+                s.CompressionLevel = 9;
+                s.VerifyAfterPackByExtract = false;
+            },
+            seedMonitor: m =>
+            {
+                byte[] noise = new byte[24 * 1024 * 1024];
+                Random.Shared.NextBytes(noise);
+                File.WriteAllBytes(m.File("big.bin"), noise);
+            });
+
+        int maxPercent = 0;
+        int packingSamples = 0;
+        using CancellationTokenSource stop = new();
+
+        Task sampler = Task.Run(async () =>
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                EngineSnapshot snap = h.Engine.Snapshot;
+
+                if (snap.Phase == EnginePhase.Packing)
+                {
+                    packingSamples++;
+                    maxPercent = Math.Max(maxPercent, snap.PackPercent);
+                }
+
+                await Task.Delay(10);
+            }
+        });
+
+        try
+        {
+            Assert.True(
+                await PumpUntilAsync(h, s => s.ArchivesCreated == 1),
+                $"没能打出包。状态：{h.Engine.Snapshot.StatusText}");
+
+            stop.Cancel();
+            await sampler;
+
+            // 机器快到打包一眨眼就结束时没有可观察的中间状态，这一条就验不了 —— 不当成失败。
+            _output.WriteLine($"打包期间采样 {packingSamples} 次，最高进度 {maxPercent}%。");
+
+            if (packingSamples < 50)
+            {
+                return;
+            }
+
+            Assert.True(maxPercent > 0, $"打包期间采样 {packingSamples} 次，进度一直是 0%");
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            stop.Cancel();
+            await h.Engine.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task 重启之后失败次数接着数_不从头算()
+    {
+        // 重试队列原先只在内存里：进程一重启（开机、崩溃、界面接管后台实例）就清零，
+        // "失败 N 次进隔离区"这道闸被重启绕过去。
+        Harness h = BuildHarness(maxAttempts: 3);
+
+        try
+        {
+            h.Monitor.WriteFile("data.dat", 2048);
+            Assert.True(await PumpUntilAsync(h, s => s.RetryCount == 1), "第一次失败没进重试队列");
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+
+        Assert.Single(h.Store.Load().Retries);
+
+        BackupEngine second = new(h.Log, h.Time, Win32FileProbe.Instance, h.Store)
+        {
+            OneDriveClientProbe = () => OneDriveClientState.Running,
+        };
+
+        Assert.True(second.Start(h.Settings, h.Notify, h.Uploads, "Z:\\这个目录不存在\\7za.exe"));
+        Harness h2 = h with { Engine = second };
+
+        try
+        {
+            Assert.True(await WaitRoundsAsync(h2, 2));
+            Assert.Equal(1, second.Snapshot.RetryCount);
+            Assert.Equal(1, second.Snapshot.Retries[0].Attempts);
+
+            // 再失败两次（共 3 次）就该进隔离区，而不是重启后再给满 3 次。
+            Assert.True(await PumpUntilAsync(h2, s => s.QuarantineCount == 1), "重启后没有接着数到隔离");
+            Assert.Equal(3, second.Snapshot.Quarantines[0].Attempts);
+        }
+        catch
+        {
+            DumpOnFailure(h2);
+            throw;
+        }
+        finally
+        {
+            await second.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task 投递失败后重试只重新投递_不重新打包()
+    {
+        // 原先投递失败走的是普通重试：每次重试把整批文件重新压一遍，
+        // 临时目录里还会多堆一个同样的包。
+        string blocked = string.Empty;
+
+        Harness h = BuildHarness(
+            sevenZipExePath: TestBinaries.SevenZip(),
+            tweak: s =>
+            {
+                s.CloudTarget = CloudTarget.Folder;
+
+                // 目标"目录"其实是个文件：建不了目录，移不进去。
+                blocked = Path.Combine(s.CloudPath, "blocked");
+                File.WriteAllText(blocked, "占位");
+                s.CloudPath = blocked;
+            },
+            seedMonitor: m => m.WriteText("report.txt", "要备份的内容"));
+
+        try
+        {
+            Assert.True(
+                await PumpUntilAsync(h, s => s.RetryCount == 1),
+                $"投递失败没进重试队列。状态：{h.Engine.Snapshot.StatusText}");
+
+            Assert.Equal(1, h.Engine.Snapshot.ArchivesCreated);
+            Assert.Single(h.ZipTemp.Files("*.7z"));
+            Assert.True(h.Log.Contains("下次重试只重新投递"), h.Log.Dump());
+
+            // 障碍消失：目标位置变回能建目录的样子。
+            File.Delete(blocked);
+
+            Assert.True(
+                await PumpUntilAsync(h, s => s.RetryCount == 0 && Directory.Exists(blocked)),
+                $"障碍消失后没有重新投递。状态：{h.Engine.Snapshot.StatusText}");
+            Assert.True(await WaitOneRoundAsync(h));
+
+            Assert.Single(Directory.GetFiles(blocked, "*.7z"));
+            Assert.Equal(1, h.Engine.Snapshot.ArchivesCreated);     // 没有重新打包
+            Assert.Empty(h.ZipTemp.Files("*.7z"));
+            Assert.True(h.Log.Contains("这次只重新投递，不重新打包"), h.Log.Dump());
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task 非OneDrive目标_投递失败后重启_新进程接着把包移进去()
+    {
+        // 云盘类型一开始就不是 OneDrive：没有"待上传"这一步，移进目录就是终点。
+        // 移不进去时那个包随重试记录一起存进 state.json —— 进程重启（开机、界面接管、崩溃）之后
+        // 新进程读回记录，只重新移动，不重新打包。
+        string blocked = string.Empty;
+
+        Harness h = BuildHarness(
+            sevenZipExePath: TestBinaries.SevenZip(),
+            tweak: s =>
+            {
+                s.CloudTarget = CloudTarget.Folder;
+                blocked = Path.Combine(s.CloudPath, "blocked");
+                File.WriteAllText(blocked, "占位");
+                s.CloudPath = blocked;
+            },
+            seedMonitor: m => m.WriteText("report.txt", "要备份的内容"));
+
+        try
+        {
+            Assert.True(
+                await PumpUntilAsync(h, s => s.RetryCount == 1),
+                $"投递失败没进重试队列。状态：{h.Engine.Snapshot.StatusText}");
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+
+        RetryEntry saved = Assert.Single(h.Store.Load().Retries);
+        Assert.False(string.IsNullOrEmpty(saved.ArchivePath));
+        Assert.True(File.Exists(saved.ArchivePath), "停止之后临时目录里那个打好的包不见了");
+        Assert.Empty(h.Store.Load().PendingUploads);          // 非 OneDrive 从来不登记待上传
+
+        // 进程"重启"期间障碍消失。
+        File.Delete(blocked);
+
+        BackupEngine second = new(h.Log, h.Time, Win32FileProbe.Instance, h.Store)
+        {
+            OneDriveClientProbe = () => OneDriveClientState.Running,
+        };
+
+        Assert.True(second.Start(h.Settings, h.Notify, h.Uploads, TestBinaries.SevenZip()));
+        Harness h2 = h with { Engine = second };
+
+        try
+        {
+            Assert.True(
+                await PumpUntilAsync(h2, s => s.RetryCount == 0 && Directory.Exists(blocked)),
+                $"重启后没有接着投递。状态：{second.Snapshot.StatusText}");
+            Assert.True(await WaitOneRoundAsync(h2));
+
+            Assert.Single(Directory.GetFiles(blocked, "*.7z"));
+            Assert.Empty(h.ZipTemp.Files("*.7z"));
+            Assert.Equal(1, second.Snapshot.ArchivesCreated);   // 累计还是 1 个：没有重新打包
+            Assert.True(h.Log.Contains("这次只重新投递，不重新打包"), h.Log.Dump());
+            Assert.Equal(1, h.Notify.CountOf(NotifyEvent.RoundFinished));
+        }
+        catch
+        {
+            DumpOnFailure(h2);
+            throw;
+        }
+        finally
+        {
+            await second.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task 打好的包在验证途中被打断_重启后补完验证再移动_不重新打包()
+    {
+        // 上一个进程留下的现场：包已经在临时目录里、"在途"记录也存了盘，
+        // 但打包后的解压验证没做完（被停止 / 被界面接管 / 进程被结束）。
+        string zipTempPath = string.Empty;
+        string archive = string.Empty;
+
+        Harness h = BuildHarness(
+            sevenZipExePath: TestBinaries.SevenZip(),
+            tweak: s =>
+            {
+                s.CloudTarget = CloudTarget.Folder;
+                s.VerifyAfterPackByExtract = true;
+                zipTempPath = s.ZipTempPath;
+            },
+            seedMonitor: m => m.WriteText("report.txt", "要备份的内容"),
+            seedState: s =>
+            {
+                string source = Directory.GetFiles(Path.GetDirectoryName(zipTempPath)!, "report.txt", SearchOption.AllDirectories)
+                    .Single(p => p.Contains("naz-watch", StringComparison.OrdinalIgnoreCase));
+
+                archive = Path.Combine(zipTempPath, "Backup_20260901_115900.7z");
+
+                PackResult packed = new SevenZipRunner(TestBinaries.SevenZip(), Core.Diagnostics.NullLogger.Instance)
+                    .CreateAsync(
+                        new PackRequest(archive, [source], "Str0ng-Passw0rd!", 1, true, TimeSpan.FromMinutes(2))
+                        {
+                            BaseDirectory = Path.GetDirectoryName(source),
+                        },
+                        null,
+                        CancellationToken.None)
+                    .GetAwaiter().GetResult();
+
+                Assert.True(packed.Ok, packed.Error);
+
+                s.FirstRunCompleted = true;
+                s.TotalArchivesCreated = 1;
+                s.InFlightDelivery = new RetryEntry
+                {
+                    Id = string.Empty,
+                    Files = [source],
+                    ArchivePath = archive,
+                    ArchiveBytes = packed.ArchiveBytes,
+                    ArchivedCount = 1,
+                    SourceBytes = new FileInfo(source).Length,
+                    Verified = false,
+                };
+            });
+
+        try
+        {
+            Assert.True(
+                await PumpUntilAsync(h, s => s.RetryCount == 0 && h.OneDrive.Files("*.7z").Length == 1),
+                $"打断的包没有被接着投递。状态：{h.Engine.Snapshot.StatusText}");
+            Assert.True(await WaitOneRoundAsync(h));
+
+            Assert.Equal("Backup_20260901_115900.7z", Path.GetFileName(h.OneDrive.Files("*.7z")[0]));
+            Assert.Equal(1, h.Engine.Snapshot.ArchivesCreated);    // 没有重新打包
+            Assert.Empty(h.ZipTemp.Files("*.7z"));
+            Assert.Null(h.Store.Load().InFlightDelivery);
+            Assert.True(h.Log.Contains("还没来得及投递"), h.Log.Dump());
+            Assert.True(h.Log.Contains("先补做一遍"), h.Log.Dump());
+            Assert.True(h.Log.Contains("开始解压 Backup_20260901_115900.7z"), h.Log.Dump());   // 验证真的跑了
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task 解压验证途中停掉引擎_换一个进程接着投递同一个包()
+    {
+        // 真实的打断：大包的解压验证要几秒，在这几秒里停掉引擎（界面接管后台实例就是这样）。
+        Harness h = BuildHarness(
+            sevenZipExePath: TestBinaries.SevenZip(),
+            tweak: s =>
+            {
+                s.CloudTarget = CloudTarget.Folder;
+                s.CompressionLevel = 0;            // 打包要快，验证（解压 + 算校验值）才是慢的那一步
+                s.VerifyAfterPackByExtract = true;
+            },
+            seedMonitor: m =>
+            {
+                byte[] noise = new byte[48 * 1024 * 1024];
+                Random.Shared.NextBytes(noise);
+                File.WriteAllBytes(m.File("big.bin"), noise);
+            });
+
+        // 验证发生在一轮的<b>中间</b>，PumpUntilAsync 只在两轮之间看状态，等它看的时候验证早做完了。
+        // 所以另起一个任务盯着快照，一看到"正在验证"就停引擎 —— 和界面接管时的时机一样。
+        Task<bool> interrupter = Task.Run(async () =>
+        {
+            DateTime deadline = DateTime.UtcNow.AddSeconds(90);
+
+            while (DateTime.UtcNow < deadline && h.Engine.IsRunning)
+            {
+                EngineSnapshot snap = h.Engine.Snapshot;
+
+                if (snap.Phase == EnginePhase.Drilling)
+                {
+                    await h.Engine.StopAsync();
+                    return true;
+                }
+
+                if (snap.ArchivesCreated > 0 && snap.Phase == EnginePhase.Idle)
+                {
+                    return false;       // 错过了：验证和投递都已经做完
+                }
+
+                await Task.Delay(2);
+            }
+
+            return false;
+        });
+
+        bool caught;
+
+        try
+        {
+            await PumpUntilAsync(h, _ => interrupter.IsCompleted, maxSteps: 100, engineSecondsPerStep: 30);
+            caught = await interrupter;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+
+        EngineState afterStop = h.Store.Load();
+
+        // 机器快到验证一眨眼就做完时抓不到这个时刻，这一条就验不了 —— 不当成失败。
+        if (!caught || afterStop.InFlightDelivery is null)
+        {
+            _output.WriteLine("没抓到验证途中的时刻，本次未验证。");
+            return;
+        }
+
+        _output.WriteLine($"已在验证途中停止引擎，在途的包：{Path.GetFileName(afterStop.InFlightDelivery.ArchivePath)}");
+
+        Assert.True(File.Exists(afterStop.InFlightDelivery.ArchivePath), "停止之后那个打好的包不见了");
+        Assert.False(afterStop.InFlightDelivery.Verified);
+        Assert.Empty(h.OneDrive.Files("*.7z"));
+
+        BackupEngine second = new(h.Log, h.Time, Win32FileProbe.Instance, h.Store)
+        {
+            OneDriveClientProbe = () => OneDriveClientState.Running,
+        };
+
+        Assert.True(second.Start(h.Settings, h.Notify, h.Uploads, TestBinaries.SevenZip()));
+        Harness h2 = h with { Engine = second };
+
+        try
+        {
+            Assert.True(
+                await PumpUntilAsync(h2, s => s.RetryCount == 0 && h.OneDrive.Files("*.7z").Length == 1),
+                $"换了进程之后没有接着投递。状态：{second.Snapshot.StatusText}");
+            Assert.True(await WaitOneRoundAsync(h2));
+
+            Assert.Equal(1, second.Snapshot.ArchivesCreated);       // 没有重新打包
+            Assert.Empty(h.ZipTemp.Files("*.7z"));
+        }
+        catch
+        {
+            DumpOnFailure(h2);
+            throw;
+        }
+        finally
+        {
+            await second.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task 隔离区点重试后马上单独重打_不等批处理窗口()
+    {
+        // 原先是并进当前批次、把窗口清零 —— 说是"下一轮就打包"，实际要再等满一个窗口。
+        Harness h = BuildHarness(maxAttempts: 2);
+
+        try
+        {
+            h.Monitor.WriteFile("data.dat", 2048);
+            Assert.True(await PumpUntilAsync(h, s => s.QuarantineCount > 0));
+
+            string id = h.Engine.Snapshot.Quarantines[0].Id;
+            Assert.True(h.Engine.RequeueQuarantined(id));
+
+            // 每步只走 1 秒：批处理窗口最短 1 分钟，按老办法 15 步之内根本轮不到打包。
+            Assert.True(
+                await PumpUntilAsync(
+                    h,
+                    s => s.RetryCount == 1 && s.Retries[0].Id == id && s.Retries[0].Attempts == 1,
+                    maxSteps: 15,
+                    engineSecondsPerStep: 1),
+                $"放回去的批次没有马上重打。状态：{h.Engine.Snapshot.StatusText}");
+
+            Assert.Equal(0, h.Engine.Snapshot.BatchFileCount);
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task OneDrive客户端没在运行时上传超时暂停计时()
+    {
+        // 开机自启后没人登录、OneDrive 根本没起来的那几个小时，原先也算进上传超时：
+        // 包一个个被记成"未能确认上传"、从此不再跟踪，本地空间也永不释放。
+        OneDriveClientState client = OneDriveClientState.NotRunning;
+
+        Harness h = BuildHarness(
+            tweak: s => s.UploadTimeoutMinutes = SettingsLimits.UploadTimeoutMinutesMin,
+            seedState: s =>
+            {
+                s.FirstRunCompleted = true;
+                s.PendingUploads.Add(new PendingUpload
+                {
+                    ArchivePath = @"X:\cloud\Backup_20260901_115000.7z",
+                    Bytes = 4096,
+                    FileCount = 1,
+                    DeliveredUtc = Origin,
+                    RoundStartedUtc = Origin,
+                    ClientRunningSeconds = 0,
+                });
+            },
+            uploadMonitor: new FakeUploadMonitor { Status = UploadStatus.Pending },
+            oneDriveClient: () => client);
+
+        try
+        {
+            // 引擎眼里过去 10 分钟，远超 1 分钟的超时 —— 但 OneDrive 一直没在跑。
+            await PumpUntilAsync(h, _ => false, maxSteps: 20, engineSecondsPerStep: 30);
+
+            Assert.Equal(1, h.Engine.Snapshot.PendingUploadCount);
+            Assert.Equal(0, h.Notify.CountOf(NotifyEvent.Failure));
+            Assert.True(h.Log.Contains("上传超时暂停计时"), h.Log.Dump());
+
+            // 有人登录、OneDrive 起来了：恢复计时，满 1 分钟照常判超时。
+            client = OneDriveClientState.Running;
+
+            Assert.True(
+                await PumpUntilAsync(h, s => s.PendingUploadCount == 0, maxSteps: 20, engineSecondsPerStep: 30),
+                "OneDrive 运行之后一直没有判超时");
+
+            Assert.True(h.Log.Contains("上传超时恢复计时"), h.Log.Dump());
+            Assert.Equal(1, h.Notify.CountOf(NotifyEvent.Failure));
+        }
+        catch
+        {
+            DumpOnFailure(h);
+            throw;
+        }
+        finally
+        {
+            await h.Engine.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task 云盘类型不是OneDrive时_不再按OneDrive去等上传()
+    {
+        // 改过云盘类型之后，上次留下的待上传记录不该再走 OneDrive 那一套判定。
+        Harness h = BuildHarness(
+            tweak: s => s.CloudTarget = CloudTarget.Folder,
+            seedState: s =>
+            {
+                s.FirstRunCompleted = true;
+                s.PendingUploads.Add(new PendingUpload
+                {
+                    ArchivePath = @"X:\cloud\Backup_20260901_115000.7z",
+                    Bytes = 4096,
+                    DeliveredUtc = Origin.AddHours(-5),
+                });
+            });
+
+        try
+        {
+            await IdleAsync(h);
+
+            Assert.Equal(0, h.Engine.Snapshot.PendingUploadCount);
+            Assert.Equal(0, h.Uploads.Checks);
+            Assert.Equal(0, h.Notify.CountOf(NotifyEvent.Failure));
+            Assert.True(h.Log.Contains("不再跟踪"), h.Log.Dump());
+            Assert.Empty(h.Store.Load().PendingUploads);
         }
         catch
         {

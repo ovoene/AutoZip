@@ -65,6 +65,10 @@ public sealed class FileFilter
     }
 
     /// <summary>判断 <paramref name="candidate"/> 是否位于 <paramref name="ancestor"/> 之内（含相等）。</summary>
+    /// <summary>两个路径是不是同一个目录（大小写、尾部分隔符、相对写法都不算差别）。</summary>
+    public static bool IsSameDirectory(string a, string b) =>
+        IsSameOrUnder(a, b) && IsSameOrUnder(b, a);
+
     public static bool IsSameOrUnder(string candidate, string ancestor)
     {
         if (string.IsNullOrWhiteSpace(candidate) || string.IsNullOrWhiteSpace(ancestor))

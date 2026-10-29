@@ -131,6 +131,38 @@ public sealed class BackupEngine : IAsyncDisposable
     private EngineState _stateView = new();
     private long _rounds;
 
+    /// <summary>"临时目录 = 目标目录、拒绝清理"那条错误本次运行是否已经说过。</summary>
+    private bool _warnedQuotaOnCloud;
+
+    /// <summary>上一次给待上传归档累计等待时间是什么时候（引擎每次启动清零）。</summary>
+    private DateTimeOffset? _lastUploadAccrualUtc;
+
+    /// <summary>上一次检查时 OneDrive 客户端是不是没在跑。只用来在"暂停 / 恢复计时"翻转时各说一句。</summary>
+    private bool _uploadClockPaused;
+
+    /// <summary>
+    /// 两次检查之间最多按多久计入上传等待。机器睡眠、休眠醒来时两次检查可能隔了一整夜，
+    /// 那段时间 OneDrive 也没在传 —— 不设上限的话一醒来所有包同时超时。
+    /// </summary>
+    private static readonly TimeSpan MaxUploadAccrualStep = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// 查 OneDrive 客户端在不在跑。测试替换它，免得依赖测试机上有没有 OneDrive 进程。
+    /// </summary>
+    internal Func<OneDriveClientState> OneDriveClientProbe { get; set; } = OneDriveClientStatus.Query;
+
+    /// <summary>
+    /// 发布快照的锁。主循环整份发布、打包进度回调只改进度两个字段，两边都在这把锁里写，
+    /// 进度回调因此不可能把一份更新的快照（比如已经切到"投递"）盖回成旧的"打包中"。
+    /// </summary>
+    private readonly object _snapshotGate = new();
+
+    /// <summary>
+    /// 第几次打包。进度回调由 <see cref="Progress{T}"/> 排到线程池上执行，可能在打包结束之后才到；
+    /// 只认本次打包的回调，迟到的直接丢掉。
+    /// </summary>
+    private int _packGeneration;
+
     public BackupEngine(IAppLogger log, TimeProvider? time = null, IFileProbe? probe = null, StateStore? stateStore = null)
     {
         _log = log;
@@ -205,6 +237,9 @@ public sealed class BackupEngine : IAsyncDisposable
             _runner = new SevenZipRunner(sevenZipExePath ?? AppPaths.SevenZipExe, _log);
             _drill = new RestoreDrillService(_runner, _log);
             _fileFloorUtc = ScheduleWindow.FromSettings(_settings).EffectiveFromUtc();
+            _warnedQuotaOnCloud = false;
+            _lastUploadAccrualUtc = null;
+            _uploadClockPaused = false;
 
             SecretRedactor.Shared.SetSecrets(
             [
@@ -315,6 +350,7 @@ public sealed class BackupEngine : IAsyncDisposable
         }
 
         _state = new EngineState();
+        _retries.Clear();
 
         // 快照里的累计数字是从 _state 读的，不重发一次的话界面会一直停在旧值。
         // 停止状态下没有主循环再去发，只能在这里补一发。
@@ -387,7 +423,16 @@ public sealed class BackupEngine : IAsyncDisposable
         AppPaths.EnsureCreated();
 
         _state = _stateStore.Load();
+
+        // 必须在 SanitizeState 之前：它可能存盘，而存盘会用内存里的队列覆盖磁盘上那一份。
+        _retries.Load(_state.Retries);
+        ResumeInterruptedDelivery();
         SanitizeState();
+
+        if (_retries.Count > 0)
+        {
+            _log.Info($"接着上次的 {_retries.Count} 个待重试批次，失败次数接着数，不从头算。");
+        }
         _zipTemp.Configure(_settings.ResolveZipTemp());
         _zipTemp.EnsureDirectory();
 
@@ -462,7 +507,7 @@ public sealed class BackupEngine : IAsyncDisposable
             }
 
             _state.FirstRunCompleted = true;
-            _stateStore.Save(_state);
+            SaveState();
         }
 
         if (!string.IsNullOrWhiteSpace(_settings.MonitorPath) && Directory.Exists(_settings.MonitorPath))
@@ -527,7 +572,7 @@ public sealed class BackupEngine : IAsyncDisposable
 
         try
         {
-            _stateStore.Save(_state);
+            SaveState();
         }
         catch (Exception ex)
         {
@@ -700,7 +745,7 @@ public sealed class BackupEngine : IAsyncDisposable
             ct).ConfigureAwait(false);
 
         RecordDrill(drill);
-        _stateStore.Save(_state);
+        SaveState();
 
         if (drill.IsProblem)
         {
@@ -748,8 +793,11 @@ public sealed class BackupEngine : IAsyncDisposable
 
         try
         {
+            // 只挑本程序打的包（见 ArchiveNaming.IsOurs）：目标目录里别人的 .7z
+            // 用我们的密码当然解不开，验了只会发一条"密码不对"的假警报。
             return new DirectoryInfo(_settings.CloudPath)
                 .EnumerateFiles("*.7z", SearchOption.TopDirectoryOnly)
+                .Where(f => ArchiveNaming.IsOurs(f.Name))
                 .OrderByDescending(f => f.LastWriteTimeUtc)
                 .Select(f => f.FullName)
                 .FirstOrDefault();
@@ -865,7 +913,7 @@ public sealed class BackupEngine : IAsyncDisposable
                 _log.Warn(
                     $"{Path.GetFileName(path)} 至今无法读取，本轮不再等它；" +
                     "它已记入待重新处理名单，下一次对账扫描会重新纳入。");
-                _stateStore.Save(_state);
+                SaveState();
             }
         }
 
@@ -1210,7 +1258,7 @@ public sealed class BackupEngine : IAsyncDisposable
 
         if (dirty)
         {
-            _stateStore.Save(_state);
+            SaveState();
         }
     }
 
@@ -1366,6 +1414,43 @@ public sealed class BackupEngine : IAsyncDisposable
 
         try
         {
+            // 上一次是"包打好了、投递失败"：这次只重新投递那个包，不重新打包。
+            // 放在探测源文件之前 —— 源文件这会儿可能已经被轮转删掉了，而那个包正是它们仅存的备份。
+            if (retryId is not null
+                && _retries.Find(retryId) is { ArchivePath: { Length: > 0 } ready } pending
+                && File.Exists(ready))
+            {
+                _log.Info($"批次 {retryId} 的压缩包已经打好（{Path.GetFileName(ready)}），这次只重新投递，不重新打包。");
+
+                // 上次是在解压验证途中被打断的：先把验证补完。没验过的包不往目标目录送。
+                if (!pending.Verified && _settings.VerifyAfterPackByExtract)
+                {
+                    _log.Info($"{Path.GetFileName(ready)} 上次没做完打包后的解压验证，先补做一遍。");
+
+                    if (!await LocalDrillPassedAsync(ready, retryId, [.. pending.Files], pending.SourceBytes, ct)
+                            .ConfigureAwait(false))
+                    {
+                        return;
+                    }
+
+                    pending.Verified = true;
+                    SaveState();
+                }
+
+                await DeliverAsync(
+                    ready,
+                    pending.ArchiveBytes,
+                    pending.ArchivedCount,
+                    [.. pending.Files],
+                    pending.SourceBytes,
+                    [.. pending.SkippedFiles],
+                    retryId,
+                    roundStartedUtc,
+                    ct).ConfigureAwait(false);
+
+                return;
+            }
+
             SetPhase(EnginePhase.Packing);
             _packPercent = 0;
             _packFile = null;
@@ -1401,7 +1486,7 @@ public sealed class BackupEngine : IAsyncDisposable
                 // 不清的话，名单只会越攒越长，而每一条都指向一个不存在的路径。
                 if (ClearForcedFiles(requested) > 0)
                 {
-                    _stateStore.Save(_state);
+                    SaveState();
                 }
 
                 // 这一支曾经是整条时间线上唯一的静默处：【就绪】已经发出去了，
@@ -1459,13 +1544,17 @@ public sealed class BackupEngine : IAsyncDisposable
                 VerifyAfterPack: true)
             {
                 ExtraFiles = manifestFile is null ? [] : [manifestFile],
+
+                // 包里按相对监控目录的路径存：子目录里的同名文件不再撞名，解出来也还是原来的目录结构。
+                BaseDirectory = _settings.MonitorPath,
             };
 
-            Progress<PackProgress> progress = new(p =>
-            {
-                _packPercent = p.Percent;
-                _packFile = p.CurrentFile;
-            });
+            int generation = Interlocked.Increment(ref _packGeneration);
+
+            // 进度要立刻推到快照上：快照原本只在打包开始和结束时各发布一次，
+            // 中间那段（大包可以是几个小时）总览上的进度条一直停在 0%。
+            // 只改快照里的两个字段（record 的 with，不重扫目录），所以回调再频繁也不贵。
+            Progress<PackProgress> progress = new(p => PublishPackProgress(generation, p));
 
             PackResult result = await _runner.CreateAsync(request, progress, ct).ConfigureAwait(false);
 
@@ -1530,6 +1619,24 @@ public sealed class BackupEngine : IAsyncDisposable
                     ]),
                 ct).ConfigureAwait(false);
 
+            // ---------- 登记"在途"：包已经在临时目录里了，从这一刻起它不能丢 ----------
+            //
+            // 立刻存盘：下面的解压验证对大包要几分钟，这期间被停止、被界面接管、进程被结束，
+            // 下次启动都会把这个包接回去，补完验证再投递，而不是把源文件重新打一遍。
+            _state.InFlightDelivery = new RetryEntry
+            {
+                Id = retryId ?? string.Empty,
+                Files = [.. files],
+                ArchivePath = result.ArchivePath,
+                ArchiveBytes = result.ArchiveBytes,
+                ArchivedCount = archivedCount,
+                SourceBytes = totalBytes,
+                SkippedFiles = [.. skippedFiles],
+                Verified = !_settings.VerifyAfterPackByExtract,
+            };
+
+            SaveState();
+
             // ---------- 本地恢复演练：解不开的包不往云盘送 ----------
             //
             // 位置是刻意选的 —— 在交付<b>之前</b>。一个用存下来的密码打不开的包
@@ -1541,86 +1648,23 @@ public sealed class BackupEngine : IAsyncDisposable
                 return;
             }
 
+            if (_state.InFlightDelivery is { } inFlight)
+            {
+                inFlight.Verified = true;
+                SaveState();
+            }
+
             // ---------- 交付到目标目录 ----------
-            SetPhase(EnginePhase.Delivering);
-            PublishSnapshot();
-
-            string pathLabel = CloudTargetText.PathLabel(_settings.CloudTarget);
-            string? delivered = TryDeliver(result.ArchivePath, out string? deliverError);
-
-            if (delivered is null)
-            {
-                // 归档本身是好的，只是移不过去。保留它并如实说明位置 ——
-                // 绝不因为"移动失败"就重新压缩一遍（那才是磁盘被填满的老路）。
-                _log.Error(
-                    $"归档已生成但移入{pathLabel}失败：{deliverError}。" +
-                    $"归档保留在 {result.ArchivePath}，受临时目录配额管理。");
-
-                HandleFailure(PipelineStage.Deliver, retryId, files, totalBytes, $"移入{pathLabel}失败：{deliverError}");
-                return;
-            }
-
-            // 水位线只推到"真正打进包里的最新文件"，然后结算例外名单。
-            // 顺序要紧：先推水位线（它会把被截断的文件记进未来时间戳名单），
-            // 再结算"必须重新处理"名单（清掉这一批已成功的、重新记上仍然没进去的）。
-            AdvanceCheckpoint(files, skippedFiles);
-            ReconcileForcedFiles(files, skippedFiles);
-
-            if (_settings.CloudTarget == CloudTarget.OneDrive)
-            {
-                _state.PendingUploads.Add(new PendingUpload
-                {
-                    ArchivePath = delivered,
-                    Bytes = result.ArchiveBytes,
-                    FileCount = archivedCount,
-                    SourceBytes = totalBytes,
-                    RoundStartedUtc = roundStartedUtc,
-                    DeliveredUtc = _time.GetUtcNow(),
-                });
-
-                // 【上传】发在这里 —— 剪切进 OneDrive 目录的那一刻，客户端从这一刻开始传。
-                //
-                // 旧行为是等云端确认完了才发这一条，于是"上传"和"结束"几乎同时到，
-                // 中间那段真正在传的时间（几分钟到几十分钟）界面外一片空白。
-                // 上传<b>完成</b>由【结束】负责宣布，两条各司其职。
-                await NotifySafeAsync(
-                    Msg(NotifyEvent.UploadCompleted, NotifyTag.Uploaded,
-                        "正在上传到OneDrive。",
-                        $"压缩包：{Path.GetFileName(delivered)}",
-                        $"压缩包大小：{ByteSize.FormatShort(result.ArchiveBytes)}",
-                        $"包含文件：{archivedCount} 个（源文件总大小 {ByteSize.FormatShort(totalBytes)}）",
-                        $"所在目录：{_settings.CloudPath}",
-                        CloudStatusLine(),
-                        $"程序每 {_settings.UploadPollSeconds} 秒查一次云端是否已收到，" +
-                        $"最长等 {_settings.UploadTimeoutMinutes} 分钟；确认收到后会发【结束】。",
-                        _settings.ReleaseLocalSpace
-                            ? "确认上传完成后会把本地副本改为「仅联机」，释放磁盘空间。"
-                            : "本地副本会保留，不释放磁盘空间。"),
-                    ct).ConfigureAwait(false);
-            }
-            else
-            {
-                // 非 OneDrive：剪切进目录就是本轮的终点。
-                //
-                // 这条分支存在的理由是<b>没有可靠的替代信号</b>：坚果云、百度网盘、Dropbox
-                // 各有各的私有协议，没有一个像 Cloud Files API 那样能被"文件已脱水"证明。
-                // 硬要等一个猜出来的信号，只会变成旧版那种死等两小时再谎报成功。
-                // 所以边界划在这里 ——【结束】只说程序自己做完的那件事（已移入指定目录），
-                // 不提"后续由客户端上传"：程序既没检测过那个客户端，也不该替它承诺。
-                await CompleteFolderRoundAsync(
-                    delivered,
-                    result.ArchiveBytes,
-                    archivedCount,
-                    totalBytes,
-                    roundStartedUtc,
-                    ct).ConfigureAwait(false);
-            }
-
-            if (retryId is not null)
-            {
-                _log.Info($"批次 {retryId} 重试成功，已从重试队列移除。");
-                _retries.Remove(retryId);
-            }
+            await DeliverAsync(
+                result.ArchivePath,
+                result.ArchiveBytes,
+                archivedCount,
+                files,
+                totalBytes,
+                skippedFiles,
+                retryId,
+                roundStartedUtc,
+                ct).ConfigureAwait(false);
         }
         finally
         {
@@ -1641,6 +1685,8 @@ public sealed class BackupEngine : IAsyncDisposable
                 _announced.Clear();
             }
 
+            // 先作废这次打包的进度回调，再清零 —— 顺序反了的话，一个迟到的回调会把数字又写回来。
+            Interlocked.Increment(ref _packGeneration);
             _packPercent = 0;
             _packFile = null;
 
@@ -1660,10 +1706,148 @@ public sealed class BackupEngine : IAsyncDisposable
 
             _zipTemp.SweepIntermediates();
             EnforceQuota();
-            _stateStore.Save(_state);
+            SaveState();
 
             SetPhase(EnginePhase.Idle);
             PublishSnapshot();
+        }
+    }
+
+    /// <summary>
+    /// 启动时：上次有一个包打好了、还没送进目标目录进程就停了。把它接回重试队列，
+    /// 下一轮补完验证（如果没做完）就投递。包已经不在了（被手动删掉）就算了 ——
+    /// 水位线没推过它的源文件，对账扫描会把源文件重新找回来、重新打包。
+    /// </summary>
+    private void ResumeInterruptedDelivery()
+    {
+        if (_state.InFlightDelivery is not { } interrupted)
+        {
+            return;
+        }
+
+        _state.InFlightDelivery = null;
+
+        if (string.IsNullOrEmpty(interrupted.ArchivePath) || !SafeExists(interrupted.ArchivePath))
+        {
+            _log.Info("上次有一个打好但没来得及投递的包，现在已经不在了；它的源文件会按正常流程重新打包。");
+            return;
+        }
+
+        RetryEntry adopted = _retries.AdoptInterrupted(interrupted);
+
+        _log.Info(
+            $"上次进程停止时，{Path.GetFileName(interrupted.ArchivePath)} 已经打好、还没来得及投递。" +
+            (interrupted.Verified ? "接着投递它，" : "先补做解压验证再投递，") +
+            $"不重新打包（批次 {adopted.Id}）。");
+    }
+
+    /// <summary>
+    /// 把一个已经打好、校验过的包送进目标目录，然后结算水位线、例外名单，
+    /// 登记待上传（OneDrive）或直接收尾（其他目录）。
+    ///
+    /// 两个调用方：刚打完包的正常流程，以及"上次投递失败"的重试 ——
+    /// 后者直接从这里开始，不重新打包（见 <see cref="RetryEntry.ArchivePath"/>）。
+    /// 投递再失败时，把这个包随失败一起登记，下一次重试仍然只投递。
+    /// </summary>
+    private async Task DeliverAsync(
+        string archivePath,
+        long archiveBytes,
+        int archivedCount,
+        IReadOnlyList<string> files,
+        long totalBytes,
+        IReadOnlyCollection<string> skippedFiles,
+        string? retryId,
+        DateTimeOffset roundStartedUtc,
+        CancellationToken ct)
+    {
+        SetPhase(EnginePhase.Delivering);
+        PublishSnapshot();
+
+        string pathLabel = CloudTargetText.PathLabel(_settings.CloudTarget);
+        string? delivered = TryDeliver(archivePath, out string? deliverError);
+
+        if (delivered is null)
+        {
+            // 归档本身是好的，只是移不过去。保留它并如实说明位置 ——
+            // 绝不因为"移动失败"就重新压缩一遍（那才是磁盘被填满的老路）。
+            // 这个包随失败一起登记，下一次重试只重新投递它；等待期间临时目录的配额清理不会删它。
+            _log.Error(
+                $"归档已生成但移入{pathLabel}失败：{deliverError}。" +
+                $"归档保留在 {archivePath}，下次重试只重新投递，不重新打包。");
+
+            HandleFailure(
+                PipelineStage.Deliver,
+                retryId,
+                files,
+                totalBytes,
+                $"移入{pathLabel}失败：{deliverError}",
+                new PackedArchive(archivePath, archiveBytes, archivedCount, totalBytes, [.. skippedFiles], Verified: true));
+            return;
+        }
+
+        // 水位线只推到"真正打进包里的最新文件"，然后结算例外名单。
+        // 顺序要紧：先推水位线（它会把被截断的文件记进未来时间戳名单），
+        // 再结算"必须重新处理"名单（清掉这一批已成功的、重新记上仍然没进去的）。
+        AdvanceCheckpoint(files, skippedFiles);
+        ReconcileForcedFiles(files, skippedFiles);
+
+        // 送到了，"在途"这一笔销掉。和水位线放在同一次存盘里（本轮 finally 那一次）。
+        _state.InFlightDelivery = null;
+
+        if (_settings.CloudTarget == CloudTarget.OneDrive)
+        {
+            _state.PendingUploads.Add(new PendingUpload
+            {
+                ArchivePath = delivered,
+                Bytes = archiveBytes,
+                FileCount = archivedCount,
+                SourceBytes = totalBytes,
+                RoundStartedUtc = roundStartedUtc,
+                DeliveredUtc = _time.GetUtcNow(),
+            });
+
+            // 【上传】发在这里 —— 剪切进 OneDrive 目录的那一刻，客户端从这一刻开始传。
+            //
+            // 旧行为是等云端确认完了才发这一条，于是"上传"和"结束"几乎同时到，
+            // 中间那段真正在传的时间（几分钟到几十分钟）界面外一片空白。
+            // 上传<b>完成</b>由【结束】负责宣布，两条各司其职。
+            await NotifySafeAsync(
+                Msg(NotifyEvent.UploadCompleted, NotifyTag.Uploaded,
+                    "正在上传到OneDrive。",
+                    $"压缩包：{Path.GetFileName(delivered)}",
+                    $"压缩包大小：{ByteSize.FormatShort(archiveBytes)}",
+                    $"包含文件：{archivedCount} 个（源文件总大小 {ByteSize.FormatShort(totalBytes)}）",
+                    $"所在目录：{_settings.CloudPath}",
+                    CloudStatusLine(),
+                    $"程序每 {_settings.UploadPollSeconds} 秒查一次云端是否已收到，" +
+                    $"最长等 {_settings.UploadTimeoutMinutes} 分钟（只算 OneDrive 客户端在运行的时间）；确认收到后会发【结束】。",
+                    _settings.ReleaseLocalSpace
+                        ? "确认上传完成后会把本地副本改为「仅联机」，释放磁盘空间。"
+                        : "本地副本会保留，不释放磁盘空间。"),
+                ct).ConfigureAwait(false);
+        }
+        else
+        {
+            // 非 OneDrive：剪切进目录就是本轮的终点。
+            //
+            // 这条分支存在的理由是<b>没有可靠的替代信号</b>：坚果云、百度网盘、Dropbox
+            // 各有各的私有协议，没有一个像 Cloud Files API 那样能被"文件已脱水"证明。
+            // 硬要等一个猜出来的信号，只会变成旧版那种死等两小时再谎报成功。
+            // 所以边界划在这里 ——【结束】只说程序自己做完的那件事（已移入指定目录），
+            // 不提"后续由客户端上传"：程序既没检测过那个客户端，也不该替它承诺。
+            await CompleteFolderRoundAsync(
+                delivered,
+                archiveBytes,
+                archivedCount,
+                totalBytes,
+                roundStartedUtc,
+                ct).ConfigureAwait(false);
+        }
+
+        if (retryId is not null)
+        {
+            _log.Info($"批次 {retryId} 重试成功，已从重试队列移除。");
+            _retries.Remove(retryId);
         }
     }
 
@@ -1861,9 +2045,13 @@ public sealed class BackupEngine : IAsyncDisposable
         string? retryId,
         IReadOnlyList<string> files,
         long totalBytes,
-        string reason)
+        string reason,
+        PackedArchive? packed = null)
     {
         DateTimeOffset now = _time.GetUtcNow();
+
+        // 失败已经记进重试队列（投递失败时连包一起记），"在途"那一笔就不再需要了。
+        _state.InFlightDelivery = null;
 
         if (stage == PipelineStage.Pack)
         {
@@ -1881,7 +2069,8 @@ public sealed class BackupEngine : IAsyncDisposable
             files,
             totalBytes,
             reason,
-            _settings.MaxAttemptsBeforeQuarantine);
+            _settings.MaxAttemptsBeforeQuarantine,
+            packed);
 
         if (outcome.Quarantined is { } quarantined)
         {
@@ -2059,6 +2248,7 @@ public sealed class BackupEngine : IAsyncDisposable
             target = MakeUnique(target);
 
             File.Move(archivePath, target);
+            InvalidateDirectoryScan();
 
             _log.Info($"已移入{CloudTargetText.PathLabel(_settings.CloudTarget)}：{target}");
 
@@ -2329,8 +2519,29 @@ public sealed class BackupEngine : IAsyncDisposable
 
     private void EnforceQuota()
     {
+        // 打包、投递、清理都在这之前或这里发生 —— 不管下面清没清，目录里的东西都可能变了。
+        InvalidateDirectoryScan();
+
+        // 第二道闸：启动前校验已经把"临时目录 = 目标目录"当错误拦下了，
+        // 但引擎不该把自己的安全押在调用方一定先校验上（手改的配置、测试、以后的新入口）。
+        // 两者是同一个目录时，被淘汰的就是已送达的备份本体，所以这里宁可不清理。
+        if (FileFilter.IsSameDirectory(_zipTemp.Root, _settings.CloudPath))
+        {
+            if (!_warnedQuotaOnCloud)
+            {
+                _warnedQuotaOnCloud = true;
+                _log.Error(
+                    "临时目录和目标目录是同一个目录，已停止按配额清理临时目录 —— " +
+                    "否则删掉的会是已经备份好的压缩包。请在设置里给临时目录另选一个目录。");
+            }
+
+            return;
+        }
+
         HashSet<string> locked = new(
-            _state.PendingUploads.Select(u => u.ArchivePath),
+            _state.PendingUploads.Select(u => u.ArchivePath)
+                .Concat(_retries.PendingArchives())
+                .Concat(_state.InFlightDelivery?.ArchivePath is { Length: > 0 } inFlight ? [inFlight] : []),
             StringComparer.OrdinalIgnoreCase);
 
         _zipTemp.Enforce(
@@ -2344,10 +2555,69 @@ public sealed class BackupEngine : IAsyncDisposable
     //  待上传归档
     // ==================================================================
 
+    /// <summary>
+    /// 这一次检查该给上传等待记多少时间：OneDrive 客户端在跑就记上"距上次检查"的那段（有上限），
+    /// 没在跑就一秒都不记 —— 没人登录时 OneDrive 根本不会上传，那段等待不该算进超时。
+    /// 查不出客户端状态（权限不足）时照常计时：宁可按老办法超时，也不能因为查不了就永远等下去。
+    /// </summary>
+    private TimeSpan AccrueUploadClock(DateTimeOffset nowUtc)
+    {
+        TimeSpan step = _lastUploadAccrualUtc is { } last ? nowUtc - last : TimeSpan.Zero;
+        _lastUploadAccrualUtc = nowUtc;
+
+        if (step < TimeSpan.Zero)
+        {
+            step = TimeSpan.Zero;       // 系统时钟被往回拨
+        }
+        else if (step > MaxUploadAccrualStep)
+        {
+            step = MaxUploadAccrualStep;
+        }
+
+        OneDriveClientState client;
+
+        try
+        {
+            client = OneDriveClientProbe();
+        }
+        catch (Exception)
+        {
+            client = OneDriveClientState.Unknown;
+        }
+
+        bool paused = client == OneDriveClientState.NotRunning;
+
+        if (paused != _uploadClockPaused)
+        {
+            _uploadClockPaused = paused;
+
+            _log.Info(paused
+                ? $"OneDrive 客户端没在运行（多半是还没有人登录 Windows）：{_state.PendingUploads.Count} 个压缩包等着上传，" +
+                  "上传超时暂停计时，等客户端运行后接着算。"
+                : "OneDrive 客户端在运行了：上传超时恢复计时。");
+        }
+
+        return paused ? TimeSpan.Zero : step;
+    }
+
     private async Task ProcessPendingUploadsAsync(DateTimeOffset nowUtc, CancellationToken ct)
     {
         if (_state.PendingUploads.Count == 0)
         {
+            return;
+        }
+
+        // 等上传、判超时都是 OneDrive 专有的：只有它能拿 Cloud Files 状态证明"云端收到了"。
+        // 云盘类型改成别的之后，上次留下的待上传记录不再按 OneDrive 去判 ——
+        // 包原样留在原来的目录里，只是不再跟踪。
+        if (_settings.CloudTarget != CloudTarget.OneDrive)
+        {
+            _log.Info(
+                $"云盘类型已不是 OneDrive，不再跟踪 {_state.PendingUploads.Count} 个之前移进 OneDrive 目录的压缩包的上传状态" +
+                "（压缩包原样保留在原目录，不会被删除）。");
+
+            _state.PendingUploads.Clear();
+            SaveState();
             return;
         }
 
@@ -2360,6 +2630,7 @@ public sealed class BackupEngine : IAsyncDisposable
         SetPhase(EnginePhase.WaitingUpload);
 
         TimeSpan timeout = TimeSpan.FromMinutes(_settings.UploadTimeoutMinutes);
+        TimeSpan accrued = AccrueUploadClock(nowUtc);
         List<PendingUpload> done = [];
 
         foreach (PendingUpload upload in _state.PendingUploads)
@@ -2367,6 +2638,11 @@ public sealed class BackupEngine : IAsyncDisposable
             ct.ThrowIfCancellationRequested();
 
             upload.Polls++;
+
+            // 老版本留下的记录没有这只表：按墙钟时间补上（就是原来的算法），之后只累计客户端在跑的时间。
+            upload.ClientRunningSeconds = upload.ClientRunningSeconds is { } waited
+                ? waited + accrued.TotalSeconds
+                : Math.Max(0, (nowUtc - upload.DeliveredUtc).TotalSeconds);
 
             UploadCheckResult check;
 
@@ -2446,7 +2722,7 @@ public sealed class BackupEngine : IAsyncDisposable
                     break;
 
                 default:
-                    if (nowUtc - upload.DeliveredUtc > timeout)
+                    if (TimeSpan.FromSeconds(upload.ClientRunningSeconds ?? 0) > timeout)
                     {
                         done.Add(upload);
 
@@ -2459,7 +2735,8 @@ public sealed class BackupEngine : IAsyncDisposable
 
                         _log.Warn(
                             $"归档 {upload.FileName} 已在 OneDrive 目录中 " +
-                            $"{ByteSize.FormatDuration(nowUtc - upload.DeliveredUtc)}，" +
+                            $"{ByteSize.FormatDuration(nowUtc - upload.DeliveredUtc)}" +
+                            $"（其中 OneDrive 客户端在运行的有 {ByteSize.FormatDuration(TimeSpan.FromSeconds(upload.ClientRunningSeconds ?? 0))}），" +
                             $"但仍未能确认上传完成，停止跟踪。{detail}");
 
                         await NotifySafeAsync(
@@ -2467,7 +2744,7 @@ public sealed class BackupEngine : IAsyncDisposable
                                 "OneDrive：未能确认云端已收到（不谎报成功）。",
                                 $"压缩包：{upload.FileName}",
                                 $"压缩包大小：{ByteSize.FormatShort(upload.Bytes)}",
-                                $"文件已在 OneDrive 目录中，但 {_settings.UploadTimeoutMinutes} 分钟内未能确认云端收到。",
+                                $"文件已在 OneDrive 目录中，OneDrive 客户端运行期间累计等了 {_settings.UploadTimeoutMinutes} 分钟，仍未能确认云端收到。",
                                 detail,
                                 "压缩包没有被删除，本地空间也未释放，请手动检查 OneDrive 同步状态。",
                                 ProgramDiskLine()),
@@ -2485,7 +2762,7 @@ public sealed class BackupEngine : IAsyncDisposable
                 _state.PendingUploads.Remove(upload);
             }
 
-            _stateStore.Save(_state);
+            SaveState();
         }
     }
 
@@ -2570,23 +2847,22 @@ public sealed class BackupEngine : IAsyncDisposable
         if (alive.Count == 0)
         {
             _log.Warn($"隔离批次 {id} 的源文件已全部不存在，直接丢弃。");
-            _stateStore.Save(_state);
+            SaveState();
             return;
         }
 
-        foreach (string path in alive)
-        {
-            _batch[path] = SafeLength(path);
-        }
-
-        _windowOpenedUtc = null;   // 立刻开新窗口，下一轮就会打包
+        // 作为一个立刻到期的独立重试批次放回去，下一轮就单独打包（见 RetryQueue.RequeueNow）。
+        //
+        // 原先是并进当前批次、再把窗口清零 —— 注释说"下一轮就会打包"，实际要再等满一个
+        // 批处理窗口；窗口里本来在等的其他文件还会被一起往后拖。
+        _retries.RequeueNow(id, alive);
 
         _log.Info(alive.Count == batch.Files.Count
             ? $"隔离批次 {id} 已放回处理队列（{alive.Count} 个文件）。"
             : $"隔离批次 {id} 已放回处理队列（{alive.Count} 个文件，另有 " +
               $"{batch.Files.Count - alive.Count} 个已不存在，已跳过）。");
 
-        _stateStore.Save(_state);
+        SaveState();
     }
 
     private void ApplyDiscard(string id)
@@ -2610,7 +2886,7 @@ public sealed class BackupEngine : IAsyncDisposable
             ? $"已忽略隔离批次 {id}（同时从待重新处理名单移除 {cleared} 个文件）。"
             : $"已忽略隔离批次 {id}。");
 
-        _stateStore.Save(_state);
+        SaveState();
     }
 
     // ==================================================================
@@ -2897,12 +3173,51 @@ public sealed class BackupEngine : IAsyncDisposable
 
     private void SetPhase(EnginePhase phase) => _phase = phase;
 
+    /// <summary>
+    /// 存盘。<b>所有</b>写 state.json 的地方都走这里：重试队列活在 <see cref="_retries"/> 里，
+    /// 存之前得抄进状态，不然存下去的永远是启动那一刻的旧队列（见 <see cref="RetryQueue.Load"/>）。
+    /// </summary>
+    private void SaveState()
+    {
+        _state.Retries = _retries.Export();
+        _stateStore.Save(_state);
+    }
+
+    /// <summary>打包进度回调：只认本次打包、而且引擎此刻确实还在打包。</summary>
+    private void PublishPackProgress(int generation, PackProgress progress)
+    {
+        lock (_snapshotGate)
+        {
+            if (generation != Volatile.Read(ref _packGeneration) || _phase != EnginePhase.Packing)
+            {
+                return;
+            }
+
+            _packPercent = progress.Percent;
+            _packFile = progress.CurrentFile;
+
+            EngineSnapshot current = Volatile.Read(ref _snapshot);
+
+            Volatile.Write(ref _snapshot, current with
+            {
+                PackPercent = progress.Percent,
+                PackCurrentFile = progress.CurrentFile,
+            });
+        }
+    }
+
     private void PublishSnapshot()
     {
         try
         {
-            Volatile.Write(ref _snapshot, BuildSnapshot());
-            Volatile.Write(ref _stateView, _state.Clone());
+            EngineSnapshot next = BuildSnapshot();
+            EngineState view = _state.Clone();
+
+            lock (_snapshotGate)
+            {
+                Volatile.Write(ref _snapshot, next);
+                Volatile.Write(ref _stateView, view);
+            }
         }
         catch (Exception ex)
         {
@@ -2911,20 +3226,53 @@ public sealed class BackupEngine : IAsyncDisposable
         }
     }
 
+    /// <summary>目录扫描结果最多用多久就得重扫。程序自己动过这两个目录时会立刻作废（见 <see cref="InvalidateDirectoryScan"/>）。</summary>
+    private static readonly TimeSpan DirectoryScanTtl = TimeSpan.FromSeconds(10);
+
+    private IReadOnlyList<ArchiveInfo> _scannedArchives = [];
+    private long _scannedCloudUsed;
+    private long _scannedAtTicks;
+    private bool _scanStale = true;
+
+    /// <summary>
+    /// 临时目录里的包、目标目录的已用量。
+    ///
+    /// 快照每一轮都要发布好几次（每轮结束、每个阶段切换），每次都去枚举两个目录
+    /// （目标目录里可能躺着上千个包，每个还要再 stat 一下旁挂清单）纯属浪费 ——
+    /// 这两个目录绝大多数时候只被程序自己改动，而程序改动它们的那几处都会作废缓存。
+    /// 剩下的是用户在资源管理器里手动增删，最多晚 <see cref="DirectoryScanTtl"/> 反映出来。
+    /// TTL 用真实时钟而不是 <c>_time</c>：省的是真实的磁盘 I/O。
+    /// </summary>
+    private (IReadOnlyList<ArchiveInfo> Archives, long CloudUsed) ScanDirectories()
+    {
+        long now = Environment.TickCount64;
+
+        if (_scanStale || now - Volatile.Read(ref _scannedAtTicks) > (long)DirectoryScanTtl.TotalMilliseconds)
+        {
+            _scannedArchives = _zipTemp.ListArchives();
+            _scannedCloudUsed = MeasureCloudUsedIfBudgeted();
+            Volatile.Write(ref _scannedAtTicks, now);
+            _scanStale = false;
+        }
+
+        return (_scannedArchives, _scannedCloudUsed);
+    }
+
+    /// <summary>程序自己往临时目录 / 目标目录里放了或删了东西：下一次发布快照时重扫。</summary>
+    private void InvalidateDirectoryScan() => _scanStale = true;
+
     private EngineSnapshot BuildSnapshot()
     {
         ScheduleWindow schedule = ScheduleWindow.FromSettings(_settings);
         DateTimeOffset nowLocal = _time.GetLocalNow();
         bool active = schedule.IsActive(nowLocal);
 
-        IReadOnlyList<ArchiveInfo> archives = _zipTemp.ListArchives();
+        (IReadOnlyList<ArchiveInfo> archives, long cloudUsed) = ScanDirectories();
         DiskSpaceInfo disk = DiskSpace.Query(_zipTemp.Root);
 
-        // 目录枚举只在填了预算时才做（见 MeasureCloudUsedIfBudgeted）——
-        // 这个方法每秒会被调用好几次（界面 4 Hz 轮询）。Evaluate 本身只多一次
-        // GetDiskFreeSpaceEx，很便宜，而本地硬盘<b>没填预算也要有数</b>，
-        // 不能再按"预算为 0 就整个跳过"来早退。
-        CloudQuotaStatus quota = CloudQuota.Evaluate(_settings, MeasureCloudUsedIfBudgeted());
+        // Evaluate 本身只多一次 GetDiskFreeSpaceEx，很便宜；本地硬盘<b>没填预算也要有数</b>，
+        // 不能再按"预算为 0 就整个跳过"来早退。贵的是目录枚举，那一半走 ScanDirectories 的缓存。
+        CloudQuotaStatus quota = CloudQuota.Evaluate(_settings, cloudUsed);
 
         DateTimeOffset? windowCloses = _windowOpenedUtc is { } opened
             ? (opened + TimeSpan.FromMinutes(_settings.BatchWindowMinutes)).ToLocalTime()

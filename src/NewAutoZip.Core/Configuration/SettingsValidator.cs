@@ -61,11 +61,22 @@ public static class SettingsValidator
     /// <param name="dataRoot">
     /// 程序数据目录。传 <c>null</c> 用 <see cref="AppPaths.DataRoot"/>；单元测试传入假目录。
     /// </param>
-    public static ValidationReport Validate(AppSettings settings, string sevenZipExePath, string? dataRoot = null)
+    /// <param name="probeWrites">
+    /// 要不要真的写一个探测文件来确认目录可写。启动引擎、点保存时要（只看权限位会漏掉
+    /// 只读介质、组策略、写入虚拟化）；设置页上<b>边打字边校验</b>时不要 —— 那时每敲一个字
+    /// 就校验一次，探测文件会一个接一个地写进 OneDrive 目录，被同步客户端反复上传又删除。
+    /// 两种模式下都<b>绝不创建目录</b>：曾经每敲一个字就建一个目录，
+    /// 敲完 <c>D:\Backup</c> 磁盘上留下 <c>D:\B</c>、<c>D:\Ba</c>……一串空目录。
+    /// </param>
+    public static ValidationReport Validate(
+        AppSettings settings,
+        string sevenZipExePath,
+        string? dataRoot = null,
+        bool probeWrites = true)
     {
         List<ValidationIssue> issues = [];
 
-        ValidatePaths(settings, issues);
+        ValidatePaths(settings, issues, probeWrites);
         ValidateDataRoot(settings, dataRoot ?? AppPaths.DataRoot, issues);
         ValidateOneDriveSync(settings, issues);
         ValidateSchedule(settings, issues);
@@ -150,7 +161,7 @@ public static class SettingsValidator
         }
     }
 
-    private static void ValidatePaths(AppSettings settings, List<ValidationIssue> issues)
+    private static void ValidatePaths(AppSettings settings, List<ValidationIssue> issues, bool probeWrites)
     {
         string monitor = settings.MonitorPath;
         string cloud = settings.CloudPath;
@@ -177,14 +188,14 @@ public static class SettingsValidator
                 $"{cloudLabel}不存在：{cloud}"));
         }
 
-        if (!CanWriteTo(zipTemp, out string? zipTempError))
+        if (!CanWriteTo(zipTemp, probeWrites, out string? zipTempError))
         {
             issues.Add(new ValidationIssue(IssueSeverity.Error, nameof(settings.ZipTempPath),
                 $"临时目录不可写：{zipTemp}（{zipTempError}）"));
         }
 
         if (!string.IsNullOrWhiteSpace(cloud) && Directory.Exists(cloud)
-            && !CanWriteTo(cloud, out string? cloudError))
+            && !CanWriteTo(cloud, probeWrites, out string? cloudError))
         {
             issues.Add(new ValidationIssue(IssueSeverity.Error, nameof(settings.CloudPath),
                 $"{cloudLabel}不可写：{cloud}（{cloudError}）"));
@@ -224,7 +235,16 @@ public static class SettingsValidator
                       "属于重复占用空间。请确认这是你想要的。"));
         }
 
-        if (FileFilter.IsSameOrUnder(zipTemp, cloud))
+        // 同一个目录必须拦下，不能只是提醒：临时目录是要按配额（保留天数 / 个数 / 总容量）
+        // 淘汰旧包的，两者是同一个目录时，被淘汰的就是已经送达的备份本体 ——
+        // 云盘客户端还会把这次删除同步到云端。
+        if (FileFilter.IsSameDirectory(zipTemp, cloud))
+        {
+            issues.Add(new ValidationIssue(IssueSeverity.Error, nameof(settings.ZipTempPath),
+                $"临时目录和{cloudLabel}是同一个目录。临时目录里的旧压缩包会按保留天数、个数和总容量" +
+                $"被自动删除 —— 放在一起的话，删掉的就是已经备份好的包。请给临时目录另选一个本地目录。"));
+        }
+        else if (FileFilter.IsSameOrUnder(zipTemp, cloud))
         {
             issues.Add(new ValidationIssue(IssueSeverity.Warning, nameof(settings.ZipTempPath),
                 $"临时目录位于{cloudLabel}之内。半成品 .part 文件会被同步客户端反复上传，" +
@@ -544,7 +564,11 @@ public static class SettingsValidator
         }
     }
 
-    private static bool CanWriteTo(string directory, out string? error)
+    /// <summary>
+    /// 目录能不能写。<b>不创建目录</b>（理由见 <see cref="Validate"/> 的 probeWrites）：
+    /// 目录还不存在时（临时目录由引擎启动时自己建），改为检查离它最近的、已经存在的上级目录。
+    /// </summary>
+    private static bool CanWriteTo(string directory, bool probe, out string? error)
     {
         error = null;
 
@@ -556,11 +580,27 @@ public static class SettingsValidator
 
         try
         {
-            Directory.CreateDirectory(directory);
+            string? existing = Path.GetFullPath(directory);
 
-            string probe = Path.Combine(directory, $".newautozip-write-test-{Environment.ProcessId}.tmp");
-            File.WriteAllBytes(probe, []);
-            File.Delete(probe);
+            while (existing is not null && !Directory.Exists(existing))
+            {
+                existing = Path.GetDirectoryName(existing);
+            }
+
+            if (existing is null)
+            {
+                error = "路径所在的磁盘或共享不存在";
+                return false;
+            }
+
+            if (!probe)
+            {
+                return true;
+            }
+
+            string probeFile = Path.Combine(existing, $".newautozip-write-test-{Environment.ProcessId}.tmp");
+            File.WriteAllBytes(probeFile, []);
+            File.Delete(probeFile);
             return true;
         }
         catch (Exception ex)

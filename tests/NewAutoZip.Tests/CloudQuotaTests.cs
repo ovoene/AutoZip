@@ -60,9 +60,9 @@ public class CloudQuotaTests
     public void 已用量是目录里所有包加起来()
     {
         using TempDir dir = new();
-        dir.WriteFile("Backup_0.7z", 1024);
-        dir.WriteFile("Backup_1.7z", 2048);
-        dir.WriteFile("Backup_2.7z", 4096);
+        dir.WriteFile("Backup_0_20260101_000000.7z", 1024);
+        dir.WriteFile("Backup_1_20260101_000000.7z", 2048);
+        dir.WriteFile("Backup_2_20260101_000000.7z", 4096);
 
         Assert.Equal(1024 + 2048 + 4096, CloudQuota.MeasureUsed(Scanner(dir.Path)));
     }
@@ -73,7 +73,7 @@ public class CloudQuotaTests
         // 清单跟着包一起躺在云盘目录里，一样占地方。
         // 漏算的那部分永远不会被任何一条上限看见 —— 预算就会慢慢失真。
         using TempDir dir = new();
-        string archive = dir.WriteFile("Backup_0.7z", 1024);
+        string archive = dir.WriteFile("Backup_0_20260101_000000.7z", 1024);
         string sidecar = MakeSidecar(archive);
 
         long used = CloudQuota.MeasureUsed(Scanner(dir.Path));
@@ -88,7 +88,7 @@ public class CloudQuotaTests
         // 只算我们自己产出的包。用户往云盘目录里放的照片、文档不是这个程序造成的占用，
         // 拿它们去拒绝用户的备份是越权。
         using TempDir dir = new();
-        dir.WriteFile("Backup_0.7z", 1024);
+        dir.WriteFile("Backup_0_20260101_000000.7z", 1024);
         dir.WriteFile("家庭照片.jpg", 900_000);
         dir.WriteFile("报表.xlsx", 500_000);
 
@@ -113,8 +113,8 @@ public class CloudQuotaTests
         using TempDir dir = new();
         ZipTempManager scanner = Scanner(dir.Path);
 
-        string a = dir.WriteFile("Backup_0.7z", 4096);
-        dir.WriteFile("Backup_1.7z", 4096);
+        string a = dir.WriteFile("Backup_0_20260101_000000.7z", 4096);
+        dir.WriteFile("Backup_1_20260101_000000.7z", 4096);
 
         Assert.Equal(8192, CloudQuota.MeasureUsed(scanner));
 
@@ -129,7 +129,7 @@ public class CloudQuotaTests
         // 云盘目录里的包是备份本体，不是 ZipTemp 那种中转站。
         // 这个类只算账 —— 将来谁顺手在这里调了 Enforce，会先在这里被挡下。
         using TempDir dir = new();
-        string archive = dir.WriteFile("Backup_0.7z", 1024);
+        string archive = dir.WriteFile("Backup_0_20260101_000000.7z", 1024);
         string sidecar = MakeSidecar(archive);
 
         CloudQuota.MeasureUsed(Scanner(dir.Path));

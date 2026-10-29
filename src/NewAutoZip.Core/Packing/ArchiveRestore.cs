@@ -367,12 +367,14 @@ public sealed class RestoreDrillService
                 "这通常说明它是启用清单之前产出的旧包。");
         }
 
-        // 解出来的文件按"文件名 + 大小"建索引。
+        // 解出来的文件建两份索引：相对路径一份，文件名一份。
         //
-        // 不按相对路径匹配：清单里的路径是相对监控目录算的，而 7-Zip 存条目时
-        // 会剥掉盘符和公共前缀，两边的层级对不上。文件名 + 大小已经足够 ——
-        // 这一步要抓的是"少了文件 / 内容变了"，不是"目录结构变了"。
+        // 现在的包按"相对监控目录的路径"存条目（见 PackRequest.BaseDirectory），
+        // 和清单里记的路径是同一个算法，所以先按相对路径精确对上 —— 子目录里的同名文件
+        // （a\x.txt、b\x.txt，大小还可能一样）只有这样才不会张冠李戴。
+        // 老版本的包只存了文件名、层级对不上，退回"文件名 + 大小"。
         Dictionary<string, List<string>> extracted = new(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, string> byRelativePath = new(StringComparer.OrdinalIgnoreCase);
 
         foreach (string file in Directory.EnumerateFiles(extractedRoot, "*", SearchOption.AllDirectories))
         {
@@ -382,6 +384,8 @@ public sealed class RestoreDrillService
             {
                 continue;
             }
+
+            byRelativePath[Path.GetRelativePath(extractedRoot, file)] = file;
 
             if (!extracted.TryGetValue(name, out List<string>? bucket))
             {
@@ -409,7 +413,13 @@ public sealed class RestoreDrillService
 
             string name = Path.GetFileName(entry.Path);
 
-            if (!extracted.TryGetValue(name, out List<string>? candidates) || candidates.Count == 0)
+            string? exact = byRelativePath.GetValueOrDefault(
+                entry.Path.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar));
+
+            List<string>? candidates = null;
+
+            if (exact is null
+                && (!extracted.TryGetValue(name, out candidates) || candidates.Count == 0))
             {
                 missing++;
 
@@ -421,8 +431,10 @@ public sealed class RestoreDrillService
                 continue;
             }
 
-            // 同名文件可能有多个（不同子目录）。先按大小对上的那个。
-            string? match = candidates.FirstOrDefault(p => SafeLength(p) == entry.Bytes);
+            // 按相对路径对上了就只认它；否则同名文件可能有多个（老包、不同子目录），先按大小对上的那个。
+            string? match = exact is not null
+                ? SafeLength(exact) == entry.Bytes ? exact : null
+                : candidates!.FirstOrDefault(p => SafeLength(p) == entry.Bytes);
 
             if (match is null)
             {

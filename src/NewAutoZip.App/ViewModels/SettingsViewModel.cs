@@ -137,6 +137,7 @@ public sealed class SettingsViewModel : ObservableObject
     private bool _notifyEngineStopped = true;
 
     private bool _startMinimized;
+    private bool _showLegacyLogonStart;
     private bool _autoStartEngine;
     private ChoiceItem<LogLevel> _logLevel;
     private ChoiceItem<ThemeMode> _theme;
@@ -839,10 +840,35 @@ public sealed class SettingsViewModel : ObservableObject
 
     // ==================== 界面与运行 ====================
 
+    /// <summary>
+    /// 改版前的自启方式：随 Windows 登录启动并最小化到托盘。
+    /// 已被「开机自启（无需登录）」取代，设置页上只对还开着它的老配置露面（见 <see cref="ShowLegacyLogonStart"/>）。
+    /// </summary>
     public bool StartMinimized
     {
         get => _startMinimized;
         set { if (Set(ref _startMinimized, value)) { MarkDirty(); } }
+    }
+
+    /// <summary>
+    /// 设置页上要不要露出旧的「随登录启动」那个勾。
+    ///
+    /// 按<b>载入时</b>的值算，而不是跟着勾选状态实时变：用户取消勾选、还没点保存时，
+    /// 那个勾要是当场消失，他就再也勾不回来了。
+    /// </summary>
+    public bool ShowLegacyLogonStart => _showLegacyLogonStart;
+
+    /// <summary>
+    /// 磁盘上的「随登录启动」已经被单独改掉了（开机自启注册成功后撤销旧方式）。
+    /// 跟着改界面上的副本，但<b>不标脏</b> —— 这不是用户的编辑；不跟着改的话，
+    /// 下一次点"保存"会把旧值原样写回去，刚撤掉的登录自启又回来了。
+    /// </summary>
+    public void AcceptStartMinimized(bool value)
+    {
+        if (Set(ref _startMinimized, value, nameof(StartMinimized)))
+        {
+            Changed?.Invoke(this, EventArgs.Empty);
+        }
     }
 
     public bool AutoStartEngine
@@ -1149,6 +1175,7 @@ public sealed class SettingsViewModel : ObservableObject
         _notifyEngineStopped = events.HasFlag(NotifyEvent.EngineStopped);
 
         _startMinimized = settings.StartMinimized;
+        _showLegacyLogonStart = settings.StartMinimized;
         _autoStartEngine = settings.AutoStartEngine;
         _logLevel = LogLevels.FirstOrDefault(c => c.Value == settings.LogLevel) ?? LogLevels[1];
         _theme = Themes.FirstOrDefault(c => c.Value == settings.Theme) ?? Themes[0];

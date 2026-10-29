@@ -3,8 +3,9 @@ name: release
 # ====================================================================
 #  推一个 v* tag 上来就发版。
 #
-#  本机的 release.bat 负责：把版本号写进 Directory.Build.props、跑完整
-#  本地关卡、提交、打 tag vX.Y.Z、推上来。剩下的全在这里做完 ——
+#  本机的 build.bat（菜单第 6 项 / build.bat release）负责：把版本号写进
+#  Directory.Build.props、跑完整本地关卡、提交、打 tag vX.Y.Z、推上来。
+#  剩下的全在这里做完 ——
 #  在 GitHub 的 Windows 机器上重新编译、跑单元测试、打成 zip、建 Release。
 #
 #  所以本机不需要装 gh，也不需要手工往网页上拖那个 71 MB 的包。
@@ -64,7 +65,7 @@ jobs:
           if ($env:GITHUB_REF -like 'refs/tags/*') {
             $fromTag = $env:GITHUB_REF_NAME -replace '^v', ''
             if ($fromTag -ne $inProps) {
-              throw "Tag $env:GITHUB_REF_NAME means $fromTag, but Directory.Build.props says $inProps. The exe would show $inProps in its title bar and About box while the release is named $fromTag. Use release.bat - it writes both."
+              throw "Tag $env:GITHUB_REF_NAME means $fromTag, but Directory.Build.props says $inProps. The exe would show $inProps in its title bar and About box while the release is named $fromTag. Use build.bat release - it writes both."
             }
           }
 
@@ -74,8 +75,9 @@ jobs:
       - name: Unit tests and single-file publish
         shell: cmd
         # 和本机跑的是同一个脚本，不在这里另抄一份 dotnet publish 参数
-        # ——抄出来的两份迟早会各走各的。noselftest 的理由见 publish.cmd。
-        run: publish.cmd noselftest
+        # ——抄出来的两份迟早会各走各的。noselftest 的理由见 build.bat 里
+        # :do_publish 那一段的注释。
+        run: build.bat publish noselftest
 
       - name: Pack the release zip
         id: pack

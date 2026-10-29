@@ -255,3 +255,32 @@ public class ClearHistoryAdviceTests
         Assert.Contains("清空后只会处理往后新增的文件", text);
     }
 }
+
+/// <summary>审计回归：重试队列存进了状态，清空历史时要说清楚它也会被清掉。</summary>
+public class ClearHistoryRetryTests
+{
+    [Fact]
+    public void 确认框里列出待重试批次_并点明已打好的包不会再自动投递()
+    {
+        Core.Pipeline.EngineState state = new()
+        {
+            Retries =
+            [
+                new Core.Pipeline.RetryEntry { Id = "B1", Files = [@"C:\w\a.txt"] },
+                new Core.Pipeline.RetryEntry
+                {
+                    Id = "B2",
+                    Files = [@"C:\w\b.txt"],
+                    ArchivePath = @"C:\tmp\Backup_20260901_120000.7z",
+                },
+            ],
+        };
+
+        string text = Core.Pipeline.ClearHistoryAdvice
+            .For(new Core.Configuration.AppSettings(), state)
+            .ToConfirmationText(deleteLogFiles: false);
+
+        Assert.Contains("待重试批次 2 条", text, StringComparison.Ordinal);
+        Assert.Contains("不再自动投递", text, StringComparison.Ordinal);
+    }
+}

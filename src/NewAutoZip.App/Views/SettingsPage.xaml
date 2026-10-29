@@ -595,13 +595,68 @@
                     <StackPanel>
                         <TextBlock Style="{StaticResource GroupTitle}" Text="界面与运行" />
 
-                        <CheckBox Margin="0,0,0,8" Content="随 Windows 登录自动启动，并最小化到托盘" IsChecked="{Binding StartMinimized}" />
-                        <CheckBox Margin="0,0,0,8" Content="程序启动后自动开始备份" IsChecked="{Binding AutoStartEngine}" />
+                        <!--
+                            开机自启（无需登录）。状态与三颗按钮都挂在 MainViewModel 上
+                            （注册要提权、要和任务计划程序打交道，SettingsViewModel 只是一份配置副本），
+                            所以沿用「数据维护」卡片那个 AncestorType=UserControl 的写法往上取。
+
+                            它<b>不走“保存”</b>：注册要管理员确认、要 Windows 密码，
+                            不可能在点“保存”时静默完成，所以由按钮当场做完、当场报结果。
+                        -->
+                        <TextBlock Margin="0,0,0,8"
+                                   Style="{StaticResource SubTitle}"
+                                   Text="开机自启（无需登录 Windows）" />
 
                         <TextBlock Style="{StaticResource Hint}"
-                                   Text="第一项会往当前用户的“启动”项里登记这个程序（不需要管理员权限，任务管理器的“启动”页里能看到它）；开机后程序直接收在右下角托盘里，不弹窗口。取消勾选会同时撤销登记。想让它开机就自己干活，把两项都勾上。" />
+                                   Margin="0,0,0,8"
+                                   Text="{Binding DataContext.BootTaskStatusText, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                                   Visibility="{Binding DataContext.BootTaskNeedsAttention, RelativeSource={RelativeSource AncestorType=UserControl}, Converter={StaticResource BoolVisibility}, ConverterParameter=invert}" />
 
-                        <StackPanel Style="{StaticResource FieldRow}" Margin="0,8,0,0">
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Margin="0,0,0,8"
+                                   Foreground="{DynamicResource WarnText}"
+                                   Text="{Binding DataContext.BootTaskStatusText, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                                   Visibility="{Binding DataContext.BootTaskNeedsAttention, RelativeSource={RelativeSource AncestorType=UserControl}, Converter={StaticResource BoolVisibility}}" />
+
+                        <StackPanel Margin="0,4,0,0" Orientation="Horizontal">
+                            <ui:Button Appearance="Primary"
+                                       Command="{Binding DataContext.RegisterBootTaskCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                                       Content="{Binding DataContext.RegisterBootTaskText, RelativeSource={RelativeSource AncestorType=UserControl}}" />
+
+                            <ui:Button Margin="8,0,0,0"
+                                       Appearance="Caution"
+                                       Command="{Binding DataContext.UnregisterBootTaskCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                                       Content="取消开机自启…"
+                                       Visibility="{Binding DataContext.BootTaskRegistered, RelativeSource={RelativeSource AncestorType=UserControl}, Converter={StaticResource BoolVisibility}}" />
+
+                            <ui:Button Margin="8,0,0,0"
+                                       Command="{Binding DataContext.RefreshBootTaskCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                                       Content="刷新状态" />
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Margin="0,10,0,0"
+                                   Text="注册后，Windows 任务计划程序会在开机时以当前账户在后台启动本程序并自动开始备份 —— 没人登录也照常运行，和数据库服务一样。后台实例没有界面，也不在托盘里。注册时要管理员确认一次，并输入当前 Windows 账户的密码（由系统加密保管，本程序不保存它）。" />
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="打开界面时会先接管后台实例（它正在压缩的那一包会中止、稍后自动重做，不会漏文件；已经压好的包会接着验证、移动，不重做）；从托盘退出界面时，备份交还给后台接着跑。程序目录挪动过、或者改过 Windows 密码之后，点「重新注册」即可。" />
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="两点限制：① OneDrive 客户端只在有人登录后才运行 —— 没人登录时压缩包照常移进 OneDrive 目录，但要等有人登录、OneDrive 启动后才会上传；② 监控目录或目标目录如果是映射的网络盘符（如 Z:），后台模式下看不见，请改用 \\服务器\共享 这种完整路径。" />
+
+                        <!-- 改版前的自启方式，只对还开着它的老配置露面（见 SettingsViewModel.ShowLegacyLogonStart）。 -->
+                        <CheckBox Margin="0,12,0,0"
+                                  Content="（旧方式）随 Windows 登录自动启动，并最小化到托盘"
+                                  IsChecked="{Binding StartMinimized}"
+                                  Visibility="{Binding ShowLegacyLogonStart, Converter={StaticResource BoolVisibility}}" />
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="这是改版前的自启方式：要有人登录 Windows 才会启动。上面的开机自启注册成功后会自动撤销它；也可以取消勾选并保存来撤销。"
+                                   Visibility="{Binding ShowLegacyLogonStart, Converter={StaticResource BoolVisibility}}" />
+
+                        <CheckBox Margin="0,14,0,0" Content="程序启动后自动开始备份" IsChecked="{Binding AutoStartEngine}" />
+
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="管的是手动打开界面的时候。开机自启的后台实例总是自动开始备份；界面从后台实例接管时也会接着跑，不受这一项影响。" />
+
+                        <StackPanel Style="{StaticResource FieldRow}" Margin="0,12,0,0">
                             <TextBlock Style="{StaticResource FieldLabel}" Text="日志级别" />
                             <ComboBox Width="280"
                                       DisplayMemberPath="Text"
@@ -610,7 +665,7 @@
                         </StackPanel>
 
                         <TextBlock Style="{StaticResource Hint}"
-                                   Text="只影响界面和日志文件的详细程度，不影响备份行为。排查问题时切到“调试”。" />
+                                   Text="界面上的日志按这个级别过滤；日志文件始终至少记录「普通」及以上，选「调试」时调试信息也一起记进文件。不影响备份行为。排查问题时切到“调试”。" />
                     </StackPanel>
                 </ui:Card>
 
@@ -794,7 +849,7 @@
 
                         <TextBlock Style="{StaticResource Hint}"
                                    Margin="0,0,0,10"
-                                   Text="把程序的“账本”整体复位成从未运行过的样子：累计统计、各类时间戳、增量水位线、待上传与隔离记录全部归零。压缩包一个都不会被删除，设置也不受影响。" />
+                                   Text="把程序的“账本”整体复位成从未运行过的样子：累计统计、各类时间戳、增量水位线、待上传、待重试与隔离记录全部归零。压缩包一个都不会被删除，设置也不受影响。" />
 
                         <CheckBox Margin="0,0,0,10"
                                   Content="同时删除磁盘上的日志文件"

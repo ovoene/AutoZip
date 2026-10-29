@@ -58,7 +58,8 @@ public static class OneDriveClientStatus
     {
         OneDriveClientState.Running => "OneDrive：客户端运行正常。",
         OneDriveClientState.NotRunning =>
-            "OneDrive：客户端未在运行，压缩包移进目录后不会被上传，本地空间也不会释放。",
+            "OneDrive：客户端未在运行（多半是还没有人登录 Windows）。压缩包照常移进目录，" +
+            "等客户端运行后才会上传；等待期间不计入上传超时。",
         _ => "OneDrive：无法确认客户端状态（进程查询被拒绝）。",
     };
 

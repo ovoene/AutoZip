@@ -2,22 +2,23 @@
     ===================================================================
       AutoZip 发版脚本
 
-      由 release.bat 调用。所有提示都是中文，交互全部走这里。
+      由 build.bat 调用（菜单第 6 / 7 项，或 build.bat release …）。
+      所有提示都是中文，交互全部走这里。
 
       用法：
-        release.bat                     交互式发版
-        release.bat 6.6.7               直接给出版本号
-        release.bat 6.6.7 -DryRun       只说会做什么，一个字节都不改
-        release.bat 6.6.7 -NoSelfTest   本地关卡里跳过界面自检
-        release.bat 6.6.7 -NoGate       本机完全不编译，直接推（CI 那边照样跑测试）
-        release.bat -ShowGitOutput      把 git 的原始输出也打出来（排错用）
-        release.bat -FirstCommit         强制走首次提交流程（通常由 release.bat 自动判断，一般不需手动加）
+        build.bat release                     交互式发版（= 菜单第 6 项）
+        build.bat release 6.6.7               直接给出版本号
+        build.bat release 6.6.7 -DryRun       只说会做什么，一个字节都不改（= 菜单第 7 项）
+        build.bat release 6.6.7 -NoSelfTest   本地关卡里跳过界面自检
+        build.bat release 6.6.7 -NoGate       本机完全不编译，直接推（CI 那边照样跑测试）
+        build.bat release -ShowGitOutput      把 git 的原始输出也打出来（排错用）
+        build.bat release -FirstCommit        强制走首次提交流程（通常由 build.bat 自动判断，一般不需手动加）
         版本号留空                       不改版本号，按当前 Directory.Build.props 发一版
 
       它做的事，按这个顺序：
 
         1  认出当前是「首次提交」还是「常规发版」，两者走不同的路
-        2  常规发版：问版本号 -> 跑本地关卡（publish.cmd：单元测试 ->
+        2  常规发版：问版本号 -> 跑本地关卡（build.bat publish：单元测试 ->
            单文件发布 -> 在发布产物上跑界面自检）
         3  把版本号写进 Directory.Build.props 的 Version /
            AssemblyVersion / FileVersion 三处
@@ -48,8 +49,8 @@ param(
     [switch]$NoGate,
     [switch]$ShowGitOutput,
 
-    #  由 release.bat 自动判断后传入：强制走「首次提交」流程。
-    #  release.bat 已经用 ASCII 安全的 git 命令认过一次，这里再强制一遍，
+    #  由 build.bat 自动判断后传入：强制走「首次提交」流程。
+    #  build.bat 已经用 ASCII 安全的 git 命令认过一次，这里再强制一遍，
     #  确保首次提交这条路一定会被走到。
     [switch]$FirstCommit,
 
@@ -64,7 +65,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------
 #  参数归一化
 #
-#  老版本 release.bat 用的是裸词参数（dryrun / noselftest / nogate），
+#  老版本的发版启动器用的是裸词参数（dryrun / noselftest / nogate），
 #  新写法是 -DryRun 这样的开关。两种都收下，别让老习惯报错。
 # ---------------------------------------------------------------------
 $script:DryRun        = [bool]$DryRun
@@ -113,7 +114,7 @@ foreach ($t in $tokens) {
 # ---------------------------------------------------------------------
 $script:Repo          = $PSScriptRoot
 $script:PropsFile     = Join-Path $script:Repo 'Directory.Build.props'
-$script:PublishCmd    = Join-Path $script:Repo 'publish.cmd'
+$script:BuildBat      = Join-Path $script:Repo 'build.bat'
 $script:GitIgnore     = Join-Path $script:Repo '.gitignore'
 $script:DefaultRemote = 'https://github.com/ovoene/AutoZip.git'
 $script:ActionsUrl    = 'https://github.com/ovoene/AutoZip/actions'
@@ -127,7 +128,7 @@ $script:ReleaseBase   = 'https://github.com/ovoene/AutoZip/releases/tag/'
 #  显式改成 UTF-8，中文提示在哪台机器上都是对的。
 #
 #  但 cmd.exe 在代码页 65001 下处理批处理文件时有过丢文件读偏移的毛病，
-#  而本地关卡要跑 publish.cmd。所以跑关卡之前先把编码还原，跑完再改回来。
+#  而本地关卡要跑 build.bat publish。所以跑关卡之前先把编码还原，跑完再改回来。
 #  脚本结束时也必须还原 —— 这个设置落在控制台宿主上，PowerShell 退出后
 #  不会自己复原，不还原就会把用户的命令行留在 65001 上。
 # ---------------------------------------------------------------------
@@ -321,31 +322,33 @@ function Git-First {
 }
 
 # ---------------------------------------------------------------------
-#  本地关卡：publish.cmd
+#  本地关卡：build.bat publish
 #
 #  单元测试 -> 清理 -> 自包含单文件发布 -> 在发布产物上跑界面自检。
 #  这一条过了，CI 上那条才是绿的。
 # ---------------------------------------------------------------------
 function Invoke-LocalGate {
-    if (-not (Test-Path -LiteralPath $script:PublishCmd)) {
+    if (-not (Test-Path -LiteralPath $script:BuildBat)) {
         Write-Blank
-        Write-Host ('  [失败] 找不到 ' + $script:PublishCmd) -ForegroundColor Red
+        Write-Host ('  [失败] 找不到 ' + $script:BuildBat) -ForegroundColor Red
         return $false
     }
 
-    $gateLabel = if ($script:NoSelfTest) { 'publish.cmd noselftest（跳过界面自检）' } else { 'publish.cmd（含界面自检）' }
+    $gateLabel = if ($script:NoSelfTest) { 'build.bat publish noselftest（跳过界面自检）' } else { 'build.bat publish（含界面自检）' }
     Write-Step ('正在跑本地关卡：' + $gateLabel)
     Write-Note '这一步要几分钟：单元测试 -> 清理 -> 单文件发布 -> 界面自检。'
     Write-Blank
 
     # 关键：先把控制台编码还原成系统默认值再交给 cmd.exe。
     # cmd.exe 在代码页 65001 下处理批处理文件有过丢文件读偏移的毛病，
-    # 而 publish.cmd 里既有 goto 又有多行括号块，中招了就会诡异失败。
+    # 而 build.bat 里既有 goto 又有多行括号块，中招了就会诡异失败。
     Restore-ConsoleEncoding
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName  = 'cmd.exe'
-        $psi.Arguments = '/c "' + $script:PublishCmd + '"' + $(if ($script:NoSelfTest) { ' noselftest' } else { '' })
+        # 整条命令行里只有路径两边那一对引号：cmd /c 只在"恰好两个引号"时原样保留它们，
+        # 路径带空格也不会被拆开。
+        $psi.Arguments = '/c "' + $script:BuildBat + '" publish' + $(if ($script:NoSelfTest) { ' noselftest' } else { '' })
         $psi.WorkingDirectory = $script:Repo
         $psi.UseShellExecute  = $false
 
@@ -407,7 +410,7 @@ $hasHead = (Git-Ok 'rev-parse' '-q' '--verify' 'HEAD')
 
 $IsFirstCommit = $false
 
-#  release.bat 已经在外部用 git 命令判断过一次。如果它显式传了 -FirstCommit，
+#  build.bat 已经在外部用 git 命令判断过一次。如果它显式传了 -FirstCommit，
 #  这里直接采信，强制走首次提交流程（避免控制台代码页差异导致的判断偏差）。
 if ($FirstCommit) {
     $IsFirstCommit = $true
@@ -618,7 +621,7 @@ if ($IsFirstCommit) {
         Write-Blank
         if (Read-YesNo '现在跑本地关卡？') {
             if ($script:DryRun) {
-                Write-Step '[演练] 会执行 publish.cmd（含界面自检）。'
+                Write-Step '[演练] 会执行 build.bat publish（含界面自检）。'
             }
             else {
                 if (-not (Invoke-LocalGate)) {
@@ -894,7 +897,7 @@ if ($IsFirstCommit) {
     }
     else {
         Write-Info '代码已经推上去了。没有打标签，所以 CI 不会构建 Release。'
-        Write-Info '以后要发版，执行 release.bat 并指定版本号即可。'
+        Write-Info '以后要发版，运行 build.bat 选第 6 项（或 build.bat release 6.6.7）即可。'
     }
     Exit-Script 0
 }
@@ -1059,8 +1062,8 @@ if ($versionChanged) { Write-Info ('版本变化：' + $curVer + '  ->  ' + $Ver
 else                 { Write-Info ('版本号：' + $Version + '（不改动）') }
 Write-Info ('标签：' + $tagName)
 if ($script:NoGate)         { Write-Info '本地关卡：跳过（已指定 -NoGate）' }
-elseif ($script:NoSelfTest) { Write-Info '本地关卡：publish.cmd noselftest（跳过界面自检）' }
-else                        { Write-Info '本地关卡：publish.cmd（单元测试 -> 单文件发布 -> 界面自检）' }
+elseif ($script:NoSelfTest) { Write-Info '本地关卡：build.bat publish noselftest（跳过界面自检）' }
+else                        { Write-Info '本地关卡：build.bat publish（单元测试 -> 单文件发布 -> 界面自检）' }
 if ($Fold) { Write-Info '同时带上：上面列出的那些未提交改动' }
 if ($remoteUrl -ne '') { Write-Info ('远端 origin：' + $remoteUrl) }
 else                   { Write-Info ('远端 origin：尚未配置，待会儿会加 ' + $script:DefaultRemote) }
@@ -1076,7 +1079,7 @@ if (-not $script:NoGate) {
     Write-Note '关卡放在写版本号之前：这样关卡一旦失败，工作区还是干干净净的原样。'
     Write-Blank
     if ($script:DryRun) {
-        Write-Step '[演练] 会执行 publish.cmd。'
+        Write-Step '[演练] 会执行 build.bat publish。'
     }
     else {
         if (-not (Invoke-LocalGate)) {

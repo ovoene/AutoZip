@@ -215,3 +215,154 @@ public class RetryQueueTests
         Assert.Equal(firstDue, q.NextAttemptUtc);
     }
 }
+
+/// <summary>
+/// 审计回归：重试队列要能存盘、读回，已打好待投递的包不能因为源文件没了就被丢掉。
+/// </summary>
+public class RetryQueuePersistenceTests
+{
+    private static readonly DateTimeOffset Origin = new(2026, 9, 1, 12, 0, 0, TimeSpan.Zero);
+
+    private static RetryQueue NewQueue(out FakeTimeProvider time)
+    {
+        time = new FakeTimeProvider(Origin);
+        return new RetryQueue(new RecordingLogger(), time);
+    }
+
+    [Fact]
+    public void 存下去再读回来_失败次数和待投递的包都还在()
+    {
+        RetryQueue queue = NewQueue(out _);
+
+        queue.RecordFailure(null, [@"C:\w\a.txt"], 10, "打包失败", maxAttempts: 6);
+        queue.RecordFailure(
+            null,
+            [@"C:\w\b.txt"],
+            20,
+            "投递失败",
+            maxAttempts: 6,
+            new PackedArchive(@"C:\tmp\Backup_20260901_120000.7z", 999, 1, 20, [@"C:\w\skipped.txt"]));
+
+        List<RetryEntry> saved = queue.Export();
+
+        RetryQueue reloaded = NewQueue(out _);
+        reloaded.Load(saved);
+
+        Assert.Equal(2, reloaded.Count);
+        Assert.All(reloaded.Entries, e => Assert.Equal(1, e.Attempts));
+
+        RetryEntry pending = reloaded.Entries.Single(e => e.ArchivePath is not null);
+        Assert.Equal(999, pending.ArchiveBytes);
+        Assert.Equal([@"C:\w\skipped.txt"], pending.SkippedFiles);
+
+        // 导出的是副本：改它不能改到队列里那一份。
+        saved[0].Files.Clear();
+        Assert.All(reloaded.Entries, e => Assert.NotEmpty(e.Files));
+    }
+
+    [Fact]
+    public void 源文件全没了_但包已经打好的批次不丢()
+    {
+        // 源文件被轮转删除是常态，而那个包正是它们仅存的备份。
+        RetryQueue queue = NewQueue(out _);
+        const string archive = @"C:\tmp\Backup_20260901_120000.7z";
+
+        queue.RecordFailure(null, [@"C:\w\gone.txt"], 10, "投递失败", 6, new PackedArchive(archive, 1, 1, 10, []));
+        queue.RecordFailure(null, [@"C:\w\gone2.txt"], 10, "打包失败", 6);
+
+        queue.PruneMissingFiles(path => path == archive);
+
+        RetryEntry left = Assert.Single(queue.Entries);
+        Assert.Equal(archive, left.ArchivePath);
+    }
+
+    [Fact]
+    public void 打包阶段再失败时_旧的包信息作废()
+    {
+        RetryQueue queue = NewQueue(out _);
+
+        FailureOutcome first = queue.RecordFailure(
+            null, [@"C:\w\a.txt"], 10, "投递失败", 6, new PackedArchive(@"C:\tmp\x_20260901_120000.7z", 1, 1, 10, []));
+
+        queue.RecordFailure(first.Requeued!.Id, [@"C:\w\a.txt"], 10, "打包失败", 6);
+
+        Assert.Null(Assert.Single(queue.Entries).ArchivePath);
+    }
+
+    [Fact]
+    public void 从隔离区放回的批次立刻到期_次数从头算()
+    {
+        RetryQueue queue = NewQueue(out FakeTimeProvider time);
+
+        RetryEntry entry = queue.RequeueNow("B1", [@"C:\w\a.txt"]);
+
+        Assert.Equal(0, entry.Attempts);
+        Assert.Same(entry, queue.TakeDue());
+        Assert.Equal(time.GetUtcNow(), entry.NextAttemptUtc);
+    }
+
+    [Fact]
+    public void 读回来的编号不会和新批次撞上()
+    {
+        RetryQueue first = NewQueue(out _);
+        FailureOutcome a = first.RecordFailure(null, [@"C:\w\a.txt"], 1, "x", 6);
+
+        RetryQueue second = NewQueue(out _);
+        second.Load(first.Export());
+
+        FailureOutcome b = second.RecordFailure(null, [@"C:\w\b.txt"], 1, "x", 6);
+
+        Assert.NotEqual(a.Requeued!.Id, b.Requeued!.Id);
+        Assert.Equal(2, second.Count);
+    }
+}
+
+/// <summary>接回"包打好了、还没投递进程就停了"的批次。</summary>
+public class RetryQueueAdoptTests
+{
+    private static readonly DateTimeOffset Origin = new(2026, 9, 1, 12, 0, 0, TimeSpan.Zero);
+
+    [Fact]
+    public void 新批次被打断_接回时分配编号_次数从零起_立刻到期()
+    {
+        FakeTimeProvider time = new(Origin);
+        RetryQueue queue = new(new RecordingLogger(), time);
+
+        RetryEntry adopted = queue.AdoptInterrupted(new RetryEntry
+        {
+            Id = string.Empty,
+            Files = [@"C:\w\a.txt"],
+            ArchivePath = @"C:\tmp\Backup_20260901_115900.7z",
+            Verified = false,
+        });
+
+        Assert.False(string.IsNullOrEmpty(adopted.Id));
+        Assert.Equal(0, adopted.Attempts);              // 被打断不是失败
+        Assert.False(adopted.Verified);
+        Assert.Same(adopted, queue.TakeDue());
+    }
+
+    [Fact]
+    public void 重试批次被打断_接回时沿用原编号和失败次数()
+    {
+        FakeTimeProvider time = new(Origin);
+        RetryQueue queue = new(new RecordingLogger(), time);
+
+        FailureOutcome failed = queue.RecordFailure(null, [@"C:\w\a.txt"], 1, "打包失败", 6);
+        string id = failed.Requeued!.Id;
+
+        RetryEntry adopted = queue.AdoptInterrupted(new RetryEntry
+        {
+            Id = id,
+            Files = [@"C:\w\a.txt"],
+            ArchivePath = @"C:\tmp\Backup_20260901_115900.7z",
+            Verified = true,
+        });
+
+        Assert.Equal(1, queue.Count);
+        Assert.Equal(id, adopted.Id);
+        Assert.Equal(1, adopted.Attempts);
+        Assert.True(adopted.Verified);
+        Assert.Equal(time.GetUtcNow(), adopted.NextAttemptUtc);
+    }
+}

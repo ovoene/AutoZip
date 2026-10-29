@@ -67,6 +67,16 @@ public sealed record PackRequest(
     /// 其中空归档判据尤其危险 —— 源文件全没了、只剩清单进包时，它就不再报空。
     /// </summary>
     public IReadOnlyList<string> ExtraFiles { get; init; } = [];
+
+    /// <summary>
+    /// 源文件按相对于这个目录的路径存进包里（通常是监控目录）。为空时按文件名存。
+    ///
+    /// 不给的话 7-Zip 对清单里的绝对路径只存文件名：勾了"包含子目录"时，
+    /// <c>a\x.txt</c> 和 <c>b\x.txt</c> 会撞成同一个 <c>x.txt</c>，7za 直接报
+    /// "Duplicate filename on disk" 整批失败；就算不撞名，解出来也是一堆平铺的文件，
+    /// 子目录结构全丢了。不在这个目录之下的文件（<see cref="ExtraFiles"/> 也一样）照旧按文件名存。
+    /// </summary>
+    public string? BaseDirectory { get; init; }
 }
 
 public readonly record struct PackProgress(int Percent, string? CurrentFile);

@@ -391,3 +391,24 @@ public class FileFilterTests
         Assert.True(filter.Accept("C:\\w\\app.log.bak"));
     }
 }
+
+/// <summary>审计回归：对账扫描要真的进子目录。</summary>
+public class ReconcileRecursionTests
+{
+    [Fact]
+    public void 包含子目录时对账扫描能找到子目录里的文件()
+    {
+        // 原先 AttributesToSkip 里带着 Directory，跳过的目录连递归也一起跳过：
+        // 勾了"包含子目录"，对账扫描照样一层子目录都不进。
+        using TempDir dir = new();
+        string top = dir.WriteFile("top.dat");
+        string deep = dir.WriteFile(Path.Combine("a", "b", "deep.dat"));
+
+        string[] recursive = [.. Core.Watching.Win32FileProbe.Instance.Enumerate(dir.Path, recurse: true)];
+        string[] flat = [.. Core.Watching.Win32FileProbe.Instance.Enumerate(dir.Path, recurse: false)];
+
+        Assert.Contains(top, recursive);
+        Assert.Contains(deep, recursive);
+        Assert.Equal(new[] { top }, flat);
+    }
+}

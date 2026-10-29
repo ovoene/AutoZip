@@ -53,9 +53,33 @@ public partial class MainWindow : Wpf.Ui.Controls.FluentWindow
         }
     }
 
-    /// <summary>托盘菜单里的"退出"。区别于关闭按钮 —— 只有这条路会真正结束进程。</summary>
+    /// <summary>
+    /// 托盘菜单里的"退出"。区别于关闭按钮 —— 只有这条路会真正结束进程。
+    ///
+    /// 开机自启已注册时，退出界面<b>不等于</b>停止备份：后台实例会马上接上（见 App.OnExit）。
+    /// 这件事得在退出前说一声，否则用户以为关掉了，任务管理器里却还有一个 AutoZip。
+    /// </summary>
     private void OnTrayExit(object sender, RoutedEventArgs e)
     {
+        if (_model.BootTaskRegistered)
+        {
+            MessageBoxResult answer = System.Windows.MessageBox.Show(
+                "开机自启已注册：退出界面后，备份会交还给后台实例继续运行（没有界面，也不在托盘里）。" +
+                $"{Environment.NewLine}{Environment.NewLine}" +
+                "想彻底停止备份，请先到「设置 → 界面与运行」里点「取消开机自启」。" +
+                $"{Environment.NewLine}{Environment.NewLine}" +
+                "确定退出界面吗？",
+                _model.AppName,
+                MessageBoxButton.OKCancel,
+                MessageBoxImage.Information,
+                MessageBoxResult.OK);
+
+            if (answer != MessageBoxResult.OK)
+            {
+                return;
+            }
+        }
+
         _explicitExit = true;
         Close();
         Application.Current.Shutdown();

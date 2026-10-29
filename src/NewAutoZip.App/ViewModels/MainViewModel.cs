@@ -11,6 +11,7 @@ using NewAutoZip.Core.Notifications;
 using NewAutoZip.Core.OneDrive;
 using NewAutoZip.Core.Packing;
 using NewAutoZip.Core.Pipeline;
+using NewAutoZip.Core.Startup;
 using NewAutoZip.Core.Storage;
 
 namespace NewAutoZip.App.ViewModels;
@@ -64,6 +65,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// 不再是又一个裸露的魔数。改导航顺序时这里和 XAML 要一起改。
     /// </summary>
     public const int RestorePageIndex = 5;
+
+    /// <summary>「设置」页在导航里的位置。同上，和 <c>MainWindow.xaml</c> 的顺序一起改。</summary>
+    public const int SettingsPageIndex = 4;
 
     /// <summary>单轮最多取走多少条日志 —— 避免一次爆量把 UI 线程占满。</summary>
     private const int LogDrainPerTick = 200;
@@ -131,6 +135,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private string _validationText = string.Empty;
     private string _notifyTestResult = string.Empty;
 
+    // ---------- 开机自启 ----------
+    private BootTaskStatus _bootTask = BootTaskStatus.NotRegistered;
+    private BootTaskAdvice _bootAdvice = new(string.Empty, false);
+    private bool _bootTaskBusy;
+
     // ---------- 恢复页 ----------
     private RestoreArchiveView? _selectedArchive;
     private string _restorePassword = string.Empty;
@@ -187,6 +196,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         DismissInfoBarCommand = new RelayCommand(() => InfoBarOpen = false);
 
+        RegisterBootTaskCommand = new AsyncRelayCommand(RegisterBootTaskAsync, () => !_bootTaskBusy);
+        UnregisterBootTaskCommand = new AsyncRelayCommand(
+            UnregisterBootTaskAsync,
+            () => !_bootTaskBusy && _bootTask.Registered);
+        RefreshBootTaskCommand = new RelayCommand(RefreshBootTask, () => !_bootTaskBusy);
+
         RefreshRestoreCommand = new RelayCommand(RefreshRestoreArchives);
         ListArchiveCommand = new AsyncRelayCommand(ListArchiveAsync, () => _selectedArchive is not null);
         DrillArchiveCommand = new AsyncRelayCommand(DrillArchiveAsync, () => _selectedArchive is not null);
@@ -194,7 +209,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         OpenRestoreTargetCommand = new RelayCommand(() => Reveal(RestoreTarget));
 
         // 配置一改就重算校验清单，用户在填的过程中就能看到问题，而不是点了"开始"才被拦。
-        Settings.Changed += (_, _) => RefreshValidation();
+        // 这条路径每敲一个字都会走一次，所以用不碰磁盘的轻量校验（见 EngineHost.ValidateLive）。
+        Settings.Changed += (_, _) => RefreshValidation(live: true);
 
         // 主题与皮肤即时生效（不等"保存"）。挑颜色看不到效果的话，这个功能等于没有。
         Settings.ThemeChanged += (_, _) => ApplyTheme();
@@ -203,6 +219,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _theme.Changed += OnThemeServiceChanged;
 
         RefreshValidation();
+
+        // 开机自启的状态要在开窗之前就有：App 拿它决定撤不撤登录自启，退出时拿它决定交不交还后台。
+        RefreshBootTask();
 
         // 步骤列表按配置里的云盘类型先搭起来（非 OneDrive 只有 4 步）。
         // 引擎此刻必然没在跑，所以直接按磁盘上那份来；下面那次 Tick 会再对齐一遍。
@@ -301,6 +320,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public RelayCommand<string> DiscardQuarantineCommand { get; }
 
     public RelayCommand DismissInfoBarCommand { get; }
+
+    // ---------- 开机自启 ----------
+
+    public AsyncRelayCommand RegisterBootTaskCommand { get; }
+
+    public AsyncRelayCommand UnregisterBootTaskCommand { get; }
+
+    public RelayCommand RefreshBootTaskCommand { get; }
 
     // ---------- 恢复 ----------
 
@@ -505,6 +532,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (value == RestorePageIndex)
             {
                 RefreshRestoreArchives();
+            }
+
+            // 切到设置页就重读一次开机自启状态（一次本机 COM 调用，几十毫秒）。
+            // 用户可能刚在「任务计划程序」里手动停用过它，显示上一次读到的样子就是在撒谎。
+            if (value == SettingsPageIndex)
+            {
+                RefreshBootTask();
             }
         }
     }
@@ -1063,6 +1097,192 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     }
 
     // ==================================================================
+    //  开机自启（无需登录）
+    //
+    //  真相只有一份：任务计划程序里那条任务。这里不在 settings.json 里另存一个
+    //  "想要开机自启"的开关 —— 注册要提权、要密码，不可能跟着"保存"静默完成，
+    //  存一个开关只会制造"开关开着、任务却不在"的第三种状态。
+    // ==================================================================
+
+    /// <summary>任务在、而且读得到。退出界面时据此决定要不要把备份交还给后台实例。</summary>
+    public bool BootTaskRegistered => _bootTask.Registered;
+
+    /// <summary>设置页上那一句状态。</summary>
+    public string BootTaskStatusText => _bootAdvice.Text;
+
+    /// <summary>状态需要用户出手（程序挪过位置、改过密码、任务被停用……），界面用警告色显示。</summary>
+    public bool BootTaskNeedsAttention => _bootAdvice.NeedsAttention;
+
+    /// <summary>主按钮上的字：没注册时是"注册"，注册过了就是"重新注册"。</summary>
+    public string RegisterBootTaskText => _bootTask.Registered ? "重新注册…" : "注册开机自启…";
+
+    /// <summary>正在注册 / 取消（等 UAC、等用户输密码）。期间三颗按钮都锁住。</summary>
+    public bool BootTaskBusy
+    {
+        get => _bootTaskBusy;
+        private set
+        {
+            if (Set(ref _bootTaskBusy, value))
+            {
+                RegisterBootTaskCommand.RaiseCanExecuteChanged();
+                UnregisterBootTaskCommand.RaiseCanExecuteChanged();
+                RefreshBootTaskCommand.RaiseCanExecuteChanged();
+            }
+        }
+    }
+
+    /// <summary>重读任务计划程序里的那条任务。</summary>
+    internal void RefreshBootTask()
+    {
+        BootTaskStatus status;
+
+        try
+        {
+            status = BootTaskScheduler.Query();
+        }
+        catch (Exception ex)
+        {
+            // Query 承诺不抛，这里再兜一层：读个状态失败不该冒到 Dispatcher 去弹崩溃框。
+            status = BootTaskStatus.Failed(ex.Message);
+        }
+
+        ApplyBootTaskStatus(status);
+    }
+
+    /// <summary>
+    /// 把一份状态摆到界面上。自检用它直接喂各种状态进来，
+    /// 不必真的去注册任务（那要提权、要密码，还会改用户的系统）。
+    /// </summary>
+    internal void ApplyBootTaskStatus(BootTaskStatus status)
+    {
+        _bootTask = status;
+        _bootAdvice = status.Describe(BootTaskRegistrar.ExecutablePath());
+
+        Raise(nameof(BootTaskRegistered));
+        Raise(nameof(BootTaskStatusText));
+        Raise(nameof(BootTaskNeedsAttention));
+        Raise(nameof(RegisterBootTaskText));
+
+        RegisterBootTaskCommand.RaiseCanExecuteChanged();
+        UnregisterBootTaskCommand.RaiseCanExecuteChanged();
+    }
+
+    private async Task RegisterBootTaskAsync()
+    {
+        BootTaskBusy = true;
+
+        try
+        {
+            BootTaskResult result = await BootTaskRegistrar
+                .RegisterAsync(Application.Current?.MainWindow, _theme.IsDark, _theme.Accent, _log)
+                .ConfigureAwait(true);
+
+            RefreshBootTask();
+
+            switch (result.Outcome)
+            {
+                case BootTaskOutcome.Succeeded:
+                    string retired = RetireLogonStart();
+
+                    ShowInfo(
+                        "开机自启已注册",
+                        $"{result.Message}现在由这个界面运行备份；从托盘退出界面后，会交还给后台实例接着跑。{retired}",
+                        _bootAdvice.NeedsAttention ? "Warning" : "Success");
+                    break;
+
+                case BootTaskOutcome.Cancelled:
+                    ShowInfo("没有改动", result.Message, "Informational");
+                    break;
+
+                default:
+                    ShowInfo("注册开机自启失败", result.Message, "Error");
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Error("注册开机自启时出错。", ex);
+            ShowInfo("注册开机自启失败", ex.Message, "Error");
+        }
+        finally
+        {
+            BootTaskBusy = false;
+        }
+    }
+
+    private async Task UnregisterBootTaskAsync()
+    {
+        MessageBoxResult answer = MessageBox.Show(
+            "取消之后，开机没人登录时就不会再自动备份了；只有打开这个程序时才会备份。" +
+            $"{Environment.NewLine}{Environment.NewLine}确定取消开机自启吗？",
+            "取消开机自启",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Warning,
+            MessageBoxResult.No);
+
+        if (answer != MessageBoxResult.Yes)
+        {
+            return;
+        }
+
+        BootTaskBusy = true;
+
+        try
+        {
+            BootTaskResult result = await BootTaskRegistrar.UnregisterAsync(_log).ConfigureAwait(true);
+
+            RefreshBootTask();
+
+            ShowInfo(
+                result.Ok ? "已取消开机自启" : result.Outcome == BootTaskOutcome.Cancelled ? "没有改动" : "取消开机自启失败",
+                result.Message,
+                result.Ok ? "Success" : result.Outcome == BootTaskOutcome.Cancelled ? "Informational" : "Error");
+        }
+        catch (Exception ex)
+        {
+            _log.Error("取消开机自启时出错。", ex);
+            ShowInfo("取消开机自启失败", ex.Message, "Error");
+        }
+        finally
+        {
+            BootTaskBusy = false;
+        }
+    }
+
+    /// <summary>
+    /// 开机自启注册成功后，撤掉改版前的「随登录启动」。返回一句附在提示后面的话（没有可撤的就是空串）。
+    ///
+    /// 两个同时在的话，每次登录都会弹出界面把后台实例接管掉 —— 那正是开机自启要避免的。
+    /// 这一步在<b>当前用户</b>的进程里做：提权进程可能是另一个账户，它的 HKCU 不是这个用户的。
+    /// </summary>
+    private string RetireLogonStart()
+    {
+        bool wasOn = _host.Settings.StartMinimized || StartupRegistration.Current() is not null;
+
+        if (!wasOn)
+        {
+            return string.Empty;
+        }
+
+        string? problem = StartupRegistration.Sync(false, _log);
+
+        try
+        {
+            _host.SaveStartMinimized(false);
+            Settings.AcceptStartMinimized(false);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn("撤销旧的「随登录启动」时保存配置失败。", ex);
+            problem ??= $"撤销旧的「随登录启动」时保存配置失败：{ex.Message}";
+        }
+
+        return problem is null
+            ? "旧的「随 Windows 登录启动」已一并撤销。"
+            : $"但旧的「随 Windows 登录启动」没能撤销：{problem}";
+    }
+
+    // ==================================================================
     //  刷新
     // ==================================================================
 
@@ -1439,15 +1659,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             AppSettings settings = Settings.ToSettings();
             _host.SaveSettings(settings);
 
-            // 「启动时最小化到托盘」同时管开机自启动，所以保存配置时要把注册表
+            // 「启动时最小化到托盘」同时管随登录启动，所以保存配置时要把注册表
             // 那条记录跟上。登记失败不算保存失败 —— 配置已经写进磁盘了，
             // 只是这一项没生效，如实附在提示后面告诉用户。
-            string? startupProblem = StartupRegistration.Sync(_host.Settings.StartMinimized, _log);
+            // 开机自启已注册时不登记（理由见 RetireLogonStart）。
+            string? startupProblem = StartupRegistration.Sync(
+                _host.Settings.StartMinimized && !BootTaskRegistered,
+                _log);
 
             // 保存后回读一遍：数值被 Clamp 修正过的话，界面必须显示修正后的真实值，
             // 不能让用户以为自己填的 0 生效了。
             Settings.Load(_host.Settings);
             _sink.MinimumLevel = _host.Settings.LogLevel;
+            App.ApplyLogLevel(_host.Settings.LogLevel);
 
             // 云盘类型不用等"点开始"了 —— 引擎停着就当场切，在跑就先记下、停了再切。
             SyncCloudTarget();
@@ -1506,6 +1730,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         Settings.Load(_host.ReloadSettings());
         _sink.MinimumLevel = _host.Settings.LogLevel;
+        App.ApplyLogLevel(_host.Settings.LogLevel);
         RefreshValidation();
 
         // 丢弃界面改动同样可能改变云盘类型（界面上改过但没保存），
@@ -1823,6 +2048,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
+        // 目标目录里已经有东西时先问清楚同名文件怎么办。
+        // 恢复最常见的去处恰恰是原来的目录，而那里的文件往往比备份新 —— 默认覆盖等于拿旧的盖掉新的。
+        if (AskOverwrite(target) is not { } overwrite)
+        {
+            SetRestoreStatus("已取消解压。", "Informational");
+            return;
+        }
+
         RestoreBusy = true;
         RestorePercent = 0;
         SetRestoreStatus($"正在把 {archive.FileName} 解压到 {target} …", "Informational");
@@ -1837,7 +2070,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             Progress<PackProgress> progress = new(p => RestorePercent = p.Percent);
 
             ExtractResult result = await _host
-                .ExtractAsync(archive.Path, target, RestorePassword, progress, cts.Token)
+                .ExtractAsync(archive.Path, target, RestorePassword, overwrite, progress, cts.Token)
                 .ConfigureAwait(true);
 
             if (!result.Ok)
@@ -1867,6 +2100,47 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             RestoreBusy = false;
             RestorePercent = 0;
         }
+    }
+
+    /// <summary>
+    /// 目标目录不空时问一句：覆盖同名文件 / 保留原有文件 / 取消。返回 null 表示取消。
+    /// 目录不存在或是空的就不问 —— 没有可覆盖的东西。
+    /// </summary>
+    private static bool? AskOverwrite(string target)
+    {
+        bool hasContent;
+
+        try
+        {
+            hasContent = Directory.Exists(target) && Directory.EnumerateFileSystemEntries(target).Any();
+        }
+        catch (Exception)
+        {
+            hasContent = true;     // 看不清就当有，宁可多问一句
+        }
+
+        if (!hasContent)
+        {
+            return true;
+        }
+
+        MessageBoxResult answer = MessageBox.Show(
+            $"目标目录里已经有文件：{target}{Environment.NewLine}{Environment.NewLine}" +
+            "包里的文件和目录里已有的文件同名时怎么办？" + Environment.NewLine +
+            "  · 是：用包里的覆盖（目录里的较新版本会被替换）" + Environment.NewLine +
+            "  · 否：保留目录里已有的，跳过包里同名的那一份" + Environment.NewLine +
+            "  · 取消：不解压",
+            "解压到已有文件的目录",
+            MessageBoxButton.YesNoCancel,
+            MessageBoxImage.Question,
+            MessageBoxResult.No);
+
+        return answer switch
+        {
+            MessageBoxResult.Yes => true,
+            MessageBoxResult.No => false,
+            _ => null,
+        };
     }
 
     private void SetRestoreStatus(string message, string kind)
@@ -1983,11 +2257,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private void RefreshValidation()
+    /// <param name="live">边打字边校验：不写探测文件。保存、启动失败、重新读取时传 false 做完整校验。</param>
+    private void RefreshValidation(bool live = false)
     {
         try
         {
-            ValidationReport report = _host.Validate(Settings.ToSettings());
+            AppSettings edited = Settings.ToSettings();
+            ValidationReport report = live ? _host.ValidateLive(edited) : _host.Validate(edited);
             ValidationText = report.Issues.Count == 0 ? string.Empty : report.ToText();
         }
         catch (Exception ex)

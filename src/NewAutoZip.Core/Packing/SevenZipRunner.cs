@@ -186,9 +186,14 @@ public sealed class SevenZipRunner
             // 附加文件（包内清单）与源文件写进同一个 @listfile —— 对 7za 来说它们没区别；
             // 区别只在<b>我们这边</b>怎么数，见下面 actualCount 的算式。
             IReadOnlyList<string> extras = request.ExtraFiles;
+            string? baseDirectory = UsableBaseDirectory(request.BaseDirectory);
+
+            // 源文件写成相对于 BaseDirectory 的路径，7za 的工作目录也设成它 ——
+            // 这样包里存的是 a\x.txt / b\x.txt，而不是两个撞名的 x.txt（见 PackRequest.BaseDirectory）。
+            IEnumerable<string> sourceEntries = request.Files.Select(f => ListEntryFor(f, baseDirectory));
             IEnumerable<string> allPaths = extras.Count == 0
-                ? request.Files
-                : request.Files.Concat(extras);
+                ? sourceEntries
+                : sourceEntries.Concat(extras);
 
             await File.WriteAllLinesAsync(listPath, allPaths, new UTF8Encoding(false), ct)
                 .ConfigureAwait(false);
@@ -198,7 +203,8 @@ public sealed class SevenZipRunner
             _log.Info($"开始压缩 {request.Files.Count} 个文件 → {Path.GetFileName(request.OutputPath)}");
             _log.Debug($"命令行：{SecretRedactor.Shared.Redact(_exePath + " " + string.Join(' ', args))}");
 
-            ProcessRunResult run = await RunAsync(args, request.Timeout, progress, ct).ConfigureAwait(false);
+            ProcessRunResult run = await RunAsync(args, request.Timeout, progress, ct, workingDirectory: baseDirectory)
+                .ConfigureAwait(false);
             TimeSpan elapsed = Stopwatch.GetElapsedTime(startedAt);
 
             List<string> warnings = ExtractWarnings(run.Lines);
@@ -734,6 +740,57 @@ public sealed class SevenZipRunner
     private static bool LooksLikeWrongPassword(IEnumerable<string> lines) =>
         lines.Any(l => WrongPasswordPattern.IsMatch(l));
 
+    /// <summary>能当工作目录用的 BaseDirectory：给了、而且真的存在。否则 null（按文件名存，老行为）。</summary>
+    private static string? UsableBaseDirectory(string? baseDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(baseDirectory))
+        {
+            return null;
+        }
+
+        try
+        {
+            string full = Path.GetFullPath(baseDirectory);
+            return Directory.Exists(full) ? full : null;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 清单里的一行：在 <paramref name="baseDirectory"/> 之下就写相对路径（7za 照这个存），
+    /// 否则写原来的绝对路径（7za 只存文件名）。
+    ///
+    /// 相对路径必须真的落在目录之内 —— <c>..\</c> 开头的不算：7-Zip 解压时会把
+    /// <c>..</c> 剥掉，存进去也只是换个地方撞名。跨盘符时 GetRelativePath 原样返回绝对路径，同样退回。
+    /// </summary>
+    internal static string ListEntryFor(string file, string? baseDirectory)
+    {
+        if (baseDirectory is null)
+        {
+            return file;
+        }
+
+        try
+        {
+            string relative = Path.GetRelativePath(baseDirectory, Path.GetFullPath(file));
+
+            bool inside = !Path.IsPathRooted(relative)
+                          && relative != "."
+                          && relative != ".."
+                          && !relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+                          && !relative.StartsWith(".." + Path.AltDirectorySeparatorChar, StringComparison.Ordinal);
+
+            return inside ? relative : file;
+        }
+        catch (Exception)
+        {
+            return file;
+        }
+    }
+
     private static List<string> BuildCreateArgs(PackRequest request, string partPath, string listPath)
     {
         List<string> args =
@@ -772,7 +829,8 @@ public sealed class SevenZipRunner
         TimeSpan timeout,
         IProgress<PackProgress>? progress,
         CancellationToken ct,
-        bool captureAll = false)
+        bool captureAll = false,
+        string? workingDirectory = null)
     {
         ProcessStartInfo startInfo = new()
         {
@@ -784,9 +842,10 @@ public sealed class SevenZipRunner
             RedirectStandardInput = true,
             StandardOutputEncoding = Encoding.UTF8,
             StandardErrorEncoding = Encoding.UTF8,
-            WorkingDirectory = Path.GetDirectoryName(_exePath) is { Length: > 0 } dir
-                ? dir
-                : Environment.CurrentDirectory,
+            WorkingDirectory = workingDirectory
+                ?? (Path.GetDirectoryName(_exePath) is { Length: > 0 } dir
+                    ? dir
+                    : Environment.CurrentDirectory),
         };
 
         foreach (string arg in args)
